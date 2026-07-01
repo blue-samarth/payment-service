@@ -166,6 +166,8 @@ func (e *GatewayError) Error() string {
 	return fmt.Sprintf("gateway error [%s/%s]", e.Category, e.Code)
 }
 
+func (e *GatewayError) Unwrap() error { return e.Underlying }
+
 type SettlementReport struct {
 	GatewayID   string
 	PeriodStart time.Time

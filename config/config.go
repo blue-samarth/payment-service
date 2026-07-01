@@ -351,10 +351,17 @@ func Validate(c *Config) error {
 	return nil
 }
 
+func quoteDSNValue(v string) string {
+	v = strings.ReplaceAll(v, `\`, `\\`)
+	v = strings.ReplaceAll(v, `'`, `\'`)
+	return "'" + v + "'"
+}
+
 func (d DatabaseConfig) DSN() string {
 	return fmt.Sprintf(
 		"host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
-		d.PrimaryHost, d.Port, d.Name, d.User, d.Password, d.SSLMode,
+		quoteDSNValue(d.PrimaryHost), d.Port, quoteDSNValue(d.Name),
+		quoteDSNValue(d.User), quoteDSNValue(d.Password), quoteDSNValue(d.SSLMode),
 	)
 }
 func (d DatabaseConfig) ReplicaDSN() string {
@@ -363,6 +370,7 @@ func (d DatabaseConfig) ReplicaDSN() string {
 	}
 	return fmt.Sprintf(
 		"host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
-		d.ReplicaHost, d.Port, d.Name, d.User, d.Password, d.SSLMode,
+		quoteDSNValue(d.ReplicaHost), d.Port, quoteDSNValue(d.Name),
+		quoteDSNValue(d.User), quoteDSNValue(d.Password), quoteDSNValue(d.SSLMode),
 	)
 }
