@@ -103,10 +103,6 @@ func (m MismatchType) IsCritical() bool {
 	return m == MismatchStatus || m == MismatchMissingInternal
 }
 
-// EligibleForAutoResolution evaluates whether this entry qualifies for
-// automated resolution. Per Engineering Reference §11, only AMOUNT_MISMATCH
-// entries are eligible — status mismatches, missing records, and fee mismatches
-// all require manual ops review.
 func (e *Entry) EligibleForAutoResolution(cfg AutoResolutionConfig) (bool, string) {
 	if e.MismatchType != MismatchAmount {
 		return false, fmt.Sprintf("mismatch type %s requires manual review", e.MismatchType)
