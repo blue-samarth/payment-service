@@ -54,6 +54,16 @@ type Queries struct {
 	WebhookEventRecord         string
 	TransactionGetByGatewayRef string
 	RawMetadataInsert          string
+
+	ConfigGetGatewayConfig         string
+	ConfigListActiveGateways       string
+	ConfigGetFeeModel              string
+	ConfigGetMetadataSchema        string
+	ConfigGetRoutingWeights        string
+	ConfigGetRoutingWeightsDefault string
+	ConfigWebhookPolicy            string
+	ConfigGetProcessingTimeout     string
+	ConfigListTimeouts             string
 }
 
 func LoadQueries() (*Queries, error) {
@@ -115,6 +125,15 @@ func LoadQueries() (*Queries, error) {
 		{&q.WebhookEventRecord, "WebhookEventRecord"},
 		{&q.TransactionGetByGatewayRef, "TransactionGetByGatewayRef"},
 		{&q.RawMetadataInsert, "RawMetadataInsert"},
+		{&q.ConfigGetGatewayConfig, "ConfigGetGatewayConfig"},
+		{&q.ConfigListActiveGateways, "ConfigListActiveGateways"},
+		{&q.ConfigGetFeeModel, "ConfigGetFeeModel"},
+		{&q.ConfigGetMetadataSchema, "ConfigGetMetadataSchema"},
+		{&q.ConfigGetRoutingWeights, "ConfigGetRoutingWeights"},
+		{&q.ConfigGetRoutingWeightsDefault, "ConfigGetRoutingWeightsDefault"},
+		{&q.ConfigWebhookPolicy, "ConfigWebhookPolicy"},
+		{&q.ConfigGetProcessingTimeout, "ConfigGetProcessingTimeout"},
+		{&q.ConfigListTimeouts, "ConfigListTimeouts"},
 	}
 
 	for _, f := range fields {

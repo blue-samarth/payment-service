@@ -13,30 +13,15 @@ import (
 
 var ErrGatewayNotFound = errors.New("gateway not found")
 
-type ConfigStore struct{ db *DB }
+type ConfigStore struct {
+	db *DB
+	q  *Queries
+}
 
-func NewConfigStore(db *DB) *ConfigStore { return &ConfigStore{db: db} }
+func NewConfigStore(db *DB, q *Queries) *ConfigStore { return &ConfigStore{db: db, q: q} }
 
 func (s *ConfigStore) GetGatewayConfig(ctx context.Context, gatewayID string) (*ports.GatewayConfig, error) {
-	row := s.db.pool.QueryRow(ctx, `
-		SELECT
-			gc.gateway_id, gc.display_name, gc.is_active,
-			gc.min_amount, gc.max_amount,
-			gc.supported_currencies, gc.supported_methods,
-			gc.idempotency_capable, gc.supports_cancel, gc.supports_partial_refund,
-			gc.priority, gc.updated_at,
-			COALESCE(cb.state, 'CLOSED'),
-			COALESCE(cb.cooldown_until, '0001-01-01 00:00:00+00'),
-			COALESCE(gm.discrepancy_rate_24h, 0),
-			COALESCE(gm.p99_latency_ms, 0),
-			COALESCE(gm.volume_7d, 0),
-			COALESCE(gm.fx_rate_spread, 1.0),
-			COALESCE(gm.last_updated, NOW())
-		FROM gateway_config gc
-		LEFT JOIN gateway_circuit_breaker_state cb ON cb.gateway_id = gc.gateway_id
-		LEFT JOIN gateway_metrics gm ON gm.gateway_id = gc.gateway_id
-		WHERE gc.gateway_id = $1
-	`, gatewayID)
+	row := s.db.pool.QueryRow(ctx, s.q.ConfigGetGatewayConfig, gatewayID)
 
 	cfg, err := scanGatewayConfig(row)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -56,26 +41,7 @@ func (s *ConfigStore) GetGatewayConfig(ctx context.Context, gatewayID string) (*
 }
 
 func (s *ConfigStore) ListActiveGateways(ctx context.Context, paymentMethod string) ([]*ports.GatewayConfig, error) {
-	rows, err := s.db.pool.Query(ctx, `
-		SELECT
-			gc.gateway_id, gc.display_name, gc.is_active,
-			gc.min_amount, gc.max_amount,
-			gc.supported_currencies, gc.supported_methods,
-			gc.idempotency_capable, gc.supports_cancel, gc.supports_partial_refund,
-			gc.priority, gc.updated_at,
-			COALESCE(cb.state, 'CLOSED'),
-			COALESCE(cb.cooldown_until, '0001-01-01 00:00:00+00'),
-			COALESCE(gm.discrepancy_rate_24h, 0),
-			COALESCE(gm.p99_latency_ms, 0),
-			COALESCE(gm.volume_7d, 0),
-			COALESCE(gm.fx_rate_spread, 1.0),
-			COALESCE(gm.last_updated, NOW())
-		FROM gateway_config gc
-		LEFT JOIN gateway_circuit_breaker_state cb ON cb.gateway_id = gc.gateway_id
-		LEFT JOIN gateway_metrics gm ON gm.gateway_id = gc.gateway_id
-		WHERE gc.is_active = true
-		  AND $1 = ANY(gc.supported_methods)
-	`, paymentMethod)
+	rows, err := s.db.pool.Query(ctx, s.q.ConfigListActiveGateways, paymentMethod)
 	if err != nil {
 		return nil, fmt.Errorf("config_store: list active gateways: %w", err)
 	}
@@ -99,12 +65,7 @@ func (s *ConfigStore) ListActiveGateways(ctx context.Context, paymentMethod stri
 
 func (s *ConfigStore) GetFeeModel(ctx context.Context, gatewayID, paymentMethod string) (*ports.GatewayFeeModel, error) {
 	var m ports.GatewayFeeModel
-	err := s.db.pool.QueryRow(ctx, `
-		SELECT gateway_id, payment_method, fixed_paise, percentage_bps,
-		       interchange_cap_paise, discount_volume_threshold_paise
-		FROM gateway_fee_models
-		WHERE gateway_id = $1 AND payment_method = $2
-	`, gatewayID, paymentMethod).Scan(
+	err := s.db.pool.QueryRow(ctx, s.q.ConfigGetFeeModel, gatewayID, paymentMethod).Scan(
 		&m.GatewayID, &m.PaymentMethod, &m.FixedPaise, &m.PercentageBPS,
 		&m.InterchangeCapPaise, &m.DiscountVolumeThresholdPaise,
 	)
@@ -119,11 +80,7 @@ func (s *ConfigStore) GetFeeModel(ctx context.Context, gatewayID, paymentMethod 
 
 func (s *ConfigStore) GetMetadataSchema(ctx context.Context, gatewayID string) (*ports.GatewayMetadataSchema, error) {
 	var schema ports.GatewayMetadataSchema
-	err := s.db.pool.QueryRow(ctx, `
-		SELECT gateway_id, allowed_keys, required_keys, max_size_bytes
-		FROM gateway_metadata_schemas
-		WHERE gateway_id = $1
-	`, gatewayID).Scan(
+	err := s.db.pool.QueryRow(ctx, s.q.ConfigGetMetadataSchema, gatewayID).Scan(
 		&schema.GatewayID, &schema.AllowedKeys,
 		&schema.RequiredKeys, &schema.MaxSizeBytes,
 	)
@@ -140,22 +97,12 @@ func (s *ConfigStore) GetRoutingWeights(ctx context.Context, merchantTier string
 	var w ports.RoutingWeights
 
 	// Try tier-specific first, fall back to default.
-	err := s.db.pool.QueryRow(ctx, `
-		SELECT merchant_tier, volume_score, cost_score, reliability_score,
-		       fx_efficiency_score, latency_score
-		FROM gateway_routing_weights
-		WHERE merchant_tier = $1
-	`, merchantTier).Scan(
+	err := s.db.pool.QueryRow(ctx, s.q.ConfigGetRoutingWeights, merchantTier).Scan(
 		&w.MerchantTier, &w.VolumeScore, &w.CostScore,
 		&w.ReliabilityScore, &w.FXEfficiencyScore, &w.LatencyScore,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		err = s.db.pool.QueryRow(ctx, `
-			SELECT merchant_tier, volume_score, cost_score, reliability_score,
-			       fx_efficiency_score, latency_score
-			FROM gateway_routing_weights
-			WHERE merchant_tier = 'default'
-		`).Scan(
+		err = s.db.pool.QueryRow(ctx, s.q.ConfigGetRoutingWeightsDefault).Scan(
 			&w.MerchantTier, &w.VolumeScore, &w.CostScore,
 			&w.ReliabilityScore, &w.FXEfficiencyScore, &w.LatencyScore,
 		)
@@ -167,11 +114,7 @@ func (s *ConfigStore) GetRoutingWeights(ctx context.Context, merchantTier string
 }
 
 func (s *ConfigStore) WebhookPolicy(ctx context.Context, gatewayID string) (replayWindowSec, clockSkewSec int, err error) {
-	err = s.db.pool.QueryRow(ctx, `
-		SELECT webhook_replay_window_sec, webhook_clock_skew_sec
-		FROM gateway_config
-		WHERE gateway_id = $1
-	`, gatewayID).Scan(&replayWindowSec, &clockSkewSec)
+	err = s.db.pool.QueryRow(ctx, s.q.ConfigWebhookPolicy, gatewayID).Scan(&replayWindowSec, &clockSkewSec)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 300, 30, nil
 	}
@@ -183,11 +126,7 @@ func (s *ConfigStore) WebhookPolicy(ctx context.Context, gatewayID string) (repl
 
 func (s *ConfigStore) GetProcessingTimeout(ctx context.Context, gatewayID, paymentMethod string) (time.Duration, error) {
 	var sec int
-	err := s.db.pool.QueryRow(ctx, `
-		SELECT estimated_timeout_sec
-		FROM gateway_timeouts
-		WHERE gateway_id = $1 AND payment_method = $2
-	`, gatewayID, paymentMethod).Scan(&sec)
+	err := s.db.pool.QueryRow(ctx, s.q.ConfigGetProcessingTimeout, gatewayID, paymentMethod).Scan(&sec)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, fmt.Errorf("config_store: no timeout configured for %s/%s", gatewayID, paymentMethod)
 	}
@@ -198,11 +137,7 @@ func (s *ConfigStore) GetProcessingTimeout(ctx context.Context, gatewayID, payme
 }
 
 func (s *ConfigStore) getTimeouts(ctx context.Context, gatewayID string) (map[string]time.Duration, error) {
-	rows, err := s.db.pool.Query(ctx, `
-		SELECT payment_method, estimated_timeout_sec
-		FROM gateway_timeouts
-		WHERE gateway_id = $1
-	`, gatewayID)
+	rows, err := s.db.pool.Query(ctx, s.q.ConfigListTimeouts, gatewayID)
 	if err != nil {
 		return nil, fmt.Errorf("config_store: get timeouts for %s: %w", gatewayID, err)
 	}
