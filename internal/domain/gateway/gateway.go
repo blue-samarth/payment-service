@@ -59,6 +59,9 @@ func CooldownDuration(consecutiveFailures int) time.Duration {
 	if consecutiveFailures <= 0 {
 		consecutiveFailures = 1
 	}
+	if consecutiveFailures > 4 {
+		consecutiveFailures = 4
+	}
 	base := 60 * time.Second
 	d := base * time.Duration(1<<(consecutiveFailures-1))
 	max := 240 * time.Second

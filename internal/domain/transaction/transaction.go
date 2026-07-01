@@ -228,5 +228,8 @@ func (t *Transaction) Validate() error {
 	if t.GatewayID == "" {
 		return fmt.Errorf("gatewayID must not be empty")
 	}
+	if t.EstimatedTimeoutSeconds <= 0 {
+		return fmt.Errorf("estimatedTimeoutSeconds must be positive, got %d", t.EstimatedTimeoutSeconds)
+	}
 	return nil
 }

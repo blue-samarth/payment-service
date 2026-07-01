@@ -118,13 +118,13 @@ func (e *Entry) EligibleForAutoResolution(cfg AutoResolutionConfig) (bool, strin
 		return false, "gateway amount is zero, cannot compute percentage"
 	}
 
-	pctCheck := discrepancy*10000/settledAmount <= int64(cfg.ThresholdBPS)
+	pctCheck := discrepancy*10000 <= int64(cfg.ThresholdBPS)*settledAmount
 	absCheck := discrepancy <= cfg.AbsoluteCapPaise
 
 	if !pctCheck {
 		return false, fmt.Sprintf(
 			"percentage check failed: %.4f%% > %.4f%%",
-			float64(discrepancy*10000/settledAmount)/100,
+			float64(discrepancy*10000)/float64(settledAmount)/100,
 			float64(cfg.ThresholdBPS)/100,
 		)
 	}

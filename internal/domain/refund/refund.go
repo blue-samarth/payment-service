@@ -100,6 +100,15 @@ func New(
 	if initiatedBy == "" {
 		return nil, fmt.Errorf("refund: initiatedBy must not be empty")
 	}
+	if originalAmount <= 0 {
+		return nil, fmt.Errorf("refund: originalAmount must be > 0, got %d", originalAmount)
+	}
+	if alreadyRefunded < 0 {
+		return nil, fmt.Errorf("refund: alreadyRefunded must be >= 0, got %d", alreadyRefunded)
+	}
+	if alreadyRefunded > originalAmount {
+		return nil, fmt.Errorf("refund: alreadyRefunded %d exceeds originalAmount %d", alreadyRefunded, originalAmount)
+	}
 	if alreadyRefunded+amount > originalAmount {
 		return nil, ErrOverRefund{
 			OriginalAmount:  originalAmount,
