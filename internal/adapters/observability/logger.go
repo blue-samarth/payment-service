@@ -20,10 +20,6 @@ func NewSlogLogger(level slog.Level) *SlogLogger {
 	return &SlogLogger{base: slog.New(h)}
 }
 
-func NewSlogLoggerFromHandler(h slog.Handler) *SlogLogger {
-	return &SlogLogger{base: slog.New(h)}
-}
-
 func fieldsToAttrs(fields map[string]any) []any {
 	attrs := make([]any, 0, len(fields)*2)
 	for k, v := range fields {
@@ -32,13 +28,12 @@ func fieldsToAttrs(fields map[string]any) []any {
 	return attrs
 }
 
-func (l *SlogLogger) Info(event string, fields map[string]any) {
-	l.base.Info(event, fieldsToAttrs(fields)...)
-}
-
-func (l *SlogLogger) Warn(event string, fields map[string]any) {
-	l.base.Warn(event, fieldsToAttrs(fields)...)
-}
+func NewSlogLoggerFromHandler(h slog.Handler) *SlogLogger { return &SlogLogger{base: slog.New(h)} }
+func (l *SlogLogger) Info(event string, fields map[string]any) { l.base.Info(event, fieldsToAttrs(fields)...) }
+func (l *SlogLogger) Warn(event string, fields map[string]any) { l.base.Warn(event, fieldsToAttrs(fields)...) }
+func (l *SlogLogger) Debug(event string, fields map[string]any) { l.base.Debug(event, fieldsToAttrs(fields)...) }
+func (l *SlogLogger) Trace(event string, fields map[string]any) { l.base.Log(context.Background(), levelTrace, event, fieldsToAttrs(fields)...) }
+func (l *SlogLogger) With(fields map[string]any) ports.Logger { return &SlogLogger{base: l.base.With(fieldsToAttrs(fields)...)} }
 
 func (l *SlogLogger) Error(event string, fields map[string]any, err error) {
 	if fields == nil {
@@ -61,18 +56,6 @@ func (l *SlogLogger) Error(event string, fields map[string]any, err error) {
 	}
 
 	l.base.Error(event, attrs...)
-}
-
-func (l *SlogLogger) Debug(event string, fields map[string]any) {
-	l.base.Debug(event, fieldsToAttrs(fields)...)
-}
-
-func (l *SlogLogger) Trace(event string, fields map[string]any) {
-	l.base.Log(context.Background(), levelTrace, event, fieldsToAttrs(fields)...)
-}
-
-func (l *SlogLogger) With(fields map[string]any) ports.Logger {
-	return &SlogLogger{base: l.base.With(fieldsToAttrs(fields)...)}
 }
 
 var _ ports.Logger = (*SlogLogger)(nil)
