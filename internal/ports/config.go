@@ -51,23 +51,23 @@ type GatewayMetrics struct {
 }
 
 type GatewayFeeModel struct {
-	GatewayID                           string
-	PaymentMethod                       string
-	FixedPaise                          int64
-	PercentageBPS                       int64
-	InterchangeCapPaise                 *int64
-	MonthlyDiscountVolumeThresholdPaise int64
+	GatewayID                    string
+	PaymentMethod                string
+	FixedPaise                   int64
+	PercentageBPS                int64
+	InterchangeCapPaise          *int64
+	DiscountVolumeThresholdPaise int64
 }
 
-func (f *GatewayFeeModel) CalculateFee(amountPaise, volume7dPaise int64) int64 {
+func (f *GatewayFeeModel) CalculateFee(amountPaise, discountVolumePaise int64) int64 {
 	fee := (amountPaise*f.PercentageBPS)/10000 + f.FixedPaise
 
 	if f.InterchangeCapPaise != nil && fee > *f.InterchangeCapPaise {
 		fee = *f.InterchangeCapPaise
 	}
 
-	if f.MonthlyDiscountVolumeThresholdPaise > 0 &&
-		volume7dPaise > f.MonthlyDiscountVolumeThresholdPaise {
+	if f.DiscountVolumeThresholdPaise > 0 &&
+		discountVolumePaise > f.DiscountVolumeThresholdPaise {
 		fee = (fee * 95) / 100
 	}
 

@@ -50,7 +50,7 @@ const (
 	MetricFeeCacheHit       = "gateway_fee_cache.hit"
 	MetricFeeCacheMiss      = "gateway_fee_cache.miss"
 	MetricFeeCacheStale     = "gateway_fee_cache.stale"
-	MetricFeeCacheStaleness = "GATEWAY_FEE_CACHE_STALENESS"
+	MetricFeeCacheStaleness = "gateway_fee_cache.staleness"
 
 	MetricReconciliationMismatchRate    = "reconciliation.mismatch_rate"
 	MetricReconciliationJobDurationMs   = "reconciliation.job_duration_ms"

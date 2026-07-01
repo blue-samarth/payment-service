@@ -88,6 +88,9 @@ func New(
 	reason string,
 	initiatedBy string,
 ) (*Refund, error) {
+	if transactionID == uuid.Nil {
+		return nil, fmt.Errorf("refund: transactionID must not be nil")
+	}
 	if amount <= 0 {
 		return nil, fmt.Errorf("refund: amount must be > 0, got %d", amount)
 	}

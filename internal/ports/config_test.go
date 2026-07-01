@@ -53,13 +53,13 @@ func TestGatewayFeeModel_CalculateFee(t *testing.T) {
 		}
 	})
 	t.Run("volume discount applied", func(t *testing.T) {
-		f := &GatewayFeeModel{PercentageBPS: 200, FixedPaise: 100, MonthlyDiscountVolumeThresholdPaise: 50000}
+		f := &GatewayFeeModel{PercentageBPS: 200, FixedPaise: 100, DiscountVolumeThresholdPaise: 50000}
 		if got := f.CalculateFee(100000, 60000); got != 1995 {
 			t.Errorf("expected discounted 1995, got %d", got)
 		}
 	})
 	t.Run("no discount below threshold", func(t *testing.T) {
-		f := &GatewayFeeModel{PercentageBPS: 200, FixedPaise: 100, MonthlyDiscountVolumeThresholdPaise: 50000}
+		f := &GatewayFeeModel{PercentageBPS: 200, FixedPaise: 100, DiscountVolumeThresholdPaise: 50000}
 		if got := f.CalculateFee(100000, 40000); got != 2100 {
 			t.Errorf("expected undiscounted 2100, got %d", got)
 		}
