@@ -10,18 +10,10 @@ import (
 type stubAdapter struct{ ports.GatewayAdapter }
 
 func (stubAdapter) Capabilities() ports.GatewayCapabilities { return ports.GatewayCapabilities{} }
-func (stubAdapter) InitiatePayment(context.Context, ports.GatewayPaymentRequest) (*ports.GatewayPaymentResponse, error) {
-	return nil, nil
-}
-func (stubAdapter) CheckStatus(context.Context, ports.GatewayStatusRequest) (*ports.GatewayPaymentResponse, error) {
-	return nil, nil
-}
-func (stubAdapter) Refund(context.Context, ports.GatewayRefundRequest) (*ports.GatewayRefundResponse, error) {
-	return nil, nil
-}
-func (stubAdapter) Cancel(context.Context, ports.GatewayCancelRequest) (*ports.GatewayCancelResponse, error) {
-	return nil, nil
-}
+func (stubAdapter) InitiatePayment(context.Context, ports.GatewayPaymentRequest) (*ports.GatewayPaymentResponse, error) { return nil, nil }
+func (stubAdapter) CheckStatus(context.Context, ports.GatewayStatusRequest) (*ports.GatewayPaymentResponse, error) { return nil, nil }
+func (stubAdapter) Refund(context.Context, ports.GatewayRefundRequest) (*ports.GatewayRefundResponse, error) { return nil, nil }
+func (stubAdapter) Cancel(context.Context, ports.GatewayCancelRequest) (*ports.GatewayCancelResponse, error) { return nil, nil }
 
 func TestRegistry_RegisterAndGet(t *testing.T) {
 	r := NewRegistry()
