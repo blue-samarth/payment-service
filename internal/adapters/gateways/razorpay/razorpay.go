@@ -25,6 +25,8 @@ type Config struct {
 	HTTPClient *http.Client
 }
 
+const maxResponseBytes = 2 << 20
+
 type Adapter struct {
 	keyID     string
 	keySecret string
@@ -53,7 +55,7 @@ func (a *Adapter) Capabilities() ports.GatewayCapabilities {
 	return ports.GatewayCapabilities{
 		SupportsCancel:        false,
 		SupportsPartialRefund: true,
-		IdempotencyCapable:    true,
+		IdempotencyCapable:    false,
 		SupportedPaymentMethods: []transaction.PaymentMethod{
 			transaction.PaymentMethodCard, transaction.PaymentMethodUPI,
 			transaction.PaymentMethodNetbanking, transaction.PaymentMethodWallet,
@@ -140,7 +142,10 @@ func (a *Adapter) do(ctx context.Context, method, path string, body any, out any
 	}
 	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return &ports.GatewayError{Category: ports.ErrorCategoryNetworkTimeout, Code: "read_error", GatewayMessage: err.Error(), Retryable: true, Underlying: err}
+	}
 	if resp.StatusCode >= 400 {
 		var env rzpErrorEnvelope
 		_ = json.Unmarshal(data, &env)

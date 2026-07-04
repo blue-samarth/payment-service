@@ -25,8 +25,8 @@ func (a *Adapter) ParseWebhook(body []byte, headers map[string]string, secret st
 		return nil, ports.ErrWebhookSignature
 	}
 
-	expected := reverseHash(secret, form)
-	if !hmac.Equal([]byte(strings.ToLower(expected)), []byte(strings.ToLower(provided))) {
+	providedMAC, err := hex.DecodeString(strings.ToLower(provided))
+	if err != nil || !hmac.Equal(reverseHash(secret, form), providedMAC) {
 		return nil, ports.ErrWebhookSignature
 	}
 
@@ -46,7 +46,7 @@ func (a *Adapter) ParseWebhook(body []byte, headers map[string]string, secret st
 	}, nil
 }
 
-func reverseHash(salt string, form url.Values) string {
+func reverseHash(salt string, form url.Values) []byte {
 	fields := []string{
 		salt,
 		form.Get("status"),
@@ -55,6 +55,16 @@ func reverseHash(salt string, form url.Values) string {
 		form.Get("email"), form.Get("firstname"), form.Get("productinfo"),
 		form.Get("amount"), form.Get("txnid"), form.Get("key"),
 	}
+	if ac := additionalCharges(form); ac != "" {
+		fields = append([]string{ac}, fields...)
+	}
 	sum := sha512.Sum512([]byte(strings.Join(fields, "|")))
-	return hex.EncodeToString(sum[:])
+	return sum[:]
+}
+
+func additionalCharges(form url.Values) string {
+	if ac := form.Get("additionalCharges"); ac != "" {
+		return ac
+	}
+	return form.Get("additional_charges")
 }

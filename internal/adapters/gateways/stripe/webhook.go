@@ -32,12 +32,15 @@ func (a *Adapter) ParseWebhook(body []byte, headers map[string]string, secret st
 		return nil, ports.ErrWebhookSignature
 	}
 
+	providedMAC, err := hex.DecodeString(v1)
+	if err != nil {
+		return nil, ports.ErrWebhookSignature
+	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(strconv.FormatInt(ts, 10)))
 	mac.Write([]byte("."))
 	mac.Write(body)
-	expected := hex.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(expected), []byte(v1)) {
+	if !hmac.Equal(mac.Sum(nil), providedMAC) {
 		return nil, ports.ErrWebhookSignature
 	}
 

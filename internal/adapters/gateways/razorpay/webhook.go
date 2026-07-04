@@ -23,14 +23,13 @@ type rzpWebhook struct {
 }
 
 func (a *Adapter) ParseWebhook(body []byte, headers map[string]string, secret string) (*ports.GatewayWebhookEvent, error) {
-	provided := headers["X-Razorpay-Signature"]
-	if provided == "" {
+	providedMAC, err := hex.DecodeString(headers["X-Razorpay-Signature"])
+	if err != nil || len(providedMAC) == 0 {
 		return nil, ports.ErrWebhookSignature
 	}
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write(body)
-	expected := hex.EncodeToString(mac.Sum(nil))
-	if !hmac.Equal([]byte(expected), []byte(provided)) {
+	if !hmac.Equal(mac.Sum(nil), providedMAC) {
 		return nil, ports.ErrWebhookSignature
 	}
 

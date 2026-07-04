@@ -25,6 +25,8 @@ type Config struct {
 	HTTPClient   *http.Client
 }
 
+const maxResponseBytes = 2 << 20
+
 type Adapter struct {
 	key     string
 	salt    string
@@ -153,7 +155,10 @@ func (a *Adapter) postService(ctx context.Context, command, var1 string, extraVa
 	}
 	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		return &ports.GatewayError{Category: ports.ErrorCategoryNetworkTimeout, Code: "read_error", GatewayMessage: err.Error(), Retryable: true, Underlying: err}
+	}
 	if resp.StatusCode >= 400 {
 		return &ports.GatewayError{Category: ports.ErrorCategoryGatewayError, Code: "gateway_error", GatewayCode: strconv.Itoa(resp.StatusCode), GatewayMessage: string(data)}
 	}

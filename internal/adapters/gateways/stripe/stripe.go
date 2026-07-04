@@ -24,6 +24,8 @@ type Config struct {
 	HTTPClient *http.Client
 }
 
+const maxResponseBytes = 2 << 20
+
 type Adapter struct {
 	apiKey  string
 	baseURL string
@@ -72,6 +74,8 @@ func (a *Adapter) InitiatePayment(ctx context.Context, req ports.GatewayPaymentR
 		form.Set("receipt_email", req.CustomerEmail)
 	}
 	form.Set("metadata[transaction_id]", req.TransactionID.String())
+	form.Add("expand[]", "latest_charge")
+	form.Add("expand[]", "latest_charge.balance_transaction")
 
 	var pi stripePaymentIntent
 	if err := a.do(ctx, http.MethodPost, "/v1/payment_intents", form, idem, &pi); err != nil {
@@ -81,8 +85,13 @@ func (a *Adapter) InitiatePayment(ctx context.Context, req ports.GatewayPaymentR
 }
 
 func (a *Adapter) CheckStatus(ctx context.Context, req ports.GatewayStatusRequest) (*ports.GatewayPaymentResponse, error) {
+	q := url.Values{}
+	q.Add("expand[]", "latest_charge")
+	q.Add("expand[]", "latest_charge.balance_transaction")
+
 	var pi stripePaymentIntent
-	if err := a.do(ctx, http.MethodGet, "/v1/payment_intents/"+url.PathEscape(req.GatewayReferenceID), nil, "", &pi); err != nil {
+	path := "/v1/payment_intents/" + url.PathEscape(req.GatewayReferenceID) + "?" + q.Encode()
+	if err := a.do(ctx, http.MethodGet, path, nil, "", &pi); err != nil {
 		return nil, err
 	}
 	return toPaymentResponse(&pi), nil
@@ -151,7 +160,7 @@ func (a *Adapter) do(ctx context.Context, method, path string, form url.Values, 
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
 		return &ports.GatewayError{Category: ports.ErrorCategoryNetworkTimeout, Code: "read_error", GatewayMessage: err.Error(), Retryable: true, Underlying: err}
 	}
@@ -205,8 +214,7 @@ func toPaymentResponse(pi *stripePaymentIntent) *ports.GatewayPaymentResponse {
 		resp.ErrorCode = firstNonEmpty(pi.LastPaymentError.DeclineCode, pi.LastPaymentError.Code)
 		resp.ErrorMessage = pi.LastPaymentError.Message
 	}
-	if pi.Charges != nil && len(pi.Charges.Data) > 0 {
-		c := pi.Charges.Data[0]
+	if c := latestCharge(pi); c != nil {
 		resp.GatewayFees = c.balanceTransactionFee()
 		if c.PaymentMethodDetails != nil && c.PaymentMethodDetails.Card != nil {
 			resp.MethodResponse = &ports.GatewayCardResponse{
@@ -217,6 +225,16 @@ func toPaymentResponse(pi *stripePaymentIntent) *ports.GatewayPaymentResponse {
 		}
 	}
 	return resp
+}
+
+func latestCharge(pi *stripePaymentIntent) *stripeCharge {
+	if c := decodeExpanded[stripeCharge](pi.LatestCharge); c != nil {
+		return c
+	}
+	if pi.Charges != nil && len(pi.Charges.Data) > 0 {
+		return &pi.Charges.Data[0]
+	}
+	return nil
 }
 
 func mapPaymentStatus(pi *stripePaymentIntent) ports.GatewayPaymentStatus {

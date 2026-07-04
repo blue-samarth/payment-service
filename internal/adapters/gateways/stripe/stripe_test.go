@@ -59,6 +59,35 @@ func TestInitiatePayment_Success(t *testing.T) {
 	}
 }
 
+func TestInitiatePayment_ExtractsFeesAndCardFromLatestCharge(t *testing.T) {
+	var expand []string
+	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		expand = r.Form["expand[]"]
+		_, _ = w.Write([]byte(`{"id":"pi_1","status":"succeeded","amount":150000,"currency":"usd",
+			"latest_charge":{"id":"ch_1","balance_transaction":{"fee":4350},
+			"payment_method_details":{"card":{"brand":"visa","last4":"4242","network":"visa"}}}}`))
+	})
+	defer srv.Close()
+
+	resp, err := a.InitiatePayment(context.Background(), ports.GatewayPaymentRequest{
+		TransactionID: uuid.New(), Amount: 150000, Currency: "USD", AttemptNumber: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GatewayFees != 4350 {
+		t.Errorf("expected fee 4350 from latest_charge.balance_transaction, got %d", resp.GatewayFees)
+	}
+	card, ok := resp.MethodResponse.(*ports.GatewayCardResponse)
+	if !ok || card.Last4 != "4242" || card.CardBrand != "visa" {
+		t.Errorf("expected card details from latest_charge, got %+v", resp.MethodResponse)
+	}
+	if len(expand) != 2 {
+		t.Errorf("expected latest_charge + balance_transaction expansion requested, got %v", expand)
+	}
+}
+
 func TestInitiatePayment_UsesProvidedIdempotencyKey(t *testing.T) {
 	var gotIdem string
 	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
