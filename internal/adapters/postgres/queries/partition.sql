@@ -1,8 +1,8 @@
 -- name: PartitionAdvisoryLock
-SELECT pg_try_advisory_lock(42);
+SELECT pg_try_advisory_lock($1);
 
 -- name: PartitionAdvisoryUnlock
-SELECT pg_advisory_unlock(42);
+SELECT pg_advisory_unlock($1);
 
 -- name: PartitionList
 SELECT c.relname

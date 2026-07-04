@@ -91,15 +91,22 @@ func (s *CircuitBreakerStore) Transition(ctx context.Context, cb *gateway.Circui
 }
 
 func (s *CircuitBreakerStore) RecordFailure(ctx context.Context, gatewayID string, threshold int) (opened bool, failures int, err error) {
-	cooldown := time.Now().UTC().Add(gateway.CooldownDuration(threshold)).Format(time.RFC3339)
-	res, err := cbRecordFailureScript.Run(ctx, s.client, []string{cbKey(gatewayID)}, threshold, cooldown).Int64Slice()
+	res, err := cbRecordFailureScript.Run(ctx, s.client, []string{cbKey(gatewayID)}, threshold).Int64Slice()
 	if err != nil {
 		return false, 0, fmt.Errorf("circuit_breaker: record failure %s: %w", gatewayID, err)
 	}
 	if len(res) != 2 {
 		return false, 0, fmt.Errorf("circuit_breaker: record failure %s: unexpected result", gatewayID)
 	}
-	return res[0] == 1, int(res[1]), nil
+	opened, failures = res[0] == 1, int(res[1])
+
+	if opened {
+		cooldown := time.Now().UTC().Add(gateway.CooldownDuration(failures)).Format(time.RFC3339)
+		if err := cbSetCooldownScript.Run(ctx, s.client, []string{cbKey(gatewayID)}, cooldown).Err(); err != nil {
+			return opened, failures, fmt.Errorf("circuit_breaker: set cooldown %s: %w", gatewayID, err)
+		}
+	}
+	return opened, failures, nil
 }
 
 func (s *CircuitBreakerStore) RecordSuccess(ctx context.Context, gatewayID string) error {
@@ -118,17 +125,10 @@ func (s *CircuitBreakerStore) AcquireProbe(ctx context.Context, gatewayID string
 }
 
 func (s *CircuitBreakerStore) SetLastKnownScore(ctx context.Context, gatewayID string, score int) error {
-	raw, _ := s.client.Get(ctx, cbKey(gatewayID)).Bytes()
-	var r cbRecord
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &r)
+	if err := cbSetScoreScript.Run(ctx, s.client, []string{cbKey(gatewayID)}, score).Err(); err != nil {
+		return fmt.Errorf("circuit_breaker: set last known score %s: %w", gatewayID, err)
 	}
-	r.LastKnownScore = score
-	b, err := json.Marshal(r)
-	if err != nil {
-		return err
-	}
-	return s.client.Set(ctx, cbKey(gatewayID), b, 0).Err()
+	return nil
 }
 
 func (s *CircuitBreakerStore) GetCritical(ctx context.Context, gatewayID string) ([]byte, error) {

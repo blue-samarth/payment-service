@@ -1,42 +1,52 @@
-local key        = KEYS[1]
-local legacy_key = KEYS[2]
-local capacity   = tonumber(ARGV[1])
-local rate       = tonumber(ARGV[2])
-local now_ms     = tonumber(ARGV[3])
-local requested  = tonumber(ARGV[4])
+local capacity  = tonumber(ARGV[1])
+local rate      = tonumber(ARGV[2])
+local now_ms    = tonumber(ARGV[3])
+local requested = tonumber(ARGV[4])
 
-local data    = redis.call('HMGET', key, 'tokens', 'last_ms')
-local tokens  = tonumber(data[1])
-local last_ms = tonumber(data[2])
-local used_legacy = 0
+local ttl
+if rate <= 0 then
+  ttl = 3600
+else
+  ttl = math.ceil(capacity / rate) + 10
+end
 
-if tokens == nil and legacy_key and legacy_key ~= '' then
-  local legacy = redis.call('HMGET', legacy_key, 'tokens', 'last_ms')
-  tokens  = tonumber(legacy[1])
-  last_ms = tonumber(legacy[2])
-  if tokens ~= nil then
-    used_legacy = 1
+local n = #KEYS
+local refilled = {}
+local allowed = 1
+local max_wait = 0
+
+for i = 1, n do
+  local data    = redis.call('HMGET', KEYS[i], 'tokens', 'last_ms')
+  local tokens  = tonumber(data[1])
+  local last_ms = tonumber(data[2])
+
+  if tokens == nil then tokens = capacity end
+  if last_ms == nil then last_ms = now_ms end
+
+  local elapsed = math.max(0, now_ms - last_ms) / 1000
+  tokens = math.min(capacity, tokens + elapsed * rate)
+
+  refilled[i] = tokens
+
+  if tokens < requested then
+    allowed = 0
+    local wait
+    if rate <= 0 then
+      wait = ttl * 1000
+    else
+      wait = math.ceil((requested - tokens) / rate * 1000)
+    end
+    if wait > max_wait then max_wait = wait end
   end
 end
 
-if tokens == nil then tokens = capacity end
-if last_ms == nil then last_ms = now_ms end
-
-local elapsed = math.max(0, now_ms - last_ms) / 1000
-tokens = math.min(capacity, tokens + elapsed * rate)
-
-local ttl = math.ceil(capacity / rate) + 10
-
-if tokens < requested then
-  local wait_sec = (requested - tokens) / rate
-  redis.call('HMSET', key, 'tokens', tokens, 'last_ms', now_ms)
-  redis.call('EXPIRE', key, ttl)
-  if used_legacy == 1 then redis.call('DEL', legacy_key) end
-  return {0, math.ceil(wait_sec * 1000)}
+for i = 1, n do
+  local tokens = refilled[i]
+  if allowed == 1 then
+    tokens = tokens - requested
+  end
+  redis.call('HMSET', KEYS[i], 'tokens', tokens, 'last_ms', now_ms)
+  redis.call('EXPIRE', KEYS[i], ttl)
 end
 
-tokens = tokens - requested
-redis.call('HMSET', key, 'tokens', tokens, 'last_ms', now_ms)
-redis.call('EXPIRE', key, ttl)
-if used_legacy == 1 then redis.call('DEL', legacy_key) end
-return {1, 0}
+return { allowed, max_wait }

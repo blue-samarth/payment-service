@@ -18,6 +18,12 @@ var cbRecordFailureLua string
 //go:embed scripts/cb_record_success.lua
 var cbRecordSuccessLua string
 
+//go:embed scripts/cb_set_cooldown.lua
+var cbSetCooldownLua string
+
+//go:embed scripts/cb_set_score.lua
+var cbSetScoreLua string
+
 var tokenBucketScript = goredis.NewScript(tokenBucketLua)
 
 var cbTransitionScript = goredis.NewScript(cbTransitionLua)
@@ -25,3 +31,7 @@ var cbTransitionScript = goredis.NewScript(cbTransitionLua)
 var cbRecordFailureScript = goredis.NewScript(cbRecordFailureLua)
 
 var cbRecordSuccessScript = goredis.NewScript(cbRecordSuccessLua)
+
+var cbSetCooldownScript = goredis.NewScript(cbSetCooldownLua)
+
+var cbSetScoreScript = goredis.NewScript(cbSetScoreLua)

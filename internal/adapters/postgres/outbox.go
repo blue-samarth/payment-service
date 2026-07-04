@@ -7,13 +7,18 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"samarth/payment-service/internal/ports"
 )
 
+const defaultOutboxClaimTTL = 60 * time.Second
+
 type OutboxWriter struct {
-	db *DB
-	q  *Queries
+	db       *DB
+	q        *Queries
+	claimTTL time.Duration
 }
 
 type MerchantWebhookWriter struct {
@@ -21,9 +26,25 @@ type MerchantWebhookWriter struct {
 	q  *Queries
 }
 
+var (
+	_ ports.OutboxWriter          = (*OutboxWriter)(nil)
+	_ ports.MerchantWebhookWriter = (*MerchantWebhookWriter)(nil)
+)
+
 type txKey struct{}
 
-func NewOutboxWriter(db *DB, q *Queries) *OutboxWriter { return &OutboxWriter{db: db, q: q} }
+func NewOutboxWriter(db *DB, q *Queries) *OutboxWriter {
+	return &OutboxWriter{db: db, q: q, claimTTL: defaultOutboxClaimTTL}
+}
+
+// SetClaimTTL controls how long a claimed (PUBLISHING) event stays invisible to
+// other pollers before it is treated as an abandoned claim and reclaimed. It
+// must comfortably exceed the time to publish one batch.
+func (w *OutboxWriter) SetClaimTTL(d time.Duration) {
+	if d > 0 {
+		w.claimTTL = d
+	}
+}
 func NewMerchantWebhookWriter(db *DB, q *Queries) *MerchantWebhookWriter {
 	return &MerchantWebhookWriter{db: db, q: q}
 }
@@ -80,7 +101,7 @@ func (w *OutboxWriter) MarkFailed(ctx context.Context, id uuid.UUID, createdAt t
 		return fmt.Errorf("outbox: mark failed %s: %w", id, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("outbox: event %s not found or not in PENDING state", id)
+		return fmt.Errorf("outbox: event %s not found or not in PUBLISHING state", id)
 	}
 	return nil
 }
@@ -115,30 +136,33 @@ func (w *OutboxWriter) MarkExhausted(ctx context.Context, id uuid.UUID, createdA
 	})
 }
 
+// PollPending atomically claims a batch of due events (PENDING, or a PUBLISHING
+// row whose claim has gone stale past claimTTL), transitioning them to
+// PUBLISHING and returning them. Because the claim is committed before the
+// caller publishes, a second poller no longer sees the same rows — the previous
+// FOR UPDATE SKIP LOCKED SELECT released its lock at commit, before publishing,
+// so two workers could fetch and publish the same event.
 func (w *OutboxWriter) PollPending(ctx context.Context, shardMin, shardMax, batchSize int) ([]ports.PendingEvent, error) {
+	claimTTLSec := int64(w.claimTTL.Seconds())
+
+	rows, err := w.db.pool.Query(ctx, w.q.OutboxPollPending, shardMin, shardMax, batchSize, claimTTLSec)
+	if err != nil {
+		return nil, fmt.Errorf("outbox: poll pending: %w", err)
+	}
+	defer rows.Close()
+
 	var events []ports.PendingEvent
-
-	err := withTx(ctx, w.db.pool, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, w.q.OutboxPollPending, shardMin, shardMax, batchSize)
-		if err != nil {
-			return fmt.Errorf("outbox: poll pending: %w", err)
+	for rows.Next() {
+		var e ports.PendingEvent
+		if err := rows.Scan(
+			&e.ID, &e.AggregateID, &e.AggregateType,
+			&e.EventType, &e.Payload, &e.EventVersion, &e.Attempts, &e.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("outbox: scan pending event: %w", err)
 		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var e ports.PendingEvent
-			if err := rows.Scan(
-				&e.ID, &e.AggregateID, &e.AggregateType,
-				&e.EventType, &e.Payload, &e.EventVersion, &e.Attempts, &e.CreatedAt,
-			); err != nil {
-				return fmt.Errorf("outbox: scan pending event: %w", err)
-			}
-			events = append(events, e)
-		}
-		return rows.Err()
-	})
-
-	return events, err
+		events = append(events, e)
+	}
+	return events, rows.Err()
 }
 
 func (w *OutboxWriter) ReplayDeadLetter(ctx context.Context, deadLetterID uuid.UUID, actor, reason string) (uuid.UUID, error) {
@@ -213,6 +237,19 @@ func txFromContext(ctx context.Context) (pgx.Tx, error) {
 	return tx, nil
 }
 
+type Queryer interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func queryer(ctx context.Context, pool *pgxpool.Pool) Queryer {
+	if tx, ok := ctx.Value(txKey{}).(pgx.Tx); ok && tx != nil {
+		return tx
+	}
+	return pool
+}
+
 func withTx(ctx context.Context, pool interface {
 	Begin(context.Context) (pgx.Tx, error)
 }, fn func(pgx.Tx) error) error {
@@ -220,8 +257,9 @@ func withTx(ctx context.Context, pool interface {
 	if err != nil {
 		return fmt.Errorf("postgres: begin tx: %w", err)
 	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	if err := fn(tx); err != nil {
-		_ = tx.Rollback(ctx)
 		return err
 	}
 	return tx.Commit(ctx)

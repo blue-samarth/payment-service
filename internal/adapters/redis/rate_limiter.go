@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -14,18 +15,27 @@ import (
 	"samarth/payment-service/internal/ports"
 )
 
+const (
+	defaultHealthCheckInterval   = 5 * time.Second
+	defaultRedisFailureThreshold = 3
+)
+
 type RateLimiter struct {
-	client            goredis.UniversalClient
-	cfg               config.RateLimitConfig
-	available         bool
-	mu                sync.RWMutex
-	localBuckets      sync.Map // map[string]*lruBucketEntry for lock-free reads
-	lruOrder          *list.List
-	lruMu             sync.Mutex
-	lruCount          int
-	logger            ports.Logger
-	metrics           ports.MetricRecorder
-	fallbackStartedAt time.Time
+	client              goredis.UniversalClient
+	cfg                 config.RateLimitConfig
+	available           bool
+	mu                  sync.RWMutex
+	localBuckets        sync.Map // map[string]*lruBucketEntry for lock-free reads
+	lruOrder            *list.List
+	lruMu               sync.Mutex
+	lruCount            int
+	logger              ports.Logger
+	metrics             ports.MetricRecorder
+	fallbackStartedAt   time.Time
+	failureThreshold    int
+	consecutiveFailures int32
+	stopHealth          chan struct{}
+	stopOnce            sync.Once
 }
 
 type lruBucketEntry struct {
@@ -48,42 +58,62 @@ type RateLimitResult struct {
 
 func NewRateLimiter(c *Client, cfg config.RateLimitConfig, logger ports.Logger, metrics ports.MetricRecorder) *RateLimiter {
 	r := &RateLimiter{
-		client:    c.RateLimit,
-		cfg:       cfg,
-		available: true,
-		lruOrder:  list.New(),
-		logger:    logger,
-		metrics:   metrics,
+		client:           c.RateLimit,
+		cfg:              cfg,
+		available:        true,
+		lruOrder:         list.New(),
+		logger:           logger,
+		metrics:          metrics,
+		failureThreshold: defaultRedisFailureThreshold,
+		stopHealth:       make(chan struct{}),
 	}
 
 	_ = tokenBucketScript.Load(context.Background(), c.RateLimit).Err()
 
-	// Start background health check with configurable interval
-	go func() {
-		ticker := time.NewTicker(cfg.HealthCheckInterval)
-		defer ticker.Stop()
+	interval := cfg.HealthCheckInterval
+	if interval <= 0 {
+		interval = defaultHealthCheckInterval
+	}
+	go r.runHealthCheck(interval)
 
-		for range ticker.C {
-			if err := c.RateLimit.Ping(context.Background()).Err(); err == nil {
-				_ = tokenBucketScript.Load(context.Background(), c.RateLimit).Err()
+	return r
+}
+
+func (r *RateLimiter) Close() {
+	r.stopOnce.Do(func() { close(r.stopHealth) })
+}
+
+func (r *RateLimiter) runHealthCheck(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.stopHealth:
+			return
+		case <-ticker.C:
+			if err := r.client.Ping(context.Background()).Err(); err == nil {
+				_ = tokenBucketScript.Load(context.Background(), r.client).Err()
 				r.MarkAvailable()
 			} else {
 				r.markUnavailable()
 			}
 		}
-	}()
-
-	return r
+	}
 }
 
-func bucketKeys(namespace, entityID string) (string, string) {
+func bucketKey(namespace, entityID string) string {
 	h := sha256.Sum256([]byte(entityID))
-	primary := fmt.Sprintf("rate_limit:rl:%s:%x", namespace, h[:8])
-	legacy := fmt.Sprintf("rl:%s:%x", namespace, h[:4])
-	return primary, legacy
+	return fmt.Sprintf("rate_limit:rl:%s:%x", namespace, h[:8])
 }
+
+const minRefillRate = 1e-9
 
 func (r *RateLimiter) Allow(ctx context.Context, userID, merchantID, ip string, capacity int64, ratePerSec float64) RateLimitResult {
+	if ratePerSec <= 0 {
+		ratePerSec = minRefillRate
+	}
+
 	r.mu.RLock()
 	avail := r.available
 	r.mu.RUnlock()
@@ -96,66 +126,75 @@ func (r *RateLimiter) Allow(ctx context.Context, userID, merchantID, ip string, 
 
 func (r *RateLimiter) allowRedis(ctx context.Context, userID, merchantID, ip string, capacity int64, ratePerSec float64) RateLimitResult {
 	nowMs := time.Now().UnixMilli()
-	userPrimary, userLegacy := bucketKeys("user", userID)
-	merchantPrimary, merchantLegacy := bucketKeys("merchant", merchantID)
-	ipPrimary, ipLegacy := bucketKeys("ip", ip)
-	keys := [][2]string{
-		{userPrimary, userLegacy},
-		{merchantPrimary, merchantLegacy},
-		{ipPrimary, ipLegacy},
+
+	keys := []string{
+		bucketKey("user", userID),
+		bucketKey("merchant", merchantID),
+		bucketKey("ip", ip),
 	}
 
-	pipe := r.client.Pipeline()
-
-	cmds := make([]*goredis.Cmd, 0, len(keys))
-	for _, keyPair := range keys {
-		cmd := tokenBucketScript.Run(ctx, pipe, []string{keyPair[0], keyPair[1]},
-			capacity, ratePerSec, nowMs, 1,
-		)
-		cmds = append(cmds, cmd)
-	}
-
-	if _, err := pipe.Exec(ctx); err != nil {
-		r.markUnavailable()
+	res, err := tokenBucketScript.Run(ctx, r.client, keys, capacity, ratePerSec, nowMs, 1).Int64Slice()
+	if err != nil || len(res) != 2 {
+		r.recordRedisFailure()
 		return r.allowLocal(userID, merchantID, ip, capacity, ratePerSec)
 	}
+	r.recordRedisSuccess()
 
-	var maxWait int64
-	for _, cmd := range cmds {
-		res, err := cmd.Int64Slice()
-		if err != nil {
-			r.markUnavailable()
-			return r.allowLocal(userID, merchantID, ip, capacity, ratePerSec)
-		}
-		if res[0] == 0 {
-			if res[1] > maxWait {
-				maxWait = res[1]
-			}
-		}
-	}
-
-	if maxWait > 0 {
-		return RateLimitResult{Allowed: false, RetryAfter: time.Duration(maxWait) * time.Millisecond}
+	if res[0] == 0 {
+		return RateLimitResult{Allowed: false, RetryAfter: time.Duration(res[1]) * time.Millisecond}
 	}
 	return RateLimitResult{Allowed: true}
+}
+
+func (r *RateLimiter) recordRedisFailure() {
+	if int(atomic.AddInt32(&r.consecutiveFailures, 1)) >= r.failureThreshold {
+		r.markUnavailable()
+	}
+}
+
+func (r *RateLimiter) recordRedisSuccess() {
+	atomic.StoreInt32(&r.consecutiveFailures, 0)
 }
 
 func (r *RateLimiter) allowLocal(userID, merchantID, ip string, capacity int64, ratePerSec float64) RateLimitResult {
 	localCap := float64(capacity) * r.cfg.FallbackMultiplier
 
-	for _, id := range []string{userID, merchantID, ip} {
-		b := r.getOrCreateBucket(id, localCap, ratePerSec)
+	ids := []string{userID, merchantID, ip}
+	buckets := make([]*localBucket, len(ids))
+	for i, id := range ids {
+		buckets[i] = r.getOrCreateBucket(id, localCap, ratePerSec)
+	}
+
+	allowed := true
+	var maxWait time.Duration
+	now := time.Now()
+	for _, b := range buckets {
 		b.mu.Lock()
-		now := time.Now()
+		b.capacity = localCap
+		b.refillRate = ratePerSec
 		elapsed := now.Sub(b.lastRefill).Seconds()
 		b.tokens = min(b.capacity, b.tokens+elapsed*b.refillRate)
 		b.lastRefill = now
 		if b.tokens < 1 {
-			wait := time.Duration((1-b.tokens)/b.refillRate*1000) * time.Millisecond
-			b.mu.Unlock()
-			return RateLimitResult{Allowed: false, RetryAfter: wait}
+			allowed = false
+			if b.refillRate > 0 {
+				if wait := time.Duration((1-b.tokens)/b.refillRate*1000) * time.Millisecond; wait > maxWait {
+					maxWait = wait
+				}
+			}
 		}
-		b.tokens--
+		b.mu.Unlock()
+	}
+
+	if !allowed {
+		return RateLimitResult{Allowed: false, RetryAfter: maxWait}
+	}
+
+	for _, b := range buckets {
+		b.mu.Lock()
+		if b.tokens >= 1 {
+			b.tokens--
+		}
 		b.mu.Unlock()
 	}
 	return RateLimitResult{Allowed: true}
@@ -244,6 +283,7 @@ func (r *RateLimiter) MarkAvailable() {
 	r.fallbackStartedAt = time.Time{}
 	r.mu.Unlock()
 
+	atomic.StoreInt32(&r.consecutiveFailures, 0)
 	r.recordFallbackRestored(startedAt)
 }
 
@@ -286,11 +326,4 @@ func (r *RateLimiter) IsAvailable() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.available
-}
-
-func min(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
 }

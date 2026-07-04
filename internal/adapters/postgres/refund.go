@@ -46,7 +46,7 @@ func (r *RefundRepository) Insert(ctx context.Context, rf *refund.Refund) error 
 }
 
 func (r *RefundRepository) GetByID(ctx context.Context, id uuid.UUID) (*refund.Refund, error) {
-	row := r.db.pool.QueryRow(ctx, r.q.RefundGetByID, id)
+	row := queryer(ctx, r.db.pool).QueryRow(ctx, r.q.RefundGetByID, id)
 	return scanRefund(row)
 }
 
@@ -91,7 +91,7 @@ func (r *RefundRepository) UpdateStatus(ctx context.Context, rf *refund.Refund) 
 
 func (r *RefundRepository) ExistsByReason(ctx context.Context, transactionID uuid.UUID, reason string) (bool, error) {
 	var exists bool
-	err := r.db.pool.QueryRow(ctx, r.q.RefundExistsByReason, transactionID, reason).Scan(&exists)
+	err := queryer(ctx, r.db.pool).QueryRow(ctx, r.q.RefundExistsByReason, transactionID, reason).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("refund: exists by reason %s/%s: %w", transactionID, reason, err)
 	}

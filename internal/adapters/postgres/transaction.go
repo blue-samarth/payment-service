@@ -63,12 +63,12 @@ func (r *TransactionRepository) Insert(ctx context.Context, t *transaction.Trans
 }
 
 func (r *TransactionRepository) GetByID(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error) {
-	row := r.db.pool.QueryRow(ctx, r.q.TransactionGetByID, id)
+	row := queryer(ctx, r.db.pool).QueryRow(ctx, r.q.TransactionGetByID, id)
 	return scanTransaction(row)
 }
 
 func (r *TransactionRepository) GetByGatewayReference(ctx context.Context, gatewayID, reference string) (*transaction.Transaction, error) {
-	row := r.db.pool.QueryRow(ctx, r.q.TransactionGetByGatewayRef, gatewayID, reference)
+	row := queryer(ctx, r.db.pool).QueryRow(ctx, r.q.TransactionGetByGatewayRef, gatewayID, reference)
 	t, err := scanTransaction(row)
 	if errors.Is(err, ErrNotFound) {
 		return nil, nil
@@ -106,6 +106,13 @@ func (r *TransactionRepository) UpdateStatus(ctx context.Context, t *transaction
 		t.Version,
 	).Scan(&newVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
+		var exists bool
+		if e := tx.QueryRow(ctx, r.q.TransactionExists, t.ID).Scan(&exists); e != nil {
+			return fmt.Errorf("transaction: disambiguate update %s: %w", t.ID, e)
+		}
+		if !exists {
+			return ErrNotFound
+		}
 		return ErrVersionConflict
 	}
 	if err != nil {
@@ -117,37 +124,15 @@ func (r *TransactionRepository) UpdateStatus(ctx context.Context, t *transaction
 }
 
 func (r *TransactionRepository) SetCancelIntent(ctx context.Context, id uuid.UUID, by transaction.Actor, via transaction.CancelVia) (bool, error) {
-	tag, err := r.db.pool.Exec(ctx, r.q.TransactionSetCancelIntent, id, by, via)
+	tag, err := queryer(ctx, r.db.pool).Exec(ctx, r.q.TransactionSetCancelIntent, id, by, via)
 	if err != nil {
 		return false, fmt.Errorf("transaction: set cancel intent %s: %w", id, err)
 	}
 	return tag.RowsAffected() == 1, nil
 }
 
-func (r *TransactionRepository) ListExpiredLeases(ctx context.Context) ([]*transaction.Transaction, error) {
-	rows, err := r.db.pool.Query(ctx, r.q.TransactionListExpiredLeases)
-	if err != nil {
-		return nil, fmt.Errorf("transaction: list expired leases: %w", err)
-	}
-	defer rows.Close()
-
-	var txns []*transaction.Transaction
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("transaction: scan expired lease id: %w", err)
-		}
-		t, err := r.GetByID(ctx, id)
-		if err != nil {
-			return nil, err
-		}
-		txns = append(txns, t)
-	}
-	return txns, rows.Err()
-}
-
 func (r *TransactionRepository) ListExpiredLeaseIDs(ctx context.Context) ([]uuid.UUID, error) {
-	rows, err := r.db.pool.Query(ctx, r.q.TransactionListExpiredLeases)
+	rows, err := queryer(ctx, r.db.pool).Query(ctx, r.q.TransactionListExpiredLeases)
 	if err != nil {
 		return nil, fmt.Errorf("transaction: list expired lease ids: %w", err)
 	}
@@ -168,7 +153,7 @@ func scanTransaction(row pgx.Row) (*transaction.Transaction, error) {
 	var t transaction.Transaction
 	var failureReasonRaw []byte
 	var methodDetailsRaw []byte
-	var processingTimeout *string
+	var processingTimeoutSec *float64
 	var cancelBy, cancelVia *string
 
 	err := row.Scan(
@@ -178,7 +163,7 @@ func scanTransaction(row pgx.Row) (*transaction.Transaction, error) {
 		&t.EstimatedTimeoutSeconds, &failureReasonRaw, &methodDetailsRaw, &t.Metadata,
 		&t.Description, &t.CustomerID, &t.CustomerEmail,
 		&t.CancelIntent, &cancelBy, &t.CancelRequestedAt, &cancelVia,
-		&t.ProcessingStartedAt, &processingTimeout,
+		&t.ProcessingStartedAt, &processingTimeoutSec,
 		&t.CreatedAt, &t.UpdatedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -207,11 +192,8 @@ func scanTransaction(row pgx.Row) (*transaction.Transaction, error) {
 		}
 	}
 
-	if processingTimeout != nil {
-		d, err := parseInterval(*processingTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("transaction: parse processing_timeout: %w", err)
-		}
+	if processingTimeoutSec != nil {
+		d := time.Duration(*processingTimeoutSec * float64(time.Second))
 		t.ProcessingTimeout = &d
 	}
 
@@ -223,24 +205,4 @@ func nullIfEmpty(s string) any {
 		return nil
 	}
 	return s
-}
-
-func parseInterval(s string) (time.Duration, error) {
-	var days, h, m int
-	var sec float64
-
-	if n, _ := fmt.Sscanf(s, "%d days %d:%d:%f", &days, &h, &m, &sec); n == 4 {
-		return time.Duration(days)*24*time.Hour +
-			time.Duration(h)*time.Hour +
-			time.Duration(m)*time.Minute +
-			time.Duration(sec*float64(time.Second)), nil
-	}
-
-	if n, _ := fmt.Sscanf(s, "%d:%d:%f", &h, &m, &sec); n == 3 {
-		return time.Duration(h)*time.Hour +
-			time.Duration(m)*time.Minute +
-			time.Duration(sec*float64(time.Second)), nil
-	}
-
-	return 0, fmt.Errorf("parse interval: unrecognised format %q", s)
 }

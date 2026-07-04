@@ -27,10 +27,13 @@ SELECT
     estimated_timeout_seconds, failure_reason, method_details, metadata,
     description, customer_id, customer_email,
     cancel_intent, cancel_requested_by, cancel_requested_at, cancel_requested_via,
-    processing_started_at, processing_timeout,
+    processing_started_at, EXTRACT(EPOCH FROM processing_timeout)::double precision,
     created_at, updated_at
 FROM transactions
 WHERE id = $1;
+
+-- name: TransactionExists
+SELECT EXISTS (SELECT 1 FROM transactions WHERE id = $1);
 
 -- name: TransactionUpdateStatus
 -- $1=status $2=actual_gateway $3=gateway_reference_id $4=failure_reason

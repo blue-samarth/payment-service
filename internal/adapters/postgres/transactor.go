@@ -18,9 +18,9 @@ func (t *Transactor) WithinTx(ctx context.Context, fn func(ctx context.Context) 
 	if err != nil {
 		return fmt.Errorf("postgres: begin tx: %w", err)
 	}
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := fn(WithTx(ctx, tx)); err != nil {
-		_ = tx.Rollback(ctx)
 		return err
 	}
 

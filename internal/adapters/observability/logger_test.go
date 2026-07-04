@@ -117,3 +117,27 @@ func TestSlogLogger_LevelsBelowThresholdSuppressed(t *testing.T) {
 		t.Error("expected warn to be emitted at INFO level")
 	}
 }
+
+func TestSlogLogger_RedactsSensitiveFields(t *testing.T) {
+	var buf bytes.Buffer
+	log := captureLogger(&buf)
+	log.Info("payment.method", map[string]any{
+		"vpa":            "buyer@upi",
+		"CARD_NUMBER":    "4242424242424242",
+		"transaction_id": "tx-1",
+	})
+
+	entry := lastEntry(t, &buf)
+	if entry["vpa"] != "[REDACTED]" {
+		t.Errorf("expected vpa redacted, got %v", entry["vpa"])
+	}
+	if entry["CARD_NUMBER"] != "[REDACTED]" {
+		t.Errorf("expected card_number redacted (case-insensitive), got %v", entry["CARD_NUMBER"])
+	}
+	if entry["transaction_id"] != "tx-1" {
+		t.Errorf("non-sensitive field must pass through, got %v", entry["transaction_id"])
+	}
+	if strings.Contains(buf.String(), "buyer@upi") || strings.Contains(buf.String(), "4242424242424242") {
+		t.Error("sensitive values must not appear anywhere in the log output")
+	}
+}

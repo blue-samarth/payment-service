@@ -23,6 +23,7 @@ type Queries struct {
 
 	TransactionInsert            string
 	TransactionGetByID           string
+	TransactionExists            string
 	TransactionUpdateStatus      string
 	TransactionSetCancelIntent   string
 	TransactionListExpiredLeases string
@@ -64,6 +65,7 @@ type Queries struct {
 	ConfigWebhookPolicy            string
 	ConfigGetProcessingTimeout     string
 	ConfigListTimeouts             string
+	ConfigListTimeoutsForGateways  string
 }
 
 func LoadQueries() (*Queries, error) {
@@ -99,6 +101,7 @@ func LoadQueries() (*Queries, error) {
 		{&q.MerchantWebhookInsert, "MerchantWebhookInsert"},
 		{&q.TransactionInsert, "TransactionInsert"},
 		{&q.TransactionGetByID, "TransactionGetByID"},
+		{&q.TransactionExists, "TransactionExists"},
 		{&q.TransactionUpdateStatus, "TransactionUpdateStatus"},
 		{&q.TransactionSetCancelIntent, "TransactionSetCancelIntent"},
 		{&q.TransactionListExpiredLeases, "TransactionListExpiredLeases"},
@@ -134,6 +137,7 @@ func LoadQueries() (*Queries, error) {
 		{&q.ConfigWebhookPolicy, "ConfigWebhookPolicy"},
 		{&q.ConfigGetProcessingTimeout, "ConfigGetProcessingTimeout"},
 		{&q.ConfigListTimeouts, "ConfigListTimeouts"},
+		{&q.ConfigListTimeoutsForGateways, "ConfigListTimeoutsForGateways"},
 	}
 
 	for _, f := range fields {

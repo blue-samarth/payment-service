@@ -94,7 +94,7 @@ CREATE TABLE gateway_metrics (
     days_since_discrepancy   INT          NOT NULL DEFAULT 0,
     p99_latency_ms           INT          NOT NULL DEFAULT 0,
     volume_7d                BIGINT       NOT NULL DEFAULT 0,
-    fx_rate_spread           NUMERIC(8,6) NOT NULL DEFAULT 1.0,
+    fx_efficiency_ratio      NUMERIC(8,6) NOT NULL DEFAULT 1.0,
     active_payment_intents   INT          NOT NULL DEFAULT 0,
     last_updated             TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );

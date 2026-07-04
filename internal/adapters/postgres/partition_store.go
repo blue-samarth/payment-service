@@ -23,6 +23,8 @@ var partitionNamePattern = regexp.MustCompile(`^outbox_\d{4}_W\d{2}$`)
 
 const partitionBoundLayout = "2006-01-02 15:04:05-07"
 
+const partitionAdvisoryLockID int64 = 42
+
 func (s *PartitionStore) AcquireLock(ctx context.Context) (bool, error) {
 	conn, err := s.db.pool.Acquire(ctx)
 	if err != nil {
@@ -30,7 +32,7 @@ func (s *PartitionStore) AcquireLock(ctx context.Context) (bool, error) {
 	}
 
 	var ok bool
-	if err := conn.QueryRow(ctx, s.q.PartitionAdvisoryLock).Scan(&ok); err != nil {
+	if err := conn.QueryRow(ctx, s.q.PartitionAdvisoryLock, partitionAdvisoryLockID).Scan(&ok); err != nil {
 		conn.Release()
 		return false, fmt.Errorf("partition: acquire advisory lock: %w", err)
 	}
@@ -51,7 +53,7 @@ func (s *PartitionStore) ReleaseLock(ctx context.Context) error {
 		s.lockConn.Release()
 		s.lockConn = nil
 	}()
-	_, err := s.lockConn.Exec(ctx, s.q.PartitionAdvisoryUnlock)
+	_, err := s.lockConn.Exec(ctx, s.q.PartitionAdvisoryUnlock, partitionAdvisoryLockID)
 	return err
 }
 

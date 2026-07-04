@@ -10,7 +10,7 @@ SELECT
     COALESCE(gm.discrepancy_rate_24h, 0),
     COALESCE(gm.p99_latency_ms, 0),
     COALESCE(gm.volume_7d, 0),
-    COALESCE(gm.fx_rate_spread, 1.0),
+    COALESCE(gm.fx_efficiency_ratio, 1.0),
     COALESCE(gm.last_updated, NOW())
 FROM gateway_config gc
 LEFT JOIN gateway_circuit_breaker_state cb ON cb.gateway_id = gc.gateway_id
@@ -29,7 +29,7 @@ SELECT
     COALESCE(gm.discrepancy_rate_24h, 0),
     COALESCE(gm.p99_latency_ms, 0),
     COALESCE(gm.volume_7d, 0),
-    COALESCE(gm.fx_rate_spread, 1.0),
+    COALESCE(gm.fx_efficiency_ratio, 1.0),
     COALESCE(gm.last_updated, NOW())
 FROM gateway_config gc
 LEFT JOIN gateway_circuit_breaker_state cb ON cb.gateway_id = gc.gateway_id
@@ -74,3 +74,8 @@ WHERE gateway_id = $1 AND payment_method = $2;
 SELECT payment_method, estimated_timeout_sec
 FROM gateway_timeouts
 WHERE gateway_id = $1;
+
+-- name: ConfigListTimeoutsForGateways
+SELECT gateway_id, payment_method, estimated_timeout_sec
+FROM gateway_timeouts
+WHERE gateway_id = ANY(string_to_array($1, ','));

@@ -5,6 +5,7 @@ package redis_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"samarth/payment-service/internal/adapters/redis"
 	"samarth/payment-service/internal/domain/gateway"
@@ -89,5 +90,66 @@ func TestCircuitBreaker_HalfOpenFailureReopens(t *testing.T) {
 	}
 	if !opened {
 		t.Error("a failure while HALF_OPEN should immediately re-open the breaker")
+	}
+}
+
+func TestCircuitBreaker_CooldownEscalatesOnReopen(t *testing.T) {
+	c := testsupport.RequireRedis(t)
+	testsupport.FlushRedis(t, c)
+	store := redis.NewCircuitBreakerStore(c)
+	ctx := context.Background()
+	const gw = "escalate-gw"
+	const threshold = 1 // open on the first failure
+
+	// First open: consecutive_failures = 1 -> CooldownDuration(1) = 60s.
+	if _, _, err := store.RecordFailure(ctx, gw, threshold); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := store.Get(ctx, gw)
+	firstCooldown := time.Until(first.CooldownUntil)
+
+	// Move OPEN -> HALF_OPEN, then fail again: failures = 2 -> CooldownDuration(2) = 120s.
+	if err := store.Transition(ctx, first, gateway.StateHalfOpen); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.RecordFailure(ctx, gw, threshold); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := store.Get(ctx, gw)
+	secondCooldown := time.Until(second.CooldownUntil)
+
+	// Previously RecordFailure always used CooldownDuration(threshold), so the
+	// cooldown never escalated across re-opens.
+	if secondCooldown <= firstCooldown {
+		t.Errorf("cooldown should escalate on re-open, got first=%v second=%v", firstCooldown, secondCooldown)
+	}
+}
+
+func TestCircuitBreaker_SetLastKnownScorePreservesState(t *testing.T) {
+	c := testsupport.RequireRedis(t)
+	testsupport.FlushRedis(t, c)
+	store := redis.NewCircuitBreakerStore(c)
+	ctx := context.Background()
+	const gw = "score-gw"
+
+	_, _, _ = store.RecordFailure(ctx, gw, 5)
+	_, _, _ = store.RecordFailure(ctx, gw, 5) // consecutive_failures = 2, still CLOSED
+
+	if err := store.SetLastKnownScore(ctx, gw, 42); err != nil {
+		t.Fatal(err)
+	}
+
+	cb, err := store.Get(ctx, gw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cb.ConsecutiveFailures != 2 {
+		t.Errorf("score update must not clobber the failure count, got %d", cb.ConsecutiveFailures)
+	}
+	if cb.State != gateway.StateClosed {
+		t.Errorf("score update must preserve state, got %s", cb.State)
+	}
+	if cb.LastKnownReliabilityScore != 42 {
+		t.Errorf("expected score 42 persisted, got %d", cb.LastKnownReliabilityScore)
 	}
 }

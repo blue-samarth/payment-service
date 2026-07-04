@@ -20,20 +20,43 @@ func NewSlogLogger(level slog.Level) *SlogLogger {
 	return &SlogLogger{base: slog.New(h)}
 }
 
+const redactedValue = "[REDACTED]"
+
+var sensitiveLogKeys = map[string]struct{}{
+	"vpa":         {},
+	"card_number": {},
+	"pan":         {},
+	"cvv":         {},
+	"card_cvv":    {},
+}
+
 func fieldsToAttrs(fields map[string]any) []any {
 	attrs := make([]any, 0, len(fields)*2)
 	for k, v := range fields {
+		if _, sensitive := sensitiveLogKeys[strings.ToLower(k)]; sensitive {
+			v = redactedValue
+		}
 		attrs = append(attrs, k, v)
 	}
 	return attrs
 }
 
 func NewSlogLoggerFromHandler(h slog.Handler) *SlogLogger { return &SlogLogger{base: slog.New(h)} }
-func (l *SlogLogger) Info(event string, fields map[string]any) { l.base.Info(event, fieldsToAttrs(fields)...) }
-func (l *SlogLogger) Warn(event string, fields map[string]any) { l.base.Warn(event, fieldsToAttrs(fields)...) }
-func (l *SlogLogger) Debug(event string, fields map[string]any) { l.base.Debug(event, fieldsToAttrs(fields)...) }
-func (l *SlogLogger) Trace(event string, fields map[string]any) { l.base.Log(context.Background(), levelTrace, event, fieldsToAttrs(fields)...) }
-func (l *SlogLogger) With(fields map[string]any) ports.Logger { return &SlogLogger{base: l.base.With(fieldsToAttrs(fields)...)} }
+func (l *SlogLogger) Info(event string, fields map[string]any) {
+	l.base.Info(event, fieldsToAttrs(fields)...)
+}
+func (l *SlogLogger) Warn(event string, fields map[string]any) {
+	l.base.Warn(event, fieldsToAttrs(fields)...)
+}
+func (l *SlogLogger) Debug(event string, fields map[string]any) {
+	l.base.Debug(event, fieldsToAttrs(fields)...)
+}
+func (l *SlogLogger) Trace(event string, fields map[string]any) {
+	l.base.Log(context.Background(), levelTrace, event, fieldsToAttrs(fields)...)
+}
+func (l *SlogLogger) With(fields map[string]any) ports.Logger {
+	return &SlogLogger{base: l.base.With(fieldsToAttrs(fields)...)}
+}
 
 func (l *SlogLogger) Error(event string, fields map[string]any, err error) {
 	if fields == nil {

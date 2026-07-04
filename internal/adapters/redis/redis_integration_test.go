@@ -165,3 +165,40 @@ func TestCircuitBreaker_AcquireProbeSingleFlight(t *testing.T) {
 		t.Errorf("probe should be single-flight: first=%v second=%v (want true,false)", first, second)
 	}
 }
+
+func TestRateLimiter_DeniedDimensionDoesNotDrainOthers(t *testing.T) {
+	c := testsupport.RequireRedis(t)
+	testsupport.FlushRedis(t, c)
+	rl := rateLimiter(c)
+	ctx := context.Background()
+
+	const capacity = 1
+	const rate = 0.0001 // effectively no refill within the test window
+
+	// Exhaust the shared IP bucket with u1/m1.
+	if !rl.Allow(ctx, "u1", "m1", "shared-ip", capacity, rate).Allowed {
+		t.Fatal("first request should be allowed")
+	}
+	// u2/m2 share the now-exhausted IP: the request must be denied.
+	if rl.Allow(ctx, "u2", "m2", "shared-ip", capacity, rate).Allowed {
+		t.Fatal("second request on the exhausted IP should be denied")
+	}
+	// That denial must NOT have consumed u2's or m2's tokens: a fresh request
+	// for u2/m2 on a different IP is still allowed. Under the old per-dimension
+	// pipeline this failed, because the denied request debited every dimension.
+	if !rl.Allow(ctx, "u2", "m2", "fresh-ip", capacity, rate).Allowed {
+		t.Error("a denial on one dimension must not drain the other dimensions' buckets")
+	}
+}
+
+func TestRateLimiter_NonPositiveRateDoesNotCrash(t *testing.T) {
+	c := testsupport.RequireRedis(t)
+	testsupport.FlushRedis(t, c)
+	rl := rateLimiter(c)
+	ctx := context.Background()
+
+	// rate = 0 must not divide-by-zero in the script; a full bucket still admits.
+	if !rl.Allow(ctx, "u", "m", "ip", 2, 0).Allowed {
+		t.Fatal("first request against a full bucket should be allowed even at rate 0")
+	}
+}

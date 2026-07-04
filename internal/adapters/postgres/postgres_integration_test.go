@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -156,6 +157,33 @@ func TestTransactor_RollsBackOnError(t *testing.T) {
 	}
 }
 
+func TestReads_JoinAmbientTransaction(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "transactions")
+	ctx := context.Background()
+
+	repo := postgres.NewTransactionRepository(pg.DB, pg.Q)
+	tr := postgres.NewTransactor(pg.DB)
+	txn := newTxn(t)
+
+	err := tr.WithinTx(ctx, func(ctx context.Context) error {
+		if err := repo.Insert(ctx, txn); err != nil {
+			return err
+		}
+		got, err := repo.GetByID(ctx, txn.ID)
+		if err != nil {
+			return err
+		}
+		if got.ID != txn.ID {
+			t.Errorf("read inside the tx returned the wrong row: %s", got.ID)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("a read inside WithinTx must see its own uncommitted insert, got %v", err)
+	}
+}
+
 func TestTransactor_CommitsTransactionAndOutboxAtomically(t *testing.T) {
 	pg := testsupport.RequirePostgres(t)
 	pg.Truncate(t, "transactions", "outbox_events")
@@ -277,5 +305,220 @@ func TestOutbox_WritePollMarkPublished(t *testing.T) {
 	}
 	if len(remaining) != 0 {
 		t.Errorf("expected no pending events after publish, got %d", len(remaining))
+	}
+}
+
+func writeOutboxEvent(t *testing.T, pg *testsupport.PG, outbox *postgres.OutboxWriter) uuid.UUID {
+	t.Helper()
+	tr := postgres.NewTransactor(pg.DB)
+	aggID := uuid.New()
+	event := ports.OutboxEvent{
+		AggregateID:   aggID,
+		AggregateType: "transaction",
+		EventType:     ports.EventTypePaymentCreated,
+		Payload:       []byte(`{"ok":true}`),
+		EventVersion:  1,
+	}
+	if err := tr.WithinTx(context.Background(), func(ctx context.Context) error { return outbox.Write(ctx, event) }); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	return aggID
+}
+
+func TestOutbox_SeedPartitionsAbsorbCurrentWrites(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "outbox_events")
+	ctx := context.Background()
+
+	// No partition_manager run here — the migration's deploy-relative seed alone
+	// must place a NOW()-dated write in a dated weekly partition, not outbox_default.
+	aggID := writeOutboxEvent(t, pg, postgres.NewOutboxWriter(pg.DB, pg.Q))
+
+	var partition string
+	if err := pg.DB.Pool().QueryRow(ctx,
+		"SELECT tableoid::regclass::text FROM outbox_events WHERE aggregate_id = $1", aggID,
+	).Scan(&partition); err != nil {
+		t.Fatalf("locate partition: %v", err)
+	}
+	if partition == "outbox_default" {
+		t.Error("a current-dated write landed in outbox_default; the migration seed should cover the current week")
+	}
+}
+
+func TestOutbox_ClaimHidesEventFromConcurrentPoller(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "outbox_events")
+	ctx := context.Background()
+
+	outbox := postgres.NewOutboxWriter(pg.DB, pg.Q)
+	writeOutboxEvent(t, pg, outbox)
+
+	// First poller claims the event (PENDING -> PUBLISHING).
+	claimed, err := outbox.PollPending(ctx, 0, 63, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 {
+		t.Fatalf("first poll should claim the event, got %d", len(claimed))
+	}
+
+	// A second poller (another relay worker) must not see the in-flight claim,
+	// so it cannot publish the same event a second time.
+	second, err := outbox.PollPending(ctx, 0, 63, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second) != 0 {
+		t.Errorf("a claimed event must be invisible to a concurrent poller until published or stale, got %d", len(second))
+	}
+}
+
+func TestOutbox_StaleClaimIsReclaimed(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "outbox_events")
+	ctx := context.Background()
+
+	outbox := postgres.NewOutboxWriter(pg.DB, pg.Q)
+	outbox.SetClaimTTL(200 * time.Millisecond)
+	writeOutboxEvent(t, pg, outbox)
+
+	claimed, err := outbox.PollPending(ctx, 0, 63, 10)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("first poll should claim, got %d err=%v", len(claimed), err)
+	}
+
+	// Simulate a crashed worker: the claim is never published. After the TTL,
+	// another poll must reclaim it rather than strand it in PUBLISHING forever.
+	time.Sleep(300 * time.Millisecond)
+
+	reclaimed, err := outbox.PollPending(ctx, 0, 63, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reclaimed) != 1 {
+		t.Errorf("a stale claim past its TTL should be reclaimed, got %d", len(reclaimed))
+	}
+}
+
+func TestOutbox_MarkFailedReleasesClaimForRetry(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "outbox_events")
+	ctx := context.Background()
+
+	outbox := postgres.NewOutboxWriter(pg.DB, pg.Q)
+	writeOutboxEvent(t, pg, outbox)
+
+	claimed, err := outbox.PollPending(ctx, 0, 63, 10)
+	if err != nil || len(claimed) != 1 {
+		t.Fatalf("first poll should claim, got %d err=%v", len(claimed), err)
+	}
+
+	// A publish failure returns the event to PENDING with a past next_attempt_at,
+	// so the next poll re-claims it with a bumped attempt count.
+	if err := outbox.MarkFailed(ctx, claimed[0].ID, claimed[0].CreatedAt, "sns down", time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+
+	retried, err := outbox.PollPending(ctx, 0, 63, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(retried) != 1 {
+		t.Fatalf("a failed publish should make the event claimable again, got %d", len(retried))
+	}
+	if retried[0].Attempts != 1 {
+		t.Errorf("expected attempts bumped to 1 after a failed publish, got %d", retried[0].Attempts)
+	}
+}
+
+func TestTransaction_ProcessingTimeoutRoundTrips(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "transactions")
+	ctx := context.Background()
+
+	repo := postgres.NewTransactionRepository(pg.DB, pg.Q)
+	tr := postgres.NewTransactor(pg.DB)
+
+	// Includes durations >= 1 day, which Postgres renders as "1 day ..." — the
+	// old hand-rolled interval text parser failed on the singular "day" form and
+	// on whole-day values, breaking GetByID entirely.
+	for _, d := range []time.Duration{30 * time.Second, 24 * time.Hour, 25*time.Hour + 90*time.Second} {
+		txn := newTxn(t)
+		started := time.Now().UTC()
+		timeout := d
+		txn.ProcessingStartedAt = &started
+		txn.ProcessingTimeout = &timeout
+
+		if err := tr.WithinTx(ctx, func(ctx context.Context) error { return repo.Insert(ctx, txn) }); err != nil {
+			t.Fatalf("insert (d=%s): %v", d, err)
+		}
+		got, err := repo.GetByID(ctx, txn.ID)
+		if err != nil {
+			t.Fatalf("get (d=%s): %v", d, err)
+		}
+		if got.ProcessingTimeout == nil || *got.ProcessingTimeout != d {
+			t.Errorf("processing_timeout %s did not round-trip, got %v", d, got.ProcessingTimeout)
+		}
+	}
+}
+
+func TestUpdateStatus_NotFoundIsDistinctFromVersionConflict(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "transactions")
+	ctx := context.Background()
+
+	repo := postgres.NewTransactionRepository(pg.DB, pg.Q)
+	tr := postgres.NewTransactor(pg.DB)
+
+	// (a) A transaction that was never inserted must surface as ErrNotFound,
+	// not a misleading ErrVersionConflict.
+	ghost := newTxn(t)
+	err := tr.WithinTx(ctx, func(ctx context.Context) error { return repo.UpdateStatus(ctx, ghost) })
+	if !errors.Is(err, postgres.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound updating a nonexistent transaction, got %v", err)
+	}
+
+	// (b) A genuine stale-version write on an existing row is ErrVersionConflict.
+	txn := newTxn(t)
+	if err := tr.WithinTx(ctx, func(ctx context.Context) error { return repo.Insert(ctx, txn) }); err != nil {
+		t.Fatal(err)
+	}
+	fresh, _ := repo.GetByID(ctx, txn.ID)
+	stale := *fresh
+
+	_ = transaction.TransitionState(fresh, transaction.StatusProcessing, transaction.ActorSystem)
+	if err := tr.WithinTx(ctx, func(ctx context.Context) error { return repo.UpdateStatus(ctx, fresh) }); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = transaction.TransitionState(&stale, transaction.StatusProcessing, transaction.ActorSystem)
+	err = tr.WithinTx(ctx, func(ctx context.Context) error { return repo.UpdateStatus(ctx, &stale) })
+	if !errors.Is(err, postgres.ErrVersionConflict) {
+		t.Fatalf("expected ErrVersionConflict on a stale update, got %v", err)
+	}
+}
+
+func TestTransactor_PanicInsideRollsBack(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "transactions")
+	ctx := context.Background()
+
+	repo := postgres.NewTransactionRepository(pg.DB, pg.Q)
+	tr := postgres.NewTransactor(pg.DB)
+	txn := newTxn(t)
+
+	func() {
+		defer func() { _ = recover() }() // the panic re-raises after rollback
+		_ = tr.WithinTx(ctx, func(ctx context.Context) error {
+			if err := repo.Insert(ctx, txn); err != nil {
+				return err
+			}
+			panic("boom")
+		})
+	}()
+
+	// The deferred rollback must have undone the insert despite the panic.
+	if _, err := repo.GetByID(ctx, txn.ID); !errors.Is(err, postgres.ErrNotFound) {
+		t.Fatalf("expected the insert to be rolled back on panic (ErrNotFound), got %v", err)
 	}
 }

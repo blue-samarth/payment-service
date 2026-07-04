@@ -7,21 +7,23 @@ VALUES
 
 -- name: OutboxMarkPublished
 UPDATE outbox_events
-SET status = 'PUBLISHED', published_at = NOW()
-WHERE id = $1 AND created_at = $2 AND status = 'PENDING';
+SET status = 'PUBLISHED', published_at = NOW(), locked_at = NULL
+WHERE id = $1 AND created_at = $2 AND status = 'PUBLISHING';
 
 -- name: OutboxMarkFailed
 UPDATE outbox_events
 SET
+    status          = 'PENDING',
     attempts        = attempts + 1,
     last_error      = $3,
-    next_attempt_at = $4
-WHERE id = $1 AND created_at = $2 AND status = 'PENDING';
+    next_attempt_at = $4,
+    locked_at       = NULL
+WHERE id = $1 AND created_at = $2 AND status = 'PUBLISHING';
 
 -- name: OutboxMarkExhausted
 UPDATE outbox_events
-SET status = 'FAILED', last_error = $3
-WHERE id = $1 AND created_at = $2 AND status = 'PENDING'
+SET status = 'FAILED', last_error = $3, locked_at = NULL
+WHERE id = $1 AND created_at = $2 AND status = 'PUBLISHING'
 RETURNING aggregate_id, aggregate_type, event_type, payload, event_version;
 
 -- name: OutboxDeadLetterInsert
@@ -31,14 +33,24 @@ VALUES
     (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, NOW());
 
 -- name: OutboxPollPending
-SELECT id, aggregate_id, aggregate_type, event_type, payload, event_version, attempts, created_at
-FROM outbox_events
-WHERE status = 'PENDING'
-  AND shard_index BETWEEN $1 AND $2
-  AND next_attempt_at <= NOW()
-ORDER BY attempts ASC, created_at ASC
-FOR UPDATE SKIP LOCKED
-LIMIT $3;
+UPDATE outbox_events o
+SET status = 'PUBLISHING', locked_at = NOW()
+FROM (
+    SELECT id, created_at
+    FROM outbox_events
+    WHERE shard_index BETWEEN $1 AND $2
+      AND next_attempt_at <= NOW()
+      AND (
+            status = 'PENDING'
+         OR (status = 'PUBLISHING' AND locked_at < NOW() - make_interval(secs => $4))
+      )
+    ORDER BY attempts ASC, created_at ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT $3
+) AS claimed
+WHERE o.id = claimed.id AND o.created_at = claimed.created_at
+RETURNING o.id, o.aggregate_id, o.aggregate_type, o.event_type,
+          o.payload, o.event_version, o.attempts, o.created_at;
 
 -- name: OutboxDeadLetterGet
 SELECT aggregate_id, aggregate_type, event_type, payload, event_version, resolved_at

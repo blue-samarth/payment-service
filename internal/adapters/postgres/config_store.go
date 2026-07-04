@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -19,6 +20,8 @@ type ConfigStore struct {
 }
 
 func NewConfigStore(db *DB, q *Queries) *ConfigStore { return &ConfigStore{db: db, q: q} }
+
+var _ ports.ConfigStore = (*ConfigStore)(nil)
 
 func (s *ConfigStore) GetGatewayConfig(ctx context.Context, gatewayID string) (*ports.GatewayConfig, error) {
 	row := s.db.pool.QueryRow(ctx, s.q.ConfigGetGatewayConfig, gatewayID)
@@ -48,19 +51,53 @@ func (s *ConfigStore) ListActiveGateways(ctx context.Context, paymentMethod stri
 	defer rows.Close()
 
 	var configs []*ports.GatewayConfig
+	var ids []string
 	for rows.Next() {
 		cfg, err := scanGatewayConfig(rows)
 		if err != nil {
 			return nil, fmt.Errorf("config_store: scan gateway: %w", err)
 		}
-		timeouts, err := s.getTimeouts(ctx, cfg.GatewayID)
-		if err != nil {
-			return nil, err
-		}
-		cfg.EstimatedTimeouts = timeouts
 		configs = append(configs, cfg)
+		ids = append(ids, cfg.GatewayID)
 	}
-	return configs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	timeouts, err := s.timeoutsForGateways(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, cfg := range configs {
+		cfg.EstimatedTimeouts = timeouts[cfg.GatewayID]
+	}
+	return configs, nil
+}
+
+func (s *ConfigStore) timeoutsForGateways(ctx context.Context, gatewayIDs []string) (map[string]map[string]time.Duration, error) {
+	out := make(map[string]map[string]time.Duration, len(gatewayIDs))
+	if len(gatewayIDs) == 0 {
+		return out, nil
+	}
+
+	rows, err := s.db.pool.Query(ctx, s.q.ConfigListTimeoutsForGateways, strings.Join(gatewayIDs, ","))
+	if err != nil {
+		return nil, fmt.Errorf("config_store: list timeouts for gateways: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var gatewayID, method string
+		var sec int
+		if err := rows.Scan(&gatewayID, &method, &sec); err != nil {
+			return nil, fmt.Errorf("config_store: scan timeout: %w", err)
+		}
+		if out[gatewayID] == nil {
+			out[gatewayID] = make(map[string]time.Duration)
+		}
+		out[gatewayID][method] = time.Duration(sec) * time.Second
+	}
+	return out, rows.Err()
 }
 
 func (s *ConfigStore) GetFeeModel(ctx context.Context, gatewayID, paymentMethod string) (*ports.GatewayFeeModel, error) {
