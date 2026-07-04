@@ -1,0 +1,9 @@
+DROP TABLE IF EXISTS gateway_config_history;
+DROP TABLE IF EXISTS gateway_metrics;
+DROP TABLE IF EXISTS gateway_circuit_breaker_state;
+DROP TABLE IF EXISTS gateway_routing_weights;
+DROP TABLE IF EXISTS gateway_metadata_schemas;
+DROP TABLE IF EXISTS gateway_fees_snapshot;
+DROP TABLE IF EXISTS gateway_fee_models;
+DROP TABLE IF EXISTS gateway_timeouts;
+DROP TABLE IF EXISTS gateway_config;
