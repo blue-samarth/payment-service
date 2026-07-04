@@ -10,9 +10,10 @@ type stripePaymentIntent struct {
 	Charges          *stripeChargeList `json:"charges"`
 }
 
-type stripeChargeList struct {
-	Data []stripeCharge `json:"data"`
-}
+type stripeChargeList struct { Data []stripeCharge `json:"data"` }
+type stripeBalanceTxn struct { Fee int64 `json:"fee"` }
+type stripePaymentMethod struct { Card *stripeCardDetails `json:"card"` }
+type stripeErrorEnvelope struct { Error *stripeError `json:"error"` }
 
 type stripeCharge struct {
 	ID                   string               `json:"id"`
@@ -25,14 +26,6 @@ func (c stripeCharge) balanceTransactionFee() int64 {
 		return 0
 	}
 	return c.BalanceTransaction.Fee
-}
-
-type stripeBalanceTxn struct {
-	Fee int64 `json:"fee"`
-}
-
-type stripePaymentMethod struct {
-	Card *stripeCardDetails `json:"card"`
 }
 
 type stripeCardDetails struct {
@@ -53,8 +46,4 @@ type stripeError struct {
 	Code        string `json:"code"`
 	DeclineCode string `json:"decline_code"`
 	Message     string `json:"message"`
-}
-
-type stripeErrorEnvelope struct {
-	Error *stripeError `json:"error"`
 }
