@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,6 +12,11 @@ import (
 )
 
 var ErrGatewayNotFound = errors.New("gateway not found")
+
+const (
+	defaultWebhookReplayWindowSec = 300
+	defaultWebhookClockSkewSec    = 30
+)
 
 type ConfigStore struct {
 	db *DB
@@ -80,7 +84,7 @@ func (s *ConfigStore) timeoutsForGateways(ctx context.Context, gatewayIDs []stri
 		return out, nil
 	}
 
-	rows, err := s.db.pool.Query(ctx, s.q.ConfigListTimeoutsForGateways, strings.Join(gatewayIDs, ","))
+	rows, err := s.db.pool.Query(ctx, s.q.ConfigListTimeoutsForGateways, gatewayIDs)
 	if err != nil {
 		return nil, fmt.Errorf("config_store: list timeouts for gateways: %w", err)
 	}
@@ -153,7 +157,7 @@ func (s *ConfigStore) GetRoutingWeights(ctx context.Context, merchantTier string
 func (s *ConfigStore) WebhookPolicy(ctx context.Context, gatewayID string) (replayWindowSec, clockSkewSec int, err error) {
 	err = s.db.pool.QueryRow(ctx, s.q.ConfigWebhookPolicy, gatewayID).Scan(&replayWindowSec, &clockSkewSec)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 300, 30, nil
+		return defaultWebhookReplayWindowSec, defaultWebhookClockSkewSec, nil
 	}
 	if err != nil {
 		return 0, 0, fmt.Errorf("config_store: webhook policy %s: %w", gatewayID, err)

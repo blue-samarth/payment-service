@@ -1,5 +1,6 @@
-local key            = KEYS[1]
-local threshold      = tonumber(ARGV[1])
+local key       = KEYS[1]
+local threshold = tonumber(ARGV[1])
+local now_epoch = tonumber(ARGV[2])
 
 local raw   = redis.call('GET', key)
 local cb    = raw and cjson.decode(raw) or {}
@@ -9,7 +10,9 @@ local opened = 0
 
 if state == 'HALF_OPEN' or (state == 'CLOSED' and fails >= threshold) then
   state = 'OPEN'
-  cb.cooldown_until = ''
+  local secs = math.floor(60 * (2 ^ (fails - 1)))
+  if secs > 240 then secs = 240 end
+  cb.cooldown_until = now_epoch + secs
   opened = 1
 end
 

@@ -1,6 +1,6 @@
 local key      = KEYS[1]
 local to       = ARGV[1]
-local until_ts = ARGV[2]
+local cooldown = tonumber(ARGV[2])
 local fails    = tonumber(ARGV[3])
 
 local raw  = redis.call('GET', key)
@@ -14,7 +14,7 @@ local ok = (from == 'CLOSED'    and to == 'OPEN')
 if not ok then return 0 end
 
 cb.state = to
-cb.cooldown_until = until_ts
+cb.cooldown_until = cooldown
 cb.consecutive_failures = fails
 redis.call('SET', key, cjson.encode(cb))
 return 1

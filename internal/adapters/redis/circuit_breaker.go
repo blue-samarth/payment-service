@@ -21,7 +21,7 @@ func NewCircuitBreakerStore(c *Client) *CircuitBreakerStore {
 
 type cbRecord struct {
 	State               string `json:"state"`
-	CooldownUntil       string `json:"cooldown_until"`
+	CooldownUntil       int64  `json:"cooldown_until"`
 	ConsecutiveFailures int    `json:"consecutive_failures"`
 	LastKnownScore      int    `json:"last_known_score"`
 }
@@ -48,10 +48,8 @@ func (s *CircuitBreakerStore) Get(ctx context.Context, gatewayID string) (*gatew
 		ConsecutiveFailures:       r.ConsecutiveFailures,
 		LastKnownReliabilityScore: r.LastKnownScore,
 	}
-	if r.CooldownUntil != "" {
-		if t, err := time.Parse(time.RFC3339, r.CooldownUntil); err == nil {
-			cb.CooldownUntil = t
-		}
+	if r.CooldownUntil > 0 {
+		cb.CooldownUntil = time.Unix(r.CooldownUntil, 0).UTC()
 	}
 	return cb, nil
 }
@@ -64,13 +62,13 @@ func (s *CircuitBreakerStore) Transition(ctx context.Context, cb *gateway.Circui
 		newFails = 0
 	}
 
-	cooldownUntil := ""
+	var cooldownEpoch int64
 	if to == gateway.StateOpen {
-		cooldownUntil = time.Now().UTC().Add(gateway.CooldownDuration(newFails)).Format(time.RFC3339)
+		cooldownEpoch = time.Now().UTC().Add(gateway.CooldownDuration(newFails)).Unix()
 	}
 
 	n, err := cbTransitionScript.Run(ctx, s.client, []string{cbKey(cb.GatewayID)},
-		string(to), cooldownUntil, newFails,
+		string(to), cooldownEpoch, newFails,
 	).Int()
 	if err != nil {
 		return fmt.Errorf("circuit_breaker: transition script %s: %w", cb.GatewayID, err)
@@ -81,9 +79,8 @@ func (s *CircuitBreakerStore) Transition(ctx context.Context, cb *gateway.Circui
 
 	cb.State = to
 	cb.ConsecutiveFailures = newFails
-	if cooldownUntil != "" {
-		t, _ := time.Parse(time.RFC3339, cooldownUntil)
-		cb.CooldownUntil = t
+	if cooldownEpoch > 0 {
+		cb.CooldownUntil = time.Unix(cooldownEpoch, 0).UTC()
 	} else {
 		cb.CooldownUntil = time.Time{}
 	}
@@ -91,22 +88,15 @@ func (s *CircuitBreakerStore) Transition(ctx context.Context, cb *gateway.Circui
 }
 
 func (s *CircuitBreakerStore) RecordFailure(ctx context.Context, gatewayID string, threshold int) (opened bool, failures int, err error) {
-	res, err := cbRecordFailureScript.Run(ctx, s.client, []string{cbKey(gatewayID)}, threshold).Int64Slice()
+	now := time.Now().UTC().Unix()
+	res, err := cbRecordFailureScript.Run(ctx, s.client, []string{cbKey(gatewayID)}, threshold, now).Int64Slice()
 	if err != nil {
 		return false, 0, fmt.Errorf("circuit_breaker: record failure %s: %w", gatewayID, err)
 	}
 	if len(res) != 2 {
 		return false, 0, fmt.Errorf("circuit_breaker: record failure %s: unexpected result", gatewayID)
 	}
-	opened, failures = res[0] == 1, int(res[1])
-
-	if opened {
-		cooldown := time.Now().UTC().Add(gateway.CooldownDuration(failures)).Format(time.RFC3339)
-		if err := cbSetCooldownScript.Run(ctx, s.client, []string{cbKey(gatewayID)}, cooldown).Err(); err != nil {
-			return opened, failures, fmt.Errorf("circuit_breaker: set cooldown %s: %w", gatewayID, err)
-		}
-	}
-	return opened, failures, nil
+	return res[0] == 1, int(res[1]), nil
 }
 
 func (s *CircuitBreakerStore) RecordSuccess(ctx context.Context, gatewayID string) error {

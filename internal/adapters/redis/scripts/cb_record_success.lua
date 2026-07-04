@@ -10,6 +10,6 @@ end
 
 cb.state = state
 cb.consecutive_failures = 0
-cb.cooldown_until = ''
+cb.cooldown_until = 0
 redis.call('SET', key, cjson.encode(cb))
 return cb.state

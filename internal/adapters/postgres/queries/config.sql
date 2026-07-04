@@ -78,4 +78,4 @@ WHERE gateway_id = $1;
 -- name: ConfigListTimeoutsForGateways
 SELECT gateway_id, payment_method, estimated_timeout_sec
 FROM gateway_timeouts
-WHERE gateway_id = ANY(string_to_array($1, ','));
+WHERE gateway_id = ANY($1);
