@@ -15,15 +15,12 @@ import (
 type WebhookProcessor interface {
 	Process(ctx context.Context, gatewayID string, ev appwebhook.Event, rawPayload []byte) (appwebhook.Outcome, error)
 }
-
 type WebhookParserResolver interface {
 	WebhookParser(gatewayID string) (ports.GatewayWebhookParser, bool)
 }
-
 type SecretProvider interface {
 	WebhookSecret(ctx context.Context, gatewayID string) (string, error)
 }
-
 type WebhookPolicyProvider interface {
 	WebhookPolicy(ctx context.Context, gatewayID string) (replayWindowSec, clockSkewSec int, err error)
 }

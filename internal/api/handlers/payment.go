@@ -18,13 +18,9 @@ type PaymentService interface {
 	GetPayment(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error)
 }
 
-type PaymentHandler struct {
-	svc PaymentService
-}
+type PaymentHandler struct{ svc PaymentService }
 
-func NewPaymentHandler(svc PaymentService) *PaymentHandler {
-	return &PaymentHandler{svc: svc}
-}
+func NewPaymentHandler(svc PaymentService) *PaymentHandler { return &PaymentHandler{svc: svc} }
 
 type createPaymentRequest struct {
 	MerchantID    string         `json:"merchant_id"`

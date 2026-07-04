@@ -8,14 +8,9 @@ import (
 type Pinger interface {
 	Ping(ctx context.Context) error
 }
+type HealthHandler struct{ db Pinger }
 
-type HealthHandler struct {
-	db Pinger
-}
-
-func NewHealthHandler(db Pinger) *HealthHandler {
-	return &HealthHandler{db: db}
-}
+func NewHealthHandler(db Pinger) *HealthHandler { return &HealthHandler{db: db} }
 
 type healthResponse struct {
 	Status     string            `json:"status"`

@@ -14,14 +14,9 @@ import (
 type CancelService interface {
 	Cancel(ctx context.Context, in appcancel.CancelInput) (appcancel.Result, error)
 }
+type CancelHandler struct{ svc CancelService }
 
-type CancelHandler struct {
-	svc CancelService
-}
-
-func NewCancelHandler(svc CancelService) *CancelHandler {
-	return &CancelHandler{svc: svc}
-}
+func NewCancelHandler(svc CancelService) *CancelHandler { return &CancelHandler{svc: svc} }
 
 type cancelRequest struct {
 	Actor string `json:"actor"`

@@ -17,10 +17,7 @@ const (
 	RoleOps     Role = "ops"
 )
 
-type Principal struct {
-	Role Role
-}
-
+type Principal struct{ Role Role }
 type TokenProvider interface {
 	ValidHashes(ctx context.Context, role Role) (map[string]struct{}, error)
 }
@@ -115,9 +112,7 @@ func (p *StaticTokenProvider) ValidHashes(_ context.Context, role Role) (map[str
 	}
 }
 
-func (p *StaticTokenProvider) HasAny() bool {
-	return len(p.service) > 0 || len(p.ops) > 0
-}
+func (p *StaticTokenProvider) HasAny() bool { return len(p.service) > 0 || len(p.ops) > 0 }
 
 func hashSet(tokens []string) map[string]struct{} {
 	set := make(map[string]struct{}, len(tokens))

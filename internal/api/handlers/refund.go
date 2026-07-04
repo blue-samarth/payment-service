@@ -17,13 +17,9 @@ type RefundService interface {
 	ProcessRefund(ctx context.Context, refundID uuid.UUID) (*domainrefund.Refund, error)
 }
 
-type RefundHandler struct {
-	svc RefundService
-}
+type RefundHandler struct{ svc RefundService }
 
-func NewRefundHandler(svc RefundService) *RefundHandler {
-	return &RefundHandler{svc: svc}
-}
+func NewRefundHandler(svc RefundService) *RefundHandler { return &RefundHandler{svc: svc} }
 
 type createRefundRequest struct {
 	Amount      int64  `json:"amount"`

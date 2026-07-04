@@ -302,9 +302,7 @@ func (s *Service) rerouteExcluding(ctx context.Context, txn *transaction.Transac
 	return decision.SelectedGateway, adapter, true
 }
 
-func isDomesticCurrency(currency string) bool {
-	return currency == "INR"
-}
+func isDomesticCurrency(currency string) bool { return currency == "INR" }
 
 func (s *Service) recordBreaker(ctx context.Context, gatewayID string, gwErr *ports.GatewayError) {
 	if s.breaker == nil {
