@@ -12,14 +12,15 @@ import (
 	"log/slog"
 	"samarth/payment-service/internal/adapters/observability"
 	"samarth/payment-service/internal/api/handlers"
+	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/app/payment"
 	"samarth/payment-service/internal/domain/transaction"
 )
 
 type stubService struct{ txn *transaction.Transaction }
 
-func (s stubService) CreatePayment(ctx context.Context, in payment.CreatePaymentInput) (*transaction.Transaction, error) {
-	return s.txn, nil
+func (s stubService) CreatePayment(ctx context.Context, in payment.CreatePaymentInput) (payment.CreateResult, error) {
+	return payment.CreateResult{Verdict: idempotency.Created, Transaction: s.txn}, nil
 }
 func (s stubService) ProcessPayment(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error) {
 	return s.txn, nil

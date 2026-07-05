@@ -261,12 +261,7 @@ func shouldFallback(gwErr *ports.GatewayError) bool {
 	if gwErr == nil {
 		return false
 	}
-	switch gwErr.Category {
-	case ports.ErrorCategorySoftDecline, ports.ErrorCategoryGatewayError:
-		return true
-	default:
-		return false
-	}
+	return gwErr.Category == ports.ErrorCategorySoftDecline
 }
 
 func (s *Service) rerouteExcluding(ctx context.Context, txn *transaction.Transaction, exclude []string) (string, ports.GatewayAdapter, bool) {

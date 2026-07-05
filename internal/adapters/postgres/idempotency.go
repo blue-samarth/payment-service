@@ -19,7 +19,7 @@ func NewIdempotencyRepository(db *DB, q *Queries) *IdempotencyRepository {
 }
 
 func (r *IdempotencyRepository) Reserve(ctx context.Context, compositeHash, requestHash string) (bool, error) {
-	tag, err := r.db.pool.Exec(ctx, r.q.IdempotencyReserve, compositeHash, requestHash)
+	tag, err := queryer(ctx, r.db.pool).Exec(ctx, r.q.IdempotencyReserve, compositeHash, requestHash)
 	if err != nil {
 		return false, fmt.Errorf("idempotency: reserve %s: %w", compositeHash, err)
 	}
@@ -27,7 +27,7 @@ func (r *IdempotencyRepository) Reserve(ctx context.Context, compositeHash, requ
 }
 
 func (r *IdempotencyRepository) Lookup(ctx context.Context, compositeHash string) (found bool, requestHash, status string, response []byte, err error) {
-	err = r.db.pool.QueryRow(ctx, r.q.IdempotencyLookup, compositeHash).Scan(&requestHash, &status, &response)
+	err = queryer(ctx, r.db.pool).QueryRow(ctx, r.q.IdempotencyLookup, compositeHash).Scan(&requestHash, &status, &response)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, "", "", nil, nil
 	}
@@ -38,14 +38,14 @@ func (r *IdempotencyRepository) Lookup(ctx context.Context, compositeHash string
 }
 
 func (r *IdempotencyRepository) Complete(ctx context.Context, compositeHash string, response []byte) error {
-	if _, err := r.db.pool.Exec(ctx, r.q.IdempotencyComplete, compositeHash, string(response)); err != nil {
+	if _, err := queryer(ctx, r.db.pool).Exec(ctx, r.q.IdempotencyComplete, compositeHash, string(response)); err != nil {
 		return fmt.Errorf("idempotency: complete %s: %w", compositeHash, err)
 	}
 	return nil
 }
 
 func (r *IdempotencyRepository) Release(ctx context.Context, compositeHash string) error {
-	if _, err := r.db.pool.Exec(ctx, r.q.IdempotencyRelease, compositeHash); err != nil {
+	if _, err := queryer(ctx, r.db.pool).Exec(ctx, r.q.IdempotencyRelease, compositeHash); err != nil {
 		return fmt.Errorf("idempotency: release %s: %w", compositeHash, err)
 	}
 	return nil

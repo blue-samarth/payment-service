@@ -8,12 +8,13 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/app/payment"
 	"samarth/payment-service/internal/domain/transaction"
 )
 
 type PaymentService interface {
-	CreatePayment(ctx context.Context, in payment.CreatePaymentInput) (*transaction.Transaction, error)
+	CreatePayment(ctx context.Context, in payment.CreatePaymentInput) (payment.CreateResult, error)
 	ProcessPayment(ctx context.Context, transactionID uuid.UUID) (*transaction.Transaction, error)
 	GetPayment(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error)
 }
@@ -75,34 +76,54 @@ func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	txn, err := h.svc.CreatePayment(r.Context(), payment.CreatePaymentInput{
-		MerchantID:    merchantID,
-		Amount:        req.Amount,
-		Currency:      req.Currency,
-		PaymentMethod: transaction.PaymentMethod(req.PaymentMethod),
-		CustomerID:    customerID,
-		CustomerEmail: req.CustomerEmail,
-		Description:   req.Description,
-		Metadata:      req.Metadata,
-		MerchantTier:  req.MerchantTier,
-		IsDomestic:    req.IsDomestic,
+	idemKey := r.Header.Get("Idempotency-Key")
+	if idemKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required")
+		return
+	}
+
+	result, err := h.svc.CreatePayment(r.Context(), payment.CreatePaymentInput{
+		MerchantID:     merchantID,
+		Amount:         req.Amount,
+		Currency:       req.Currency,
+		PaymentMethod:  transaction.PaymentMethod(req.PaymentMethod),
+		CustomerID:     customerID,
+		CustomerEmail:  req.CustomerEmail,
+		Description:    req.Description,
+		Metadata:       req.Metadata,
+		MerchantTier:   req.MerchantTier,
+		IsDomestic:     req.IsDomestic,
+		IdempotencyKey: idemKey,
 	})
 	if err != nil {
-		if errors.Is(err, payment.ErrNoGateway) {
+		switch {
+		case errors.Is(err, payment.ErrNoGateway):
 			writeError(w, http.StatusUnprocessableEntity, "no_eligible_gateway", "no gateway can process this payment")
+		case errors.Is(err, idempotency.ErrKeyRequired):
+			writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required")
+		default:
+			writeError(w, http.StatusInternalServerError, "create_failed", "could not create payment")
+		}
+		return
+	}
+
+	switch result.Verdict {
+	case idempotency.Created:
+		processed, err := h.svc.ProcessPayment(r.Context(), result.Transaction.ID)
+		if err != nil {
+			writeJSON(w, http.StatusAccepted, toPaymentResponse(result.Transaction))
 			return
 		}
+		writeJSON(w, http.StatusCreated, toPaymentResponse(processed))
+	case idempotency.Replayed:
+		writeJSON(w, http.StatusOK, toPaymentResponse(result.Transaction))
+	case idempotency.InProgress:
+		writeError(w, http.StatusConflict, "idempotency_in_progress", "a request with this idempotency key is already in progress")
+	case idempotency.KeyReused:
+		writeError(w, http.StatusConflict, "idempotency_key_reused", "idempotency key reused with a different request body")
+	default:
 		writeError(w, http.StatusInternalServerError, "create_failed", "could not create payment")
-		return
 	}
-
-	processed, err := h.svc.ProcessPayment(r.Context(), txn.ID)
-	if err != nil {
-		writeJSON(w, http.StatusAccepted, toPaymentResponse(txn))
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, toPaymentResponse(processed))
 }
 
 func (h *PaymentHandler) Get(w http.ResponseWriter, r *http.Request) {

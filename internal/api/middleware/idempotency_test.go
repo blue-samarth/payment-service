@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,55 +11,32 @@ import (
 	"testing"
 )
 
-type memIdempotency struct {
+type memCache struct {
 	mu      sync.Mutex
-	records map[string]*memRecord
+	entries map[string][]byte
+	getErr  error
+	putErr  error
 }
 
-type memRecord struct {
-	requestHash string
-	status      string
-	response    []byte
-}
+func newMemCache() *memCache { return &memCache{entries: map[string][]byte{}} }
 
-func newMemIdempotency() *memIdempotency {
-	return &memIdempotency{records: map[string]*memRecord{}}
-}
-
-func (m *memIdempotency) Reserve(_ context.Context, composite, requestHash string) (bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.records[composite]; ok {
-		return false, nil
+func (m *memCache) Get(_ context.Context, key string) (bool, []byte, error) {
+	if m.getErr != nil {
+		return false, nil, m.getErr
 	}
-	m.records[composite] = &memRecord{requestHash: requestHash, status: "PROCESSING"}
-	return true, nil
-}
-
-func (m *memIdempotency) Lookup(_ context.Context, composite string) (bool, string, string, []byte, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r, ok := m.records[composite]
-	if !ok {
-		return false, "", "", nil, nil
+	body, ok := m.entries[key]
+	return ok, body, nil
+}
+
+func (m *memCache) Put(_ context.Context, key string, response []byte) error {
+	if m.putErr != nil {
+		return m.putErr
 	}
-	return true, r.requestHash, r.status, r.response, nil
-}
-
-func (m *memIdempotency) Complete(_ context.Context, composite string, response []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if r, ok := m.records[composite]; ok {
-		r.status = "COMPLETED"
-		r.response = response
-	}
-	return nil
-}
-
-func (m *memIdempotency) Release(_ context.Context, composite string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.records, composite)
+	m.entries[key] = response
 	return nil
 }
 
@@ -70,7 +48,7 @@ func countingHandler(calls *int64, status int, body string) http.Handler {
 	})
 }
 
-func doIdem(h http.Handler, key, body string) *httptest.ResponseRecorder {
+func doCached(h http.Handler, key, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(body))
 	if key != "" {
 		req.Header.Set("Idempotency-Key", key)
@@ -80,62 +58,80 @@ func doIdem(h http.Handler, key, body string) *httptest.ResponseRecorder {
 	return rec
 }
 
-func TestIdempotency_NoKeyPassesThrough(t *testing.T) {
+func TestResponseCache_NoKeyPassesThrough(t *testing.T) {
 	var calls int64
-	h := Idempotency(newMemIdempotency(), noopLog{})(countingHandler(&calls, http.StatusCreated, `{"ok":true}`))
-	rec := doIdem(h, "", `{"a":1}`)
+	h := ResponseCache(newMemCache(), noopLog{})(countingHandler(&calls, http.StatusCreated, `{"ok":true}`))
+	rec := doCached(h, "", `{"a":1}`)
 	if rec.Code != http.StatusCreated || calls != 1 {
 		t.Fatalf("expected passthrough (201, 1 call), got %d / %d", rec.Code, calls)
 	}
 }
 
-func TestIdempotency_ReplaysCachedResponse(t *testing.T) {
+func TestResponseCache_ReplaysCachedHit(t *testing.T) {
 	var calls int64
-	store := newMemIdempotency()
-	h := Idempotency(store, noopLog{})(countingHandler(&calls, http.StatusCreated, `{"id":"abc"}`))
+	h := ResponseCache(newMemCache(), noopLog{})(countingHandler(&calls, http.StatusCreated, `{"id":"abc"}`))
 
-	first := doIdem(h, "key-1", `{"a":1}`)
-	second := doIdem(h, "key-1", `{"a":1}`)
+	first := doCached(h, "key-1", `{"a":1}`)
+	second := doCached(h, "key-1", `{"a":1}`)
 
 	if calls != 1 {
-		t.Errorf("handler should run once, ran %d times", calls)
+		t.Errorf("second request should be served from cache, handler ran %d times", calls)
 	}
-	if first.Code != http.StatusCreated || second.Code != http.StatusCreated {
-		t.Errorf("both should be 201, got %d / %d", first.Code, second.Code)
-	}
-	if first.Body.String() != second.Body.String() {
-		t.Errorf("replayed body mismatch: %q vs %q", first.Body.String(), second.Body.String())
+	if first.Body.String() != second.Body.String() || second.Code != http.StatusCreated {
+		t.Errorf("replay mismatch: %q/%d vs %q/%d", first.Body.String(), first.Code, second.Body.String(), second.Code)
 	}
 	if second.Header().Get("Idempotent-Replayed") != "true" {
 		t.Error("expected Idempotent-Replayed header on the cached response")
 	}
 }
 
-func TestIdempotency_SameKeyDifferentBody409(t *testing.T) {
+func TestResponseCache_Only2xxStored(t *testing.T) {
 	var calls int64
-	store := newMemIdempotency()
-	h := Idempotency(store, noopLog{})(countingHandler(&calls, http.StatusCreated, `{"id":"abc"}`))
-
-	doIdem(h, "key-2", `{"a":1}`)
-	conflict := doIdem(h, "key-2", `{"a":2}`)
-
-	if conflict.Code != http.StatusConflict {
-		t.Fatalf("expected 409 for reused key with different body, got %d", conflict.Code)
-	}
-	if calls != 1 {
-		t.Errorf("handler should not run for the conflicting request, ran %d", calls)
+	h := ResponseCache(newMemCache(), noopLog{})(countingHandler(&calls, http.StatusInternalServerError, `boom`))
+	doCached(h, "key-2", `{"a":1}`)
+	doCached(h, "key-2", `{"a":1}`)
+	if calls != 2 {
+		t.Errorf("a 5xx must not be cached; both requests should run, ran %d", calls)
 	}
 }
 
-func TestIdempotency_5xxNotCached(t *testing.T) {
+func TestResponseCache_4xxNotStored(t *testing.T) {
 	var calls int64
-	store := newMemIdempotency()
-	h := Idempotency(store, noopLog{})(countingHandler(&calls, http.StatusInternalServerError, `boom`))
-
-	doIdem(h, "key-3", `{"a":1}`)
-	doIdem(h, "key-3", `{"a":1}`)
-
+	h := ResponseCache(newMemCache(), noopLog{})(countingHandler(&calls, http.StatusConflict, `nope`))
+	doCached(h, "key-3", `{"a":1}`)
+	doCached(h, "key-3", `{"a":1}`)
 	if calls != 2 {
-		t.Errorf("a 5xx should release the key so retries re-run the handler, ran %d", calls)
+		t.Errorf("only 2xx is cached; a 4xx should re-run, ran %d", calls)
+	}
+}
+
+func TestResponseCache_SwallowsBackendErrors(t *testing.T) {
+	var calls int64
+	cache := newMemCache()
+	cache.getErr = errors.New("cache down")
+	cache.putErr = errors.New("cache down")
+	h := ResponseCache(cache, noopLog{})(countingHandler(&calls, http.StatusCreated, `{"ok":true}`))
+
+	rec := doCached(h, "key-4", `{"a":1}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("a cache-backend outage must fall through to the handler, got %d", rec.Code)
+	}
+	if calls != 1 {
+		t.Errorf("handler should have run despite cache errors, ran %d", calls)
+	}
+}
+
+func TestResponseCache_MerchantScopedKeys(t *testing.T) {
+	var calls int64
+	h := ResponseCache(newMemCache(), noopLog{})(countingHandler(&calls, http.StatusCreated, `{"ok":true}`))
+
+	for _, m := range []string{"merchant-a", "merchant-b"} {
+		req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(`{"a":1}`))
+		req.Header.Set("Idempotency-Key", "shared-key")
+		ctx := context.WithValue(req.Context(), merchantIDKey, m)
+		h.ServeHTTP(httptest.NewRecorder(), req.WithContext(ctx))
+	}
+	if calls != 2 {
+		t.Errorf("the same key under different merchants must not collide in the cache, ran %d", calls)
 	}
 }

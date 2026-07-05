@@ -8,12 +8,13 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/idempotency"
 	apprefund "samarth/payment-service/internal/app/refund"
 	domainrefund "samarth/payment-service/internal/domain/refund"
 )
 
 type RefundService interface {
-	InitiateRefund(ctx context.Context, in apprefund.InitiateInput) (*domainrefund.Refund, error)
+	InitiateRefund(ctx context.Context, in apprefund.InitiateInput) (apprefund.InitiateResult, error)
 	ProcessRefund(ctx context.Context, refundID uuid.UUID) (*domainrefund.Refund, error)
 }
 
@@ -59,11 +60,18 @@ func (h *RefundHandler) Create(w http.ResponseWriter, r *http.Request) {
 		req.InitiatedBy = "api"
 	}
 
-	initiated, err := h.svc.InitiateRefund(r.Context(), apprefund.InitiateInput{
-		TransactionID: transactionID,
-		Amount:        req.Amount,
-		Reason:        req.Reason,
-		InitiatedBy:   req.InitiatedBy,
+	idemKey := r.Header.Get("Idempotency-Key")
+	if idemKey == "" {
+		writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required")
+		return
+	}
+
+	result, err := h.svc.InitiateRefund(r.Context(), apprefund.InitiateInput{
+		TransactionID:  transactionID,
+		Amount:         req.Amount,
+		Reason:         req.Reason,
+		InitiatedBy:    req.InitiatedBy,
+		IdempotencyKey: idemKey,
 	})
 	if err != nil {
 		var over domainrefund.ErrOverRefund
@@ -72,19 +80,31 @@ func (h *RefundHandler) Create(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnprocessableEntity, "not_refundable", "transaction is not in a refundable state")
 		case errors.As(err, &over):
 			writeError(w, http.StatusUnprocessableEntity, "over_refund", over.Error())
+		case errors.Is(err, idempotency.ErrKeyRequired):
+			writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required")
 		default:
 			writeError(w, http.StatusInternalServerError, "refund_failed", "could not initiate refund")
 		}
 		return
 	}
 
-	processed, err := h.svc.ProcessRefund(r.Context(), initiated.ID)
-	if err != nil {
-		writeJSON(w, http.StatusAccepted, toRefundResponse(initiated))
-		return
+	switch result.Verdict {
+	case idempotency.Created:
+		processed, err := h.svc.ProcessRefund(r.Context(), result.Refund.ID)
+		if err != nil {
+			writeJSON(w, http.StatusAccepted, toRefundResponse(result.Refund))
+			return
+		}
+		writeJSON(w, http.StatusCreated, toRefundResponse(processed))
+	case idempotency.Replayed:
+		writeJSON(w, http.StatusOK, toRefundResponse(result.Refund))
+	case idempotency.InProgress:
+		writeError(w, http.StatusConflict, "idempotency_in_progress", "a request with this idempotency key is already in progress")
+	case idempotency.KeyReused:
+		writeError(w, http.StatusConflict, "idempotency_key_reused", "idempotency key reused with a different request body")
+	default:
+		writeError(w, http.StatusInternalServerError, "refund_failed", "could not initiate refund")
 	}
-
-	writeJSON(w, http.StatusCreated, toRefundResponse(processed))
 }
 
 func toRefundResponse(rf *domainrefund.Refund) refundResponse {

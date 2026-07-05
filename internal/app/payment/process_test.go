@@ -349,6 +349,31 @@ func TestProcessPayment_FallbackExhaustedStaysFailed(t *testing.T) {
 	}
 }
 
+func TestProcessPayment_NoFallbackOnGatewayError(t *testing.T) {
+	txn := pendingTxn() // GatewayID "stripe"
+	repo := seedRepo(txn)
+	// A GatewayError is a "maybe charged" outcome (5xx / post-send failure), so
+	// re-attempting on another gateway risks a double charge.
+	first := &fakeAdapter{err: &ports.GatewayError{Category: ports.ErrorCategoryGatewayError, Code: "gateway_error"}}
+	second := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_fb", Status: ports.GatewayPaymentStatusSucceeded}}
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": first, "razorpay": second}}
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
+
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
+	svc.SetMaxGatewayAttempts(2)
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.ActualGateway != "stripe" {
+		t.Errorf("a GatewayError must not re-attempt on another gateway, got %q", got.ActualGateway)
+	}
+	if got.GatewayReferenceID == "pi_fb" {
+		t.Error("the second gateway must not have been called after a GatewayError")
+	}
+}
+
 func recoverService(repo *fakeRepo, reg *fakeRegistry, outbox *fakeOutbox) *Service {
 	return NewService(repo, outbox, &fakeRouter{}, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
 }

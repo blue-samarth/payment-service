@@ -11,12 +11,14 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/app/payment"
 	"samarth/payment-service/internal/domain/transaction"
 )
 
 type fakeService struct {
 	created   *transaction.Transaction
+	verdict   idempotency.Verdict
 	processed *transaction.Transaction
 	fetched   *transaction.Transaction
 	createErr error
@@ -24,8 +26,11 @@ type fakeService struct {
 	getErr    error
 }
 
-func (f *fakeService) CreatePayment(ctx context.Context, in payment.CreatePaymentInput) (*transaction.Transaction, error) {
-	return f.created, f.createErr
+func (f *fakeService) CreatePayment(ctx context.Context, in payment.CreatePaymentInput) (payment.CreateResult, error) {
+	if f.createErr != nil {
+		return payment.CreateResult{}, f.createErr
+	}
+	return payment.CreateResult{Verdict: f.verdict, Transaction: f.created}, nil
 }
 func (f *fakeService) ProcessPayment(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error) {
 	return f.processed, f.procErr
@@ -49,6 +54,7 @@ func doRequest(h *PaymentHandler, method, target, body string) *httptest.Respons
 	rec := httptest.NewRecorder()
 	switch {
 	case method == http.MethodPost:
+		req.Header.Set("Idempotency-Key", "test-key")
 		h.Create(rec, req)
 	default:
 		h.Get(rec, req)
@@ -85,6 +91,41 @@ func TestCreate_NoGatewayReturns422(t *testing.T) {
 	rec := doRequest(h, http.MethodPost, "/payments", validBody())
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected 422, got %d", rec.Code)
+	}
+}
+
+func TestCreate_MissingIdempotencyKey400(t *testing.T) {
+	h := NewPaymentHandler(&fakeService{created: sampleTxn(transaction.StatusPending)})
+	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(validBody()))
+	rec := httptest.NewRecorder()
+	h.Create(rec, req) // no Idempotency-Key header
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 without Idempotency-Key, got %d", rec.Code)
+	}
+}
+
+func TestCreate_ReplayedReturns200(t *testing.T) {
+	replayed := sampleTxn(transaction.StatusSucceeded)
+	h := NewPaymentHandler(&fakeService{created: replayed, verdict: idempotency.Replayed})
+	rec := doRequest(h, http.MethodPost, "/payments", validBody())
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a replayed idempotent create should be 200, got %d", rec.Code)
+	}
+}
+
+func TestCreate_InProgressReturns409(t *testing.T) {
+	h := NewPaymentHandler(&fakeService{verdict: idempotency.InProgress})
+	rec := doRequest(h, http.MethodPost, "/payments", validBody())
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("an in-progress idempotent create should be 409, got %d", rec.Code)
+	}
+}
+
+func TestCreate_KeyReusedReturns409(t *testing.T) {
+	h := NewPaymentHandler(&fakeService{verdict: idempotency.KeyReused})
+	rec := doRequest(h, http.MethodPost, "/payments", validBody())
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("a reused idempotency key should be 409, got %d", rec.Code)
 	}
 }
 

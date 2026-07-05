@@ -17,9 +17,12 @@ const (
 	RoleOps     Role = "ops"
 )
 
-type Principal struct{ Role Role }
+type Principal struct {
+	Role       Role
+	MerchantID string
+}
 type TokenProvider interface {
-	ValidHashes(ctx context.Context, role Role) (map[string]struct{}, error)
+	Resolve(ctx context.Context, role Role, token string) (Principal, bool, error)
 }
 
 const principalKey contextKey = "principal"
@@ -45,7 +48,7 @@ func Authenticate(provider TokenProvider, log ports.Logger) func(http.Handler) h
 				return
 			}
 
-			role, ok := authenticate(r, provider)
+			principal, ok := authenticate(r, provider)
 			if !ok {
 				log.Warn("auth.rejected", map[string]any{"path": r.URL.Path})
 				w.Header().Set("Content-Type", "application/json")
@@ -54,74 +57,82 @@ func Authenticate(provider TokenProvider, log ports.Logger) func(http.Handler) h
 				return
 			}
 
-			ctx := context.WithValue(r.Context(), principalKey, Principal{Role: role})
-			if m := r.Header.Get("X-Merchant-ID"); m != "" {
-				ctx = context.WithValue(ctx, merchantIDKey, m)
+			ctx := context.WithValue(r.Context(), principalKey, principal)
+			if principal.MerchantID != "" {
+				ctx = context.WithValue(ctx, merchantIDKey, principal.MerchantID)
 			}
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }
 
-func authenticate(r *http.Request, provider TokenProvider) (Role, bool) {
+func authenticate(r *http.Request, provider TokenProvider) (Principal, bool) {
 	if tok := r.Header.Get("X-Ops-Token"); tok != "" {
-		if validToken(r.Context(), provider, RoleOps, tok) {
-			return RoleOps, true
-		}
-		return "", false
+		return resolveToken(r.Context(), provider, RoleOps, tok)
 	}
 	if tok := r.Header.Get("X-Service-Token"); tok != "" {
-		if validToken(r.Context(), provider, RoleService, tok) {
-			return RoleService, true
-		}
-		return "", false
+		return resolveToken(r.Context(), provider, RoleService, tok)
 	}
-	return "", false
+	return Principal{}, false
 }
 
-func validToken(ctx context.Context, provider TokenProvider, role Role, token string) bool {
-	hashes, err := provider.ValidHashes(ctx, role)
-	if err != nil {
-		return false
+func resolveToken(ctx context.Context, provider TokenProvider, role Role, token string) (Principal, bool) {
+	principal, ok, err := provider.Resolve(ctx, role, token)
+	if err != nil || !ok {
+		return Principal{}, false
 	}
-	sum := sha256.Sum256([]byte(token))
-	_, ok := hashes[hex.EncodeToString(sum[:])]
-	return ok
+	return principal, true
 }
 
 type StaticTokenProvider struct {
-	service map[string]struct{}
-	ops     map[string]struct{}
+	service map[string]Principal
+	ops     map[string]Principal
 }
 
-func NewStaticTokenProvider(serviceTokens, opsTokens []string) *StaticTokenProvider {
+func NewStaticTokenProvider(serviceTokens map[string]string, opsTokens []string) *StaticTokenProvider {
 	return &StaticTokenProvider{
-		service: hashSet(serviceTokens),
-		ops:     hashSet(opsTokens),
+		service: servicePrincipals(serviceTokens),
+		ops:     opsPrincipals(opsTokens),
 	}
 }
 
-func (p *StaticTokenProvider) ValidHashes(_ context.Context, role Role) (map[string]struct{}, error) {
+func (p *StaticTokenProvider) Resolve(_ context.Context, role Role, token string) (Principal, bool, error) {
+	var set map[string]Principal
 	switch role {
 	case RoleOps:
-		return p.ops, nil
+		set = p.ops
 	case RoleService:
-		return p.service, nil
+		set = p.service
 	default:
-		return nil, nil
+		return Principal{}, false, nil
 	}
+	sum := sha256.Sum256([]byte(token))
+	principal, ok := set[hex.EncodeToString(sum[:])]
+	return principal, ok, nil
 }
 
 func (p *StaticTokenProvider) HasAny() bool { return len(p.service) > 0 || len(p.ops) > 0 }
 
-func hashSet(tokens []string) map[string]struct{} {
-	set := make(map[string]struct{}, len(tokens))
-	for _, t := range tokens {
-		if t == "" {
+func servicePrincipals(tokens map[string]string) map[string]Principal {
+	set := make(map[string]Principal, len(tokens))
+	for token, merchantID := range tokens {
+		if token == "" {
 			continue
 		}
-		sum := sha256.Sum256([]byte(t))
-		set[hex.EncodeToString(sum[:])] = struct{}{}
+		sum := sha256.Sum256([]byte(token))
+		set[hex.EncodeToString(sum[:])] = Principal{Role: RoleService, MerchantID: merchantID}
+	}
+	return set
+}
+
+func opsPrincipals(tokens []string) map[string]Principal {
+	set := make(map[string]Principal, len(tokens))
+	for _, token := range tokens {
+		if token == "" {
+			continue
+		}
+		sum := sha256.Sum256([]byte(token))
+		set[hex.EncodeToString(sum[:])] = Principal{Role: RoleOps}
 	}
 	return set
 }

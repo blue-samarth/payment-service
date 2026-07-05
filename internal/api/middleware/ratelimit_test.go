@@ -11,13 +11,15 @@ import (
 )
 
 type fakeLimiter struct {
-	allow      bool
-	retryAfter time.Duration
-	gotIP      string
+	allow       bool
+	retryAfter  time.Duration
+	gotIP       string
+	gotMerchant string
 }
 
 func (f *fakeLimiter) Allow(_ context.Context, userID, merchantID, ip string, _ int64, _ float64) RateDecision {
 	f.gotIP = ip
+	f.gotMerchant = merchantID
 	return RateDecision{Allowed: f.allow, RetryAfter: f.retryAfter}
 }
 
@@ -66,6 +68,28 @@ func TestRateLimit_Rejects429(t *testing.T) {
 	}
 	if rec.Header().Get("Retry-After") != "2" {
 		t.Errorf("expected Retry-After: 2, got %q", rec.Header().Get("Retry-After"))
+	}
+}
+
+func TestRateLimit_MerchantBucketFromTokenNotHeader(t *testing.T) {
+	lim := &fakeLimiter{allow: true}
+	provider := NewStaticTokenProvider(map[string]string{"svc-secret": "attacker"}, nil)
+	// Authenticate resolves the token to merchant "attacker"; RateLimit must key
+	// on that, ignoring the spoofed X-Merchant-ID header naming the victim.
+	h := Authenticate(provider, noopLog{})(
+		RateLimit(lim, RateLimitConfig{Capacity: 10, RefillPerSec: 5}, noopLog{})(okHandler()),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
+	req.Header.Set("X-Service-Token", "svc-secret")
+	req.Header.Set("X-Merchant-ID", "victim")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if lim.gotMerchant == "victim" {
+		t.Fatal("a spoofed X-Merchant-ID must not reach the bucket key")
+	}
+	if lim.gotMerchant != "attacker" {
+		t.Errorf("bucket must key on the token-bound merchant, got %q", lim.gotMerchant)
 	}
 }
 

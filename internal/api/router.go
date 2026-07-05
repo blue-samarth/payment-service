@@ -15,10 +15,10 @@ type Deps struct {
 	Webhook     *handlers.WebhookHandler
 	Health      *handlers.HealthHandler
 	Logger      ports.Logger
-	Auth        middleware.TokenProvider
-	Limiter     middleware.Limiter
-	RateLimit   middleware.RateLimitConfig
-	Idempotency middleware.IdempotencyStore
+	Auth          middleware.TokenProvider
+	Limiter       middleware.Limiter
+	RateLimit     middleware.RateLimitConfig
+	ResponseCache middleware.ResponseCacheStore
 }
 
 func NewRouter(deps Deps) http.Handler {
@@ -43,8 +43,8 @@ func NewRouter(deps Deps) http.Handler {
 	if deps.Limiter != nil {
 		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.RateLimit, deps.Logger))
 	}
-	if deps.Idempotency != nil {
-		chain = append(chain, middleware.Idempotency(deps.Idempotency, deps.Logger))
+	if deps.ResponseCache != nil {
+		chain = append(chain, middleware.ResponseCache(deps.ResponseCache, deps.Logger))
 	}
 
 	return middleware.Chain(mux, chain...)

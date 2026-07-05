@@ -24,6 +24,7 @@ func (f *fakeCancelService) Cancel(context.Context, appcancel.CancelInput) (appc
 func postCancel(h *CancelHandler, id, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodPost, "/payments/"+id+"/cancel", strings.NewReader(body))
 	req.SetPathValue("id", id)
+	req.Header.Set("Idempotency-Key", "cancel-key")
 	rec := httptest.NewRecorder()
 	h.Cancel(rec, req)
 	return rec

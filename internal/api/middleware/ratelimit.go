@@ -29,7 +29,7 @@ func RateLimit(limiter Limiter, cfg RateLimitConfig, log ports.Logger) func(http
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			userID := r.Header.Get("X-User-ID")
-			merchantID := r.Header.Get("X-Merchant-ID")
+			merchantID := merchantBucketID(r.Context())
 			ip := clientIP(r)
 
 			decision := limiter.Allow(r.Context(), userID, merchantID, ip, cfg.Capacity, cfg.RefillPerSec)
@@ -52,6 +52,16 @@ func RateLimit(limiter Limiter, cfg RateLimitConfig, log ports.Logger) func(http
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func merchantBucketID(ctx context.Context) string {
+	if m := MerchantIDFromContext(ctx); m != "" {
+		return m
+	}
+	if p, ok := PrincipalFromContext(ctx); ok {
+		return "principal:" + string(p.Role)
+	}
+	return ""
 }
 
 func clientIP(r *http.Request) string {

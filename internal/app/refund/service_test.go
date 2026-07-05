@@ -144,18 +144,43 @@ func TestProcessRefund_GatewayCompleted(t *testing.T) {
 	}
 }
 
+func TestProcessRefund_GatewayErrorStaysNonTerminal(t *testing.T) {
+	parent := succeededTxn(100000)
+	parent.GatewayReferenceID = "pi_1"
+	rf, _ := domainrefund.New(parent.ID, 40000, 100000, 0, "r", "by")
+	rf.AttemptedGateway = "stripe"
+	refunds := &fakeRefunds{byID: map[uuid.UUID]*domainrefund.Refund{rf.ID: rf}}
+	outbox := &fakeOutbox{}
+	// A 5xx / gateway error is "maybe refunded, can't tell" — declaring it FAILED
+	// and retrying would double-refund. It must stay non-terminal for reconciliation.
+	reg := &fakeRegistry{adapter: &fakeAdapter{err: &ports.GatewayError{Category: ports.ErrorCategoryGatewayError, Code: "gateway_error"}}}
+
+	s := NewService(&fakeTxns{txn: parent}, refunds, outbox, fakeTransactor{}, reg, noopLogger{}, noopMetrics{})
+	got, err := s.ProcessRefund(context.Background(), rf.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.Status != domainrefund.StatusProcessing {
+		t.Errorf("a gateway error must leave the refund PROCESSING, got %s", got.Status)
+	}
+	if len(outbox.events) != 0 {
+		t.Errorf("no terminal refund event should be written on an ambiguous gateway error, got %+v", outbox.events)
+	}
+}
+
 func TestInitiateRefund_Success(t *testing.T) {
 	parent := succeededTxn(100000)
 	outbox := &fakeOutbox{}
 	refunds := &fakeRefunds{sum: 0}
 	s := svc(&fakeTxns{txn: parent}, refunds, outbox)
 
-	rf, err := s.InitiateRefund(context.Background(), InitiateInput{
+	res, err := s.InitiateRefund(context.Background(), InitiateInput{
 		TransactionID: parent.ID, Amount: 40000, Reason: "customer_request", InitiatedBy: "ops:1",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	rf := res.Refund
 	if rf.Status != domainrefund.StatusInitiated {
 		t.Errorf("expected REFUND_INITIATED, got %s", rf.Status)
 	}

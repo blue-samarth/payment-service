@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/domain/routing"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -64,9 +66,10 @@ type CreatePaymentInput struct {
 	CustomerID    uuid.UUID
 	CustomerEmail string
 	Description   string
-	Metadata      map[string]any
-	MerchantTier  string
-	IsDomestic    bool
+	Metadata       map[string]any
+	MerchantTier   string
+	IsDomestic     bool
+	IdempotencyKey string
 }
 
 type Service struct {
@@ -79,14 +82,16 @@ type Service struct {
 	gateways       GatewayRegistry
 	cancelResolver CancelResolver
 	breaker        CircuitBreaker
+	idem           *idempotency.Guard
 	maxAttempts    int
 	log            ports.Logger
 	metrics        ports.MetricRecorder
 }
 
-func (s *Service) SetCancelResolver(r CancelResolver) { s.cancelResolver = r }
-func (s *Service) SetCircuitBreaker(b CircuitBreaker) { s.breaker = b }
-func (s *Service) SetMaxGatewayAttempts(n int)        { s.maxAttempts = n }
+func (s *Service) SetCancelResolver(r CancelResolver)   { s.cancelResolver = r }
+func (s *Service) SetCircuitBreaker(b CircuitBreaker)   { s.breaker = b }
+func (s *Service) SetMaxGatewayAttempts(n int)          { s.maxAttempts = n }
+func (s *Service) SetIdempotency(g *idempotency.Guard)  { s.idem = g }
 
 func NewService(
 	repo TransactionRepo,
@@ -127,7 +132,75 @@ func (s *Service) GetPayment(ctx context.Context, id uuid.UUID) (*transaction.Tr
 	return s.repo.GetByID(ctx, id)
 }
 
-func (s *Service) CreatePayment(ctx context.Context, in CreatePaymentInput) (*transaction.Transaction, error) {
+type CreateResult struct {
+	Verdict     idempotency.Verdict
+	Transaction *transaction.Transaction
+}
+
+type idempotencyPaymentResponse struct {
+	TransactionID string `json:"transaction_id"`
+}
+
+func (s *Service) CreatePayment(ctx context.Context, in CreatePaymentInput) (CreateResult, error) {
+	// Routing and config reads acquire their own pool connections, so they must
+	// run BEFORE (never nested inside) the reservation transaction — otherwise a
+	// burst of concurrent creates each hold a tx connection while waiting for a
+	// second one to route, and the pool deadlocks.
+	txn, event, err := s.buildTransaction(ctx, in)
+	if err != nil {
+		return CreateResult{}, err
+	}
+
+	if s.idem == nil {
+		if err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
+			return s.insertTransaction(ctx, txn, event)
+		}); err != nil {
+			return CreateResult{}, err
+		}
+		s.logCreated(txn)
+		return CreateResult{Verdict: idempotency.Created, Transaction: txn}, nil
+	}
+
+	if in.IdempotencyKey == "" {
+		return CreateResult{}, idempotency.ErrKeyRequired
+	}
+	composite := idempotency.Composite(in.MerchantID.String(), "create_payment", in.IdempotencyKey)
+	requestHash := createRequestHash(in)
+
+	res, err := s.idem.Execute(ctx, composite, requestHash, func(ctx context.Context) ([]byte, error) {
+		if err := s.insertTransaction(ctx, txn, event); err != nil {
+			return nil, err
+		}
+		return json.Marshal(idempotencyPaymentResponse{TransactionID: txn.ID.String()})
+	})
+	if err != nil {
+		return CreateResult{}, err
+	}
+
+	switch res.Verdict {
+	case idempotency.Created:
+		s.logCreated(txn)
+		return CreateResult{Verdict: res.Verdict, Transaction: txn}, nil
+	case idempotency.Replayed:
+		var stored idempotencyPaymentResponse
+		if err := json.Unmarshal(res.Response, &stored); err != nil {
+			return CreateResult{}, fmt.Errorf("payment: decode idempotent response: %w", err)
+		}
+		id, err := uuid.Parse(stored.TransactionID)
+		if err != nil {
+			return CreateResult{}, fmt.Errorf("payment: bad stored transaction id: %w", err)
+		}
+		existing, err := s.repo.GetByID(ctx, id)
+		if err != nil {
+			return CreateResult{}, fmt.Errorf("payment: reload idempotent transaction %s: %w", id, err)
+		}
+		return CreateResult{Verdict: res.Verdict, Transaction: existing}, nil
+	default:
+		return CreateResult{Verdict: res.Verdict}, nil
+	}
+}
+
+func (s *Service) buildTransaction(ctx context.Context, in CreatePaymentInput) (*transaction.Transaction, *ports.OutboxEvent, error) {
 	decision, err := s.router.Route(ctx, RouteInput{
 		Amount:        in.Amount,
 		Currency:      in.Currency,
@@ -142,21 +215,21 @@ func (s *Service) CreatePayment(ctx context.Context, in CreatePaymentInput) (*tr
 				ports.FieldMerchantID:    in.MerchantID.String(),
 				ports.FieldPaymentMethod: string(in.PaymentMethod),
 			})
-			return nil, ErrNoGateway
+			return nil, nil, ErrNoGateway
 		}
-		return nil, fmt.Errorf("payment: routing: %w", err)
+		return nil, nil, fmt.Errorf("payment: routing: %w", err)
 	}
 
 	gateway := decision.SelectedGateway
 
 	timeout, err := s.config.GetProcessingTimeout(ctx, gateway, string(in.PaymentMethod))
 	if err != nil {
-		return nil, fmt.Errorf("payment: processing timeout for %s/%s: %w", gateway, in.PaymentMethod, err)
+		return nil, nil, fmt.Errorf("payment: processing timeout for %s/%s: %w", gateway, in.PaymentMethod, err)
 	}
 
 	timeoutSec := int(timeout.Seconds())
 	if timeoutSec <= 0 {
-		return nil, fmt.Errorf("payment: invalid processing timeout %s for %s/%s", timeout, gateway, in.PaymentMethod)
+		return nil, nil, fmt.Errorf("payment: invalid processing timeout %s for %s/%s", timeout, gateway, in.PaymentMethod)
 	}
 
 	txn, err := transaction.New(
@@ -172,7 +245,7 @@ func (s *Service) CreatePayment(ctx context.Context, in CreatePaymentInput) (*tr
 		timeoutSec,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("payment: build transaction: %w", err)
+		return nil, nil, fmt.Errorf("payment: build transaction: %w", err)
 	}
 	txn.AttemptedGateway = gateway
 
@@ -187,46 +260,49 @@ func (s *Service) CreatePayment(ctx context.Context, in CreatePaymentInput) (*tr
 		CreatedAt:     txn.CreatedAt.Format(time.RFC3339Nano),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("payment: marshal created event: %w", err)
+		return nil, nil, fmt.Errorf("payment: marshal created event: %w", err)
 	}
 
-	event := ports.OutboxEvent{
+	return txn, &ports.OutboxEvent{
 		AggregateID:   txn.ID,
 		AggregateType: "transaction",
 		EventType:     ports.EventTypePaymentCreated,
 		Payload:       payload,
 		EventVersion:  1,
-	}
+	}, nil
+}
 
-	err = s.tx.WithinTx(ctx, func(ctx context.Context) error {
-		if err := s.repo.Insert(ctx, txn); err != nil {
-			return fmt.Errorf("insert transaction: %w", err)
-		}
-		if err := s.outbox.Write(ctx, event); err != nil {
-			return fmt.Errorf("write outbox event: %w", err)
-		}
-		return nil
-	})
-	if err != nil {
-		s.log.Error(ports.LogEventTransactionCreated, map[string]any{
-			ports.FieldErrorCode:     "payment_persist_failed",
-			ports.FieldTransactionID: txn.ID.String(),
-			ports.FieldMerchantID:    txn.MerchantID.String(),
-			ports.FieldGatewayID:     gateway,
-		}, err)
-		return nil, fmt.Errorf("payment: persist transaction %s: %w", txn.ID, err)
+func (s *Service) insertTransaction(ctx context.Context, txn *transaction.Transaction, event *ports.OutboxEvent) error {
+	if err := s.repo.Insert(ctx, txn); err != nil {
+		return fmt.Errorf("insert transaction: %w", err)
 	}
+	if err := s.outbox.Write(ctx, *event); err != nil {
+		return fmt.Errorf("write outbox event: %w", err)
+	}
+	return nil
+}
 
+func (s *Service) logCreated(txn *transaction.Transaction) {
 	s.log.Info(ports.LogEventTransactionCreated, map[string]any{
 		ports.FieldTransactionID: txn.ID.String(),
 		ports.FieldMerchantID:    txn.MerchantID.String(),
-		ports.FieldGatewayID:     gateway,
+		ports.FieldGatewayID:     txn.GatewayID,
 		ports.FieldPaymentMethod: string(txn.PaymentMethod),
 	})
 	s.metrics.Increment(ports.MetricTransactionCreated, map[string]string{
-		"gateway_id":     gateway,
+		"gateway_id":     txn.GatewayID,
 		"payment_method": string(txn.PaymentMethod),
 	})
+}
 
-	return txn, nil
+func createRequestHash(in CreatePaymentInput) string {
+	return idempotency.RequestHash(
+		in.MerchantID.String(),
+		strconv.FormatInt(in.Amount, 10),
+		in.Currency,
+		string(in.PaymentMethod),
+		in.CustomerID.String(),
+		in.CustomerEmail,
+		in.Description,
+	)
 }

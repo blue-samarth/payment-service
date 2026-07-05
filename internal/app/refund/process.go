@@ -110,11 +110,12 @@ func (s *Service) ResolveCancelRefund(ctx context.Context, transactionID uuid.UU
 		return nil
 	}
 
-	rf, err := s.InitiateRefund(ctx, InitiateInput{
-		TransactionID: transactionID,
-		Amount:        amount,
-		Reason:        ReasonCancelResolution,
-		InitiatedBy:   "system:cancel_resolution",
+	res, err := s.InitiateRefund(ctx, InitiateInput{
+		TransactionID:  transactionID,
+		Amount:         amount,
+		Reason:         ReasonCancelResolution,
+		InitiatedBy:    "system:cancel_resolution",
+		IdempotencyKey: "cancel-resolution:" + transactionID.String(),
 	})
 	if err != nil {
 		var over refund.ErrOverRefund
@@ -123,9 +124,12 @@ func (s *Service) ResolveCancelRefund(ctx context.Context, transactionID uuid.UU
 		}
 		return fmt.Errorf("refund: cancel resolution for %s: %w", transactionID, err)
 	}
+	if res.Refund == nil {
+		return nil
+	}
 
-	if _, err := s.ProcessRefund(ctx, rf.ID); err != nil {
-		return fmt.Errorf("refund: process cancel resolution %s: %w", rf.ID, err)
+	if _, err := s.ProcessRefund(ctx, res.Refund.ID); err != nil {
+		return fmt.Errorf("refund: process cancel resolution %s: %w", res.Refund.ID, err)
 	}
 	return nil
 }
@@ -156,7 +160,8 @@ func (s *Service) callGateway(ctx context.Context, adapter ports.GatewayAdapter,
 
 func resolveRefundOutcome(resp *ports.GatewayRefundResponse, gwErr *ports.GatewayError) refundOutcome {
 	if gwErr != nil {
-		if gwErr.Category == ports.ErrorCategoryAmbiguous || gwErr.Category == ports.ErrorCategoryNetworkTimeout {
+		switch gwErr.Category {
+		case ports.ErrorCategoryAmbiguous, ports.ErrorCategoryNetworkTimeout, ports.ErrorCategoryGatewayError:
 			return refundOutcome{terminal: false}
 		}
 		return refundOutcome{

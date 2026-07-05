@@ -176,10 +176,11 @@ func TestCreatePayment_Success(t *testing.T) {
 	tx := &fakeTransactor{}
 	svc := newTestService(repo, outbox, router, config, tx)
 
-	txn, err := svc.CreatePayment(context.Background(), validInput())
+	res, err := svc.CreatePayment(context.Background(), validInput())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	txn := res.Transaction
 
 	if txn.Status != transaction.StatusPending {
 		t.Errorf("expected status PENDING, got %s", txn.Status)
