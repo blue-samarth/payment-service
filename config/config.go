@@ -98,6 +98,7 @@ type DatabaseConfig struct {
 	User              string
 	Password          string
 	SSLMode           string
+	SearchPath        string
 	MaxOpenConns      int
 	MaxIdleConns      int
 	ConnMaxLifetime   time.Duration
@@ -358,19 +359,27 @@ func quoteDSNValue(v string) string {
 }
 
 func (d DatabaseConfig) DSN() string {
-	return fmt.Sprintf(
+	dsn := fmt.Sprintf(
 		"host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
 		quoteDSNValue(d.PrimaryHost), d.Port, quoteDSNValue(d.Name),
 		quoteDSNValue(d.User), quoteDSNValue(d.Password), quoteDSNValue(d.SSLMode),
 	)
+	if d.SearchPath != "" {
+		dsn += " search_path=" + quoteDSNValue(d.SearchPath)
+	}
+	return dsn
 }
 func (d DatabaseConfig) ReplicaDSN() string {
 	if d.ReplicaHost == "" {
 		return d.DSN()
 	}
-	return fmt.Sprintf(
+	dsn := fmt.Sprintf(
 		"host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
 		quoteDSNValue(d.ReplicaHost), d.Port, quoteDSNValue(d.Name),
 		quoteDSNValue(d.User), quoteDSNValue(d.Password), quoteDSNValue(d.SSLMode),
 	)
+	if d.SearchPath != "" {
+		dsn += " search_path=" + quoteDSNValue(d.SearchPath)
+	}
+	return dsn
 }

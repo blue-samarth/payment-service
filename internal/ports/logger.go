@@ -51,6 +51,9 @@ const (
 	LogEventConfigReload  = "config.hot_reload"
 	LogEventConfigInvalid = "config.invalid_rejected"
 
+	LogEventTLSCertReloaded     = "tls.cert_reloaded"
+	LogEventTLSCertReloadFailed = "tls.cert_reload_failed"
+
 	LogEventRateLimitRejected = "rate_limit.rejected"
 	LogEventRateLimitFallback = "rate_limit.fallback_activated"
 	LogEventRateLimitRestored = "rate_limit.redis_restored"
