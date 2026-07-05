@@ -380,11 +380,11 @@ Idempotency is enforced at **two layers**, both following the same Reserve → r
 
 ```mermaid
 flowchart TD
-    Start([Execute(composite, requestHash, op)]) --> Tx[Begin DB tx]
+    Start(["Execute(composite, requestHash, op)"]) --> Tx[Begin DB tx]
     Tx --> Reserve[store.Reserve composite, requestHash]
     Reserve --> Claimed{Claimed?}
 
-    Claimed -->|Yes| RunOp[op(ctx)]
+    Claimed -->|Yes| RunOp["op(ctx)"]
     RunOp --> OpResult{op error?}
     OpResult -->|Error| Rollback[Rollback tx<br/>reservation undone — key free for retry]
     OpResult -->|OK| Complete[store.Complete composite, response]
