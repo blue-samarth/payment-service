@@ -136,6 +136,7 @@ type OutboxConfig struct {
 	PollIntervalSec             int
 	MaxAttempts                 int
 	BatchSize                   int
+	ClaimTTLSec                 int
 }
 type RateLimitConfig struct {
 	FallbackMultiplier  float64
@@ -266,6 +267,7 @@ func LoadConfig() (*Config, error) {
 	c.Outbox.PollIntervalSec = getEnvInt("OUTBOX_RELAY_POLL_INTERVAL_SEC", 10, &errs)
 	c.Outbox.MaxAttempts = getEnvInt("OUTBOX_RELAY_MAX_ATTEMPTS", 5, &errs)
 	c.Outbox.BatchSize = getEnvInt("OUTBOX_RELAY_BATCH_SIZE", 50, &errs)
+	c.Outbox.ClaimTTLSec = getEnvInt("OUTBOX_RELAY_CLAIM_TTL_SEC", 60, &errs)
 
 	c.RateLimit.FallbackMultiplier = getEnvFloat64("RATE_LIMIT_FALLBACK_MULTIPLIER", 0.5, &errs)
 	c.RateLimit.LocalMaxBuckets = getEnvInt("RATE_LIMIT_LOCAL_MAX_BUCKETS", 10000, &errs)
@@ -336,6 +338,10 @@ func Validate(c *Config) error {
 
 	if c.Outbox.WALLagAlertThresholdMB >= c.Outbox.WALLagCriticalThresholdMB {
 		errs = append(errs, "OUTBOX_RELAY_WAL_LAG_ALERT_THRESHOLD_MB must be < OUTBOX_RELAY_WAL_LAG_CRITICAL_THRESHOLD_MB")
+	}
+
+	if c.Outbox.ClaimTTLSec <= c.Outbox.PollIntervalSec {
+		errs = append(errs, "OUTBOX_RELAY_CLAIM_TTL_SEC must be > OUTBOX_RELAY_POLL_INTERVAL_SEC (and must exceed max publish duration)")
 	}
 
 	if c.RateLimit.FallbackMultiplier <= 0 || c.RateLimit.FallbackMultiplier > 1 {
