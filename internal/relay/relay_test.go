@@ -158,13 +158,24 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 
 func TestBackoff_Caps(t *testing.T) {
 	w := newWorker(&fakeOutbox{}, &fakePublisher{}, Config{BaseBackoff: time.Second, MaxBackoff: 10 * time.Second})
-	if got := w.backoff(0); got != time.Second {
-		t.Errorf("attempt 0: expected 1s, got %v", got)
+
+	// Equal jitter: each attempt returns a value in [d/2, d], where d is the
+	// capped exponential delay, so a batch of failures does not re-poll in lockstep.
+	cases := []struct {
+		attempt  int
+		min, max time.Duration
+	}{
+		{0, 500 * time.Millisecond, time.Second}, // d = 1s
+		{2, 2 * time.Second, 4 * time.Second},    // d = 4s
+		{20, 5 * time.Second, 10 * time.Second},  // d capped to MaxBackoff
+		{100, 5 * time.Second, 10 * time.Second}, // exponent capped, no shift overflow
 	}
-	if got := w.backoff(2); got != 4*time.Second {
-		t.Errorf("attempt 2: expected 4s, got %v", got)
-	}
-	if got := w.backoff(20); got != 10*time.Second {
-		t.Errorf("attempt 20: expected capped 10s, got %v", got)
+	for _, c := range cases {
+		for i := 0; i < 50; i++ {
+			got := w.backoff(c.attempt)
+			if got < c.min || got > c.max {
+				t.Fatalf("attempt %d: backoff %v outside [%v, %v]", c.attempt, got, c.min, c.max)
+			}
+		}
 	}
 }

@@ -2,6 +2,7 @@ package relay
 
 import (
 	"context"
+	"math/rand/v2"
 	"time"
 
 	"github.com/google/uuid"
@@ -165,9 +166,13 @@ func (w *Worker) processEvent(ctx context.Context, e ports.PendingEvent) {
 }
 
 func (w *Worker) backoff(attempts int) time.Duration {
+	if attempts > 30 {
+		attempts = 30
+	}
 	d := w.cfg.BaseBackoff << attempts
 	if d <= 0 || d > w.cfg.MaxBackoff {
-		return w.cfg.MaxBackoff
+		d = w.cfg.MaxBackoff
 	}
-	return d
+	half := d / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
 }

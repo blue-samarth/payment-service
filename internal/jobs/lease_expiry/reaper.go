@@ -82,23 +82,23 @@ func (r *Reaper) reapLeases(ctx context.Context) {
 func (r *Reaper) sweepIdempotency(ctx context.Context) {
 	stale, err := r.idem.SweepStaleProcessing(ctx, r.cfg.IdempotencyProcessingTimeout)
 	if err != nil {
-		r.log.Error(ports.LogEventTransactionLeaseExpired, map[string]any{
+		r.log.Error(ports.LogEventIdempotencySweep, map[string]any{
 			ports.FieldErrorCode:     "idempotency_sweep_failed",
 			ports.FieldTraceID:       "",
 			ports.FieldTransactionID: "",
 		}, err)
 	} else if stale > 0 {
-		r.log.Warn("idempotency.stale_processing_swept", map[string]any{"swept": stale})
+		r.log.Warn(ports.LogEventIdempotencySweep, map[string]any{"swept": stale})
 	}
 
 	expired, err := r.idem.DeleteExpired(ctx)
 	if err != nil {
-		r.log.Error(ports.LogEventTransactionLeaseExpired, map[string]any{
+		r.log.Error(ports.LogEventIdempotencySweep, map[string]any{
 			ports.FieldErrorCode:     "idempotency_expiry_failed",
 			ports.FieldTraceID:       "",
 			ports.FieldTransactionID: "",
 		}, err)
 	} else if expired > 0 {
-		r.log.Info("idempotency.expired_purged", map[string]any{"purged": expired})
+		r.log.Info(ports.LogEventIdempotencySweep, map[string]any{"purged": expired})
 	}
 }
