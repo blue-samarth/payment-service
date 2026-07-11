@@ -21,10 +21,12 @@ import (
 type Config struct {
 	APIKey     string
 	BaseURL    string
+	Timeout    time.Duration
 	HTTPClient *http.Client
 }
 
 const maxResponseBytes = 2 << 20
+const defaultHTTPTimeout = 30 * time.Second
 
 type Adapter struct {
 	apiKey  string
@@ -39,7 +41,11 @@ func New(cfg Config) *Adapter {
 	}
 	client := cfg.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		timeout := cfg.Timeout
+		if timeout <= 0 {
+			timeout = defaultHTTPTimeout
+		}
+		client = &http.Client{Timeout: timeout}
 	}
 	return &Adapter{
 		apiKey:  cfg.APIKey,

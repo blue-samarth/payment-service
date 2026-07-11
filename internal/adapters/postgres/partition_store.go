@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -63,7 +64,7 @@ func (s *PartitionStore) CreatePartition(ctx context.Context, name string, start
 	}
 	sql := fmt.Sprintf(
 		"CREATE TABLE IF NOT EXISTS %s PARTITION OF outbox_events FOR VALUES FROM ('%s') TO ('%s')",
-		name,
+		pgx.Identifier{name}.Sanitize(),
 		start.UTC().Format(partitionBoundLayout),
 		end.UTC().Format(partitionBoundLayout),
 	)
@@ -95,7 +96,7 @@ func (s *PartitionStore) CountUnpublished(ctx context.Context, partition string)
 	if !partitionNamePattern.MatchString(partition) {
 		return 0, fmt.Errorf("partition: invalid partition name %q", partition)
 	}
-	sql := fmt.Sprintf("SELECT count(*) FROM %s WHERE status IN ('PENDING', 'FAILED')", partition)
+	sql := fmt.Sprintf("SELECT count(*) FROM %s WHERE status IN ('PENDING', 'FAILED', 'PUBLISHING')", pgx.Identifier{partition}.Sanitize())
 	var n int
 	if err := s.db.pool.QueryRow(ctx, sql).Scan(&n); err != nil {
 		return 0, fmt.Errorf("partition: count unpublished in %s: %w", partition, err)
@@ -107,7 +108,7 @@ func (s *PartitionStore) DetachPartition(ctx context.Context, name string) error
 	if !partitionNamePattern.MatchString(name) {
 		return fmt.Errorf("partition: invalid partition name %q", name)
 	}
-	sql := fmt.Sprintf("ALTER TABLE outbox_events DETACH PARTITION %s", name)
+	sql := fmt.Sprintf("ALTER TABLE outbox_events DETACH PARTITION %s", pgx.Identifier{name}.Sanitize())
 	if _, err := s.db.pool.Exec(ctx, sql); err != nil {
 		return fmt.Errorf("partition: detach %s: %w", name, err)
 	}
@@ -118,7 +119,7 @@ func (s *PartitionStore) DropPartition(ctx context.Context, name string) error {
 	if !partitionNamePattern.MatchString(name) {
 		return fmt.Errorf("partition: invalid partition name %q", name)
 	}
-	sql := fmt.Sprintf("DROP TABLE IF EXISTS %s", name)
+	sql := fmt.Sprintf("DROP TABLE IF EXISTS %s", pgx.Identifier{name}.Sanitize())
 	if _, err := s.db.pool.Exec(ctx, sql); err != nil {
 		return fmt.Errorf("partition: drop %s: %w", name, err)
 	}

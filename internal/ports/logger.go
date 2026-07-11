@@ -43,6 +43,8 @@ const (
 	LogEventCancelIntent     = "cancel.intent_set"
 	LogEventCancelResolution = "cancel.resolution"
 
+	LogEventIdempotencySweep = "idempotency.sweep"
+
 	LogEventReconciliationStart    = "reconciliation.started"
 	LogEventReconciliationComplete = "reconciliation.completed"
 	LogEventReconciliationMismatch = "reconciliation.mismatch_detected"
