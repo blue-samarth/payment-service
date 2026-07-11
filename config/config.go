@@ -170,11 +170,16 @@ type SecurityConfig struct {
 	DEKRotationBatchSize    int
 	DEKRotationBatchSleepMs int
 }
+type GatewayConfig struct {
+	HTTPTimeout time.Duration
+	MaxAttempts int
+}
 type JobsConfig struct {
-	LockRetryIntervalSec     int
-	LockTimeoutMinutes       int
-	LeaseExpiryIntervalSec   int
-	FeeSnapshotIntervalHours int
+	LockRetryIntervalSec            int
+	LockTimeoutMinutes              int
+	LeaseExpiryIntervalSec          int
+	FeeSnapshotIntervalHours        int
+	IdempotencyProcessingTimeoutSec int
 }
 type DataRetentionConfig struct {
 	BatchSize      int
@@ -190,6 +195,7 @@ type Config struct {
 	Outbox         OutboxConfig
 	RateLimit      RateLimitConfig
 	Routing        RoutingConfig
+	Gateway        GatewayConfig
 	Reconciliation ReconciliationConfig
 	Observability  ObservabilityConfig
 	Security       SecurityConfig
@@ -277,6 +283,9 @@ func LoadConfig() (*Config, error) {
 	c.Routing.FeeCacheTTLSec = getEnvInt("GATEWAY_FEE_CACHE_TTL_SEC", 3600, &errs)
 	c.Routing.FXReconciliationTolerancePct = getEnvFloat64("FX_RECONCILIATION_TOLERANCE_PCT", 1.0, &errs)
 
+	c.Gateway.HTTPTimeout = getEnvDuration("GATEWAY_HTTP_TIMEOUT", 30*time.Second, &errs)
+	c.Gateway.MaxAttempts = getEnvInt("GATEWAY_MAX_ATTEMPTS", 3, &errs)
+
 	c.Reconciliation.RunIntervalHours = getEnvInt("RECONCILIATION_RUN_INTERVAL_HOURS", 6, &errs)
 	c.Reconciliation.ReportFetchTimeoutSeconds = getEnvInt("RECONCILIATION_REPORT_FETCH_TIMEOUT_SECONDS", 120, &errs)
 	c.Reconciliation.AutoResolutionEnabled = getEnvBool("RECONCILIATION_AUTO_RESOLUTION_ENABLED", true, &errs)
@@ -300,6 +309,7 @@ func LoadConfig() (*Config, error) {
 	c.Jobs.LockTimeoutMinutes = getEnvInt("JOB_LOCK_TIMEOUT_MINUTES", 10, &errs)
 	c.Jobs.LeaseExpiryIntervalSec = getEnvInt("LEASE_EXPIRY_INTERVAL_SECONDS", 60, &errs)
 	c.Jobs.FeeSnapshotIntervalHours = getEnvInt("FEE_SNAPSHOT_INTERVAL_HOURS", 1, &errs)
+	c.Jobs.IdempotencyProcessingTimeoutSec = getEnvInt("LEASE_REAPER_IDEMPOTENCY_TIMEOUT_SEC", 300, &errs)
 
 	c.DataRetention.BatchSize = getEnvInt("DATA_RETENTION_BATCH_SIZE", 1000, &errs)
 	c.DataRetention.BatchSleepMs = getEnvInt("DATA_RETENTION_BATCH_SLEEP_MS", 100, &errs)
@@ -342,6 +352,17 @@ func Validate(c *Config) error {
 
 	if c.Outbox.ClaimTTLSec <= c.Outbox.PollIntervalSec {
 		errs = append(errs, "OUTBOX_RELAY_CLAIM_TTL_SEC must be > OUTBOX_RELAY_POLL_INTERVAL_SEC (and must exceed max publish duration)")
+	}
+
+	if c.Gateway.MaxAttempts > 0 && c.Gateway.HTTPTimeout > 0 {
+		gatewayBudget := time.Duration(c.Gateway.MaxAttempts) * c.Gateway.HTTPTimeout
+		idemTimeout := time.Duration(c.Jobs.IdempotencyProcessingTimeoutSec) * time.Second
+		if idemTimeout <= gatewayBudget {
+			errs = append(errs, fmt.Sprintf(
+				"LEASE_REAPER_IDEMPOTENCY_TIMEOUT_SEC (%s) must exceed the gateway budget GATEWAY_HTTP_TIMEOUT*GATEWAY_MAX_ATTEMPTS (%s), or the reaper can release a still-in-flight reservation and cause double-execution",
+				idemTimeout, gatewayBudget,
+			))
+		}
 	}
 
 	if c.RateLimit.FallbackMultiplier <= 0 || c.RateLimit.FallbackMultiplier > 1 {

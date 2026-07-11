@@ -66,7 +66,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	})
 
 	for {
-		n, err := w.RunOnce(ctx)
+		n, published, err := w.RunOnce(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -78,7 +78,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			}, err)
 		}
 
-		if err == nil && n >= w.cfg.BatchSize {
+		if err == nil && n >= w.cfg.BatchSize && published > 0 {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -95,18 +95,20 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 }
 
-func (w *Worker) RunOnce(ctx context.Context) (int, error) {
+func (w *Worker) RunOnce(ctx context.Context) (count, published int, err error) {
 	events, err := w.outbox.PollPending(ctx, w.cfg.ShardMin, w.cfg.ShardMax, w.cfg.BatchSize)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	for _, e := range events {
-		w.processEvent(ctx, e)
+		if w.processEvent(ctx, e) {
+			published++
+		}
 	}
-	return len(events), nil
+	return len(events), published, nil
 }
 
-func (w *Worker) processEvent(ctx context.Context, e ports.PendingEvent) {
+func (w *Worker) processEvent(ctx context.Context, e ports.PendingEvent) bool {
 	start := time.Now()
 	err := w.publisher.Publish(ctx, e)
 	w.metrics.Histogram(ports.MetricOutboxPublishLatencyMs, float64(time.Since(start).Milliseconds()), map[string]string{
@@ -120,13 +122,13 @@ func (w *Worker) processEvent(ctx context.Context, e ports.PendingEvent) {
 				ports.FieldTraceID:       "",
 				ports.FieldTransactionID: e.AggregateID.String(),
 			}, mErr)
-			return
+			return false
 		}
 		w.log.Info(ports.LogEventOutboxPublish, map[string]any{
 			"event_type":   e.EventType,
 			"aggregate_id": e.AggregateID.String(),
 		})
-		return
+		return true
 	}
 
 	if e.Attempts+1 >= w.cfg.MaxAttempts {
@@ -136,7 +138,7 @@ func (w *Worker) processEvent(ctx context.Context, e ports.PendingEvent) {
 				ports.FieldTraceID:       "",
 				ports.FieldTransactionID: e.AggregateID.String(),
 			}, mErr)
-			return
+			return false
 		}
 		w.metrics.Increment(ports.MetricOutboxDeadLetter, map[string]string{"event_type": e.EventType})
 		w.log.Error(ports.LogEventOutboxDeadLetter, map[string]any{
@@ -145,7 +147,7 @@ func (w *Worker) processEvent(ctx context.Context, e ports.PendingEvent) {
 			ports.FieldTransactionID: e.AggregateID.String(),
 			"event_type":             e.EventType,
 		}, err)
-		return
+		return false
 	}
 
 	nextAttempt := time.Now().Add(w.backoff(e.Attempts))
@@ -155,7 +157,7 @@ func (w *Worker) processEvent(ctx context.Context, e ports.PendingEvent) {
 			ports.FieldTraceID:       "",
 			ports.FieldTransactionID: e.AggregateID.String(),
 		}, mErr)
-		return
+		return false
 	}
 	w.metrics.Increment(ports.MetricOutboxPublishFailure, map[string]string{"event_type": e.EventType})
 	w.log.Warn(ports.LogEventOutboxPublishFailure, map[string]any{
@@ -163,6 +165,7 @@ func (w *Worker) processEvent(ctx context.Context, e ports.PendingEvent) {
 		"aggregate_id":           e.AggregateID.String(),
 		ports.FieldAttemptNumber: e.Attempts + 1,
 	})
+	return false
 }
 
 func (w *Worker) backoff(attempts int) time.Duration {

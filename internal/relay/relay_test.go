@@ -84,12 +84,15 @@ func TestRunOnce_PublishesAndMarks(t *testing.T) {
 	pub := &fakePublisher{}
 	w := newWorker(outbox, pub, Config{ShardMin: 0, ShardMax: 63, BatchSize: 50, MaxAttempts: 5})
 
-	n, err := w.RunOnce(context.Background())
+	n, published, err := w.RunOnce(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 2 {
 		t.Errorf("expected 2 events processed, got %d", n)
+	}
+	if published != 2 {
+		t.Errorf("expected 2 events reported as published progress, got %d", published)
 	}
 	if len(pub.published) != 2 {
 		t.Errorf("expected 2 published, got %d", len(pub.published))
@@ -104,7 +107,7 @@ func TestRunOnce_FailureMarksFailedWithRetriesRemaining(t *testing.T) {
 	pub := &fakePublisher{err: errors.New("sns down")}
 	w := newWorker(outbox, pub, Config{MaxAttempts: 5})
 
-	if _, err := w.RunOnce(context.Background()); err != nil {
+	if _, _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(outbox.marks.failed) != 1 {
@@ -120,7 +123,7 @@ func TestRunOnce_FailureOnLastAttemptExhausts(t *testing.T) {
 	pub := &fakePublisher{err: errors.New("sns down")}
 	w := newWorker(outbox, pub, Config{MaxAttempts: 5})
 
-	if _, err := w.RunOnce(context.Background()); err != nil {
+	if _, _, err := w.RunOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if len(outbox.marks.exhausted) != 1 {
@@ -133,7 +136,7 @@ func TestRunOnce_FailureOnLastAttemptExhausts(t *testing.T) {
 
 func TestRunOnce_PollError(t *testing.T) {
 	w := newWorker(&errOutbox{}, &fakePublisher{}, Config{})
-	if _, err := w.RunOnce(context.Background()); err == nil {
+	if _, _, err := w.RunOnce(context.Background()); err == nil {
 		t.Fatal("expected poll error to propagate")
 	}
 }
@@ -153,6 +156,39 @@ func TestRun_StopsOnContextCancel(t *testing.T) {
 
 	if err := w.Run(ctx); err != context.Canceled {
 		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+}
+
+// alwaysFullOutbox returns a full batch on every poll and counts the polls.
+type alwaysFullOutbox struct {
+	fakeOutbox
+	batch  int
+	nPolls int
+}
+
+func (f *alwaysFullOutbox) PollPending(ctx context.Context, a, b, c int) ([]ports.PendingEvent, error) {
+	f.nPolls++
+	out := make([]ports.PendingEvent, f.batch)
+	for i := range out {
+		out[i] = event(0)
+	}
+	return out, nil
+}
+
+func TestRun_ThrottlesWhenFullBatchMakesNoProgress(t *testing.T) {
+	outbox := &alwaysFullOutbox{batch: 3}
+	pub := &fakePublisher{err: errors.New("sns down")}
+	w := newWorker(outbox, pub, Config{BatchSize: 3, MaxAttempts: 5, PollInterval: 50 * time.Millisecond})
+
+	// A full batch that published nothing must fall through to PollInterval, so
+	// within one interval window only the first poll runs. A busy-drain bug would
+	// re-poll immediately and rack up many polls against the dead publisher.
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	_ = w.Run(ctx)
+
+	if outbox.nPolls > 3 {
+		t.Errorf("full-batch-no-progress must throttle to PollInterval; polled %d times in 25ms", outbox.nPolls)
 	}
 }
 
