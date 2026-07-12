@@ -221,29 +221,20 @@ type circuitBreakerAdapter struct {
 	threshold int
 }
 
+type breakerStateAdapter struct { store *redis.CircuitBreakerStore }
+type limiterAdapter struct { rl *redis.RateLimiter }
+
+func (a circuitBreakerAdapter) RecordSuccess(ctx context.Context, gatewayID string) error { return a.store.RecordSuccess(ctx, gatewayID) }
 func (a circuitBreakerAdapter) RecordFailure(ctx context.Context, gatewayID string) error {
 	_, _, err := a.store.RecordFailure(ctx, gatewayID, a.threshold)
 	return err
 }
-
-func (a circuitBreakerAdapter) RecordSuccess(ctx context.Context, gatewayID string) error {
-	return a.store.RecordSuccess(ctx, gatewayID)
-}
-
-type breakerStateAdapter struct {
-	store *redis.CircuitBreakerStore
-}
-
 func (a breakerStateAdapter) BreakerState(ctx context.Context, gatewayID string) (string, time.Time, error) {
 	cb, err := a.store.Get(ctx, gatewayID)
 	if err != nil {
 		return "", time.Time{}, err
 	}
 	return string(cb.State), cb.CooldownUntil, nil
-}
-
-type limiterAdapter struct {
-	rl *redis.RateLimiter
 }
 
 func (a limiterAdapter) Allow(ctx context.Context, userID, merchantID, ip string, capacity int64, ratePerSec float64) middleware.RateDecision {
