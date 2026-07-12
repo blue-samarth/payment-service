@@ -39,7 +39,7 @@ func TestRouter_RoutesAndSetsRequestID(t *testing.T) {
 
 	router := NewRouter(Deps{
 		Payment: handlers.NewPaymentHandler(stubService{txn: txn}),
-		Health:  handlers.NewHealthHandler(okPinger{}),
+		Health:  handlers.NewHealthHandler(handlers.Check{Name: "database", Pinger: okPinger{}}),
 		Logger:  logger,
 	})
 

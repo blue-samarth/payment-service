@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,6 +11,7 @@ import (
 	"samarth/payment-service/config"
 	"samarth/payment-service/internal/adapters/observability"
 	"samarth/payment-service/internal/adapters/postgres"
+	"samarth/payment-service/internal/bootstrap"
 	"samarth/payment-service/internal/relay"
 	"samarth/payment-service/internal/relay/publisher"
 )
@@ -29,15 +29,33 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	logger := observability.NewSlogLogger(parseLogLevel(cfg.Observability.LogLevel))
-	metrics := observability.NewNoopMetrics()
+	logger := observability.NewSlogLogger(bootstrap.ParseLogLevel(cfg.Observability.LogLevel))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	db, err := postgres.New(ctx, cfg.Database)
+	metrics, metricsClose, err := observability.NewMetrics(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("connect database: %w", err)
+		return fmt.Errorf("init metrics: %w", err)
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsClose(flushCtx)
+	}()
+
+	connectPolicy := bootstrap.RetryPolicy{
+		Attempts:       cfg.Startup.ConnectMaxAttempts,
+		AttemptTimeout: cfg.Startup.ConnectAttemptTimeout,
+		Backoff:        cfg.Startup.ConnectBackoff,
+	}
+
+	var db *postgres.DB
+	if err := bootstrap.Connect(ctx, logger, "postgres", connectPolicy, func(c context.Context) error {
+		db, err = postgres.New(c, cfg.Database)
+		return err
+	}); err != nil {
+		return err
 	}
 	defer db.Close()
 
@@ -63,19 +81,4 @@ func run() error {
 	}
 	logger.Info("relay.stopped", nil)
 	return nil
-}
-
-func parseLogLevel(level string) slog.Level {
-	switch level {
-	case "error":
-		return slog.LevelError
-	case "warn":
-		return slog.LevelWarn
-	case "debug":
-		return slog.LevelDebug
-	case "trace":
-		return slog.Level(-8)
-	default:
-		return slog.LevelInfo
-	}
 }

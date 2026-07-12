@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,10 +13,6 @@ import (
 	"time"
 
 	"samarth/payment-service/config"
-	"samarth/payment-service/internal/adapters/gateways"
-	"samarth/payment-service/internal/adapters/gateways/payu"
-	"samarth/payment-service/internal/adapters/gateways/razorpay"
-	"samarth/payment-service/internal/adapters/gateways/stripe"
 	"samarth/payment-service/internal/adapters/observability"
 	"samarth/payment-service/internal/adapters/postgres"
 	"samarth/payment-service/internal/adapters/redis"
@@ -31,6 +26,7 @@ import (
 	"samarth/payment-service/internal/app/refund"
 	approuting "samarth/payment-service/internal/app/routing"
 	"samarth/payment-service/internal/app/webhook"
+	"samarth/payment-service/internal/bootstrap"
 )
 
 func main() {
@@ -46,14 +42,32 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	logger := observability.NewSlogLogger(parseLogLevel(cfg.Observability.LogLevel))
-	metrics := observability.NewNoopMetrics()
+	logger := observability.NewSlogLogger(bootstrap.ParseLogLevel(cfg.Observability.LogLevel))
 
 	ctx := context.Background()
 
-	db, err := postgres.New(ctx, cfg.Database)
+	metrics, metricsClose, err := observability.NewMetrics(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("connect database: %w", err)
+		return fmt.Errorf("init metrics: %w", err)
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsClose(flushCtx)
+	}()
+
+	connectPolicy := bootstrap.RetryPolicy{
+		Attempts:       cfg.Startup.ConnectMaxAttempts,
+		AttemptTimeout: cfg.Startup.ConnectAttemptTimeout,
+		Backoff:        cfg.Startup.ConnectBackoff,
+	}
+
+	var db *postgres.DB
+	if err := bootstrap.Connect(ctx, logger, "postgres", connectPolicy, func(c context.Context) error {
+		db, err = postgres.New(c, cfg.Database)
+		return err
+	}); err != nil {
+		return err
 	}
 	defer db.Close()
 
@@ -69,24 +83,7 @@ func run() error {
 	transactor := postgres.NewTransactor(db)
 	configStore := postgres.NewConfigStore(db, queries)
 
-	registry := gateways.NewRegistry()
-	registry.Register("stripe", stripe.New(stripe.Config{
-		APIKey:  os.Getenv("STRIPE_API_KEY"),
-		BaseURL: os.Getenv("STRIPE_BASE_URL"),
-		Timeout: cfg.Gateway.HTTPTimeout,
-	}))
-	registry.Register("razorpay", razorpay.New(razorpay.Config{
-		KeyID:     os.Getenv("RAZORPAY_KEY_ID"),
-		KeySecret: os.Getenv("RAZORPAY_KEY_SECRET"),
-		BaseURL:   os.Getenv("RAZORPAY_BASE_URL"),
-		Timeout:   cfg.Gateway.HTTPTimeout,
-	}))
-	registry.Register("payu", payu.New(payu.Config{
-		MerchantKey:  os.Getenv("PAYU_MERCHANT_KEY"),
-		MerchantSalt: os.Getenv("PAYU_MERCHANT_SALT"),
-		BaseURL:      os.Getenv("PAYU_BASE_URL"),
-		Timeout:      cfg.Gateway.HTTPTimeout,
-	}))
+	registry := bootstrap.GatewayRegistry(cfg)
 
 	router := approuting.NewRouter(configStore)
 
@@ -115,6 +112,9 @@ func run() error {
 		return fmt.Errorf("connect redis: %w", err)
 	}
 	defer redisClient.Close()
+	if err := bootstrap.Connect(ctx, logger, "redis", connectPolicy, redisClient.Ping); err != nil {
+		return err
+	}
 	rateLimiter := redis.NewRateLimiter(redisClient, cfg.RateLimit, logger, metrics)
 	defer rateLimiter.Close()
 	idempotencyRepo := postgres.NewIdempotencyRepository(db, queries)
@@ -140,8 +140,12 @@ func run() error {
 	if tokenProvider.HasAny() {
 		authProvider = tokenProvider
 		logger.Info("auth.enabled", nil)
+	} else if cfg.App.AllowNoAuth {
+		logger.Warn("auth.disabled_allow_no_auth", map[string]any{
+			"warning": "ALLOW_NO_AUTH=true: the API is serving unauthenticated requests",
+		})
 	} else {
-		logger.Warn("auth.disabled_no_tokens", nil)
+		return fmt.Errorf("no auth tokens configured: set SERVICE_TOKENS or OPS_TOKENS, or set ALLOW_NO_AUTH=true to explicitly run without authentication")
 	}
 
 	handler := api.NewRouter(api.Deps{
@@ -149,7 +153,10 @@ func run() error {
 		Refund:  handlers.NewRefundHandler(refundSvc),
 		Cancel:  handlers.NewCancelHandler(cancelSvc),
 		Webhook: handlers.NewWebhookHandler(webhookSvc, registry, webhookSecrets, configStore, logger),
-		Health:  handlers.NewHealthHandler(db),
+		Health: handlers.NewHealthHandler(
+			handlers.Check{Name: "database", Pinger: db},
+			handlers.Check{Name: "redis", Pinger: redisClient},
+		),
 		Logger:  logger,
 		Auth:    authProvider,
 		Limiter: limiterAdapter{rl: rateLimiter},
@@ -167,6 +174,11 @@ func run() error {
 
 	var tlsMgr *security.Manager
 	if cfg.Security.TLSCertFile != "" {
+		if !cfg.App.MtlsStrictMode {
+			logger.Warn("mtls.optional_mode", map[string]any{
+				"warning": "MTLS_STRICT_MODE=false: client certificates are requested but not enforced",
+			})
+		}
 		tlsMgr, err = security.NewManager(security.Config{
 			CertFile:        cfg.Security.TLSCertFile,
 			KeyFile:         cfg.Security.TLSKeyFile,
@@ -221,10 +233,12 @@ type circuitBreakerAdapter struct {
 	threshold int
 }
 
-type breakerStateAdapter struct { store *redis.CircuitBreakerStore }
-type limiterAdapter struct { rl *redis.RateLimiter }
+type breakerStateAdapter struct{ store *redis.CircuitBreakerStore }
+type limiterAdapter struct{ rl *redis.RateLimiter }
 
-func (a circuitBreakerAdapter) RecordSuccess(ctx context.Context, gatewayID string) error { return a.store.RecordSuccess(ctx, gatewayID) }
+func (a circuitBreakerAdapter) RecordSuccess(ctx context.Context, gatewayID string) error {
+	return a.store.RecordSuccess(ctx, gatewayID)
+}
 func (a circuitBreakerAdapter) RecordFailure(ctx context.Context, gatewayID string) error {
 	_, _, err := a.store.RecordFailure(ctx, gatewayID, a.threshold)
 	return err
@@ -287,19 +301,4 @@ func getEnvFloat(key string, def float64) float64 {
 		}
 	}
 	return def
-}
-
-func parseLogLevel(level string) slog.Level {
-	switch level {
-	case "error":
-		return slog.LevelError
-	case "warn":
-		return slog.LevelWarn
-	case "debug":
-		return slog.LevelDebug
-	case "trace":
-		return slog.Level(-8)
-	default:
-		return slog.LevelInfo
-	}
 }

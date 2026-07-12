@@ -3,23 +3,20 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"time"
 
 	"samarth/payment-service/config"
-	"samarth/payment-service/internal/adapters/gateways"
-	"samarth/payment-service/internal/adapters/gateways/payu"
-	"samarth/payment-service/internal/adapters/gateways/razorpay"
-	"samarth/payment-service/internal/adapters/gateways/stripe"
 	"samarth/payment-service/internal/adapters/observability"
 	"samarth/payment-service/internal/adapters/postgres"
 	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/app/payment"
 	"samarth/payment-service/internal/app/refund"
 	approuting "samarth/payment-service/internal/app/routing"
+	"samarth/payment-service/internal/bootstrap"
 	leaseexpiry "samarth/payment-service/internal/jobs/lease_expiry"
 	partitionmanager "samarth/payment-service/internal/jobs/partition_manager"
+	"samarth/payment-service/internal/ports"
 )
 
 func main() {
@@ -40,14 +37,37 @@ func run() error {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	logger := observability.NewSlogLogger(parseLogLevel(cfg.Observability.LogLevel))
+	logger := observability.NewSlogLogger(bootstrap.ParseLogLevel(cfg.Observability.LogLevel))
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
+	ctx := context.Background()
+	if cfg.Jobs.RunTimeoutMinutes > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(cfg.Jobs.RunTimeoutMinutes)*time.Minute)
+		defer cancel()
+	}
 
-	db, err := postgres.New(ctx, cfg.Database)
+	metrics, metricsClose, err := observability.NewMetrics(ctx, cfg)
 	if err != nil {
-		return fmt.Errorf("connect database: %w", err)
+		return fmt.Errorf("init metrics: %w", err)
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsClose(flushCtx)
+	}()
+
+	connectPolicy := bootstrap.RetryPolicy{
+		Attempts:       cfg.Startup.ConnectMaxAttempts,
+		AttemptTimeout: cfg.Startup.ConnectAttemptTimeout,
+		Backoff:        cfg.Startup.ConnectBackoff,
+	}
+
+	var db *postgres.DB
+	if err := bootstrap.Connect(ctx, logger, "postgres", connectPolicy, func(c context.Context) error {
+		db, err = postgres.New(c, cfg.Database)
+		return err
+	}); err != nil {
+		return err
 	}
 	defer db.Close()
 
@@ -61,7 +81,11 @@ func run() error {
 		mgr := partitionmanager.New(
 			postgres.NewPartitionStore(db, queries),
 			logger,
-			partitionmanager.Config{},
+			partitionmanager.Config{
+				WeeksAhead:     cfg.Jobs.PartitionWeeksAhead,
+				RetentionWeeks: cfg.Jobs.PartitionRetentionWeeks,
+				DropAfter:      time.Duration(cfg.Jobs.PartitionDropAfterDays) * 24 * time.Hour,
+			},
 		)
 		logger.Info("job.starting", map[string]any{"job": job})
 		if err := mgr.RunOnce(ctx); err != nil {
@@ -70,7 +94,7 @@ func run() error {
 		logger.Info("job.completed", map[string]any{"job": job})
 		return nil
 	case "lease_expiry":
-		reaper := buildReaper(cfg, db, queries, logger)
+		reaper := buildReaper(cfg, db, queries, logger, metrics)
 		logger.Info("job.starting", map[string]any{"job": job})
 		if err := reaper.RunOnce(ctx); err != nil {
 			return fmt.Errorf("lease_expiry: %w", err)
@@ -82,27 +106,8 @@ func run() error {
 	}
 }
 
-func buildReaper(cfg *config.Config, db *postgres.DB, queries *postgres.Queries, logger *observability.SlogLogger) *leaseexpiry.Reaper {
-	metrics := observability.NewNoopMetrics()
-
-	registry := gateways.NewRegistry()
-	registry.Register("stripe", stripe.New(stripe.Config{
-		APIKey:  os.Getenv("STRIPE_API_KEY"),
-		BaseURL: os.Getenv("STRIPE_BASE_URL"),
-		Timeout: cfg.Gateway.HTTPTimeout,
-	}))
-	registry.Register("razorpay", razorpay.New(razorpay.Config{
-		KeyID:     os.Getenv("RAZORPAY_KEY_ID"),
-		KeySecret: os.Getenv("RAZORPAY_KEY_SECRET"),
-		BaseURL:   os.Getenv("RAZORPAY_BASE_URL"),
-		Timeout:   cfg.Gateway.HTTPTimeout,
-	}))
-	registry.Register("payu", payu.New(payu.Config{
-		MerchantKey:  os.Getenv("PAYU_MERCHANT_KEY"),
-		MerchantSalt: os.Getenv("PAYU_MERCHANT_SALT"),
-		BaseURL:      os.Getenv("PAYU_BASE_URL"),
-		Timeout:      cfg.Gateway.HTTPTimeout,
-	}))
+func buildReaper(cfg *config.Config, db *postgres.DB, queries *postgres.Queries, logger *observability.SlogLogger, metrics ports.MetricRecorder) *leaseexpiry.Reaper {
+	registry := bootstrap.GatewayRegistry(cfg)
 
 	txnRepo := postgres.NewTransactionRepository(db, queries)
 	refundRepo := postgres.NewRefundRepository(db, queries)
@@ -133,19 +138,4 @@ func buildReaper(cfg *config.Config, db *postgres.DB, queries *postgres.Queries,
 	return leaseexpiry.New(txnRepo, paymentSvc, idempotencyRepo, logger, leaseexpiry.Config{
 		IdempotencyProcessingTimeout: time.Duration(cfg.Jobs.IdempotencyProcessingTimeoutSec) * time.Second,
 	})
-}
-
-func parseLogLevel(level string) slog.Level {
-	switch level {
-	case "error":
-		return slog.LevelError
-	case "warn":
-		return slog.LevelWarn
-	case "debug":
-		return slog.LevelDebug
-	case "trace":
-		return slog.Level(-8)
-	default:
-		return slog.LevelInfo
-	}
 }

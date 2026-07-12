@@ -8,9 +8,15 @@ import (
 type Pinger interface {
 	Ping(ctx context.Context) error
 }
-type HealthHandler struct{ db Pinger }
 
-func NewHealthHandler(db Pinger) *HealthHandler { return &HealthHandler{db: db} }
+type Check struct {
+	Name   string
+	Pinger Pinger
+}
+
+type HealthHandler struct{ checks []Check }
+
+func NewHealthHandler(checks ...Check) *HealthHandler { return &HealthHandler{checks: checks} }
 
 type healthResponse struct {
 	Status     string            `json:"status"`
@@ -21,11 +27,13 @@ func (h *HealthHandler) Health(w http.ResponseWriter, r *http.Request) {
 	components := map[string]string{}
 	healthy := true
 
-	if err := h.db.Ping(r.Context()); err != nil {
-		components["database"] = "unhealthy"
-		healthy = false
-	} else {
-		components["database"] = "healthy"
+	for _, c := range h.checks {
+		if err := c.Pinger.Ping(r.Context()); err != nil {
+			components[c.Name] = "unhealthy"
+			healthy = false
+		} else {
+			components[c.Name] = "healthy"
+		}
 	}
 
 	status := http.StatusOK
