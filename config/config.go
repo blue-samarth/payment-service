@@ -89,6 +89,12 @@ type AppConfig struct {
 	ServiceVersion string
 	Port           int
 	MtlsStrictMode bool
+	AllowNoAuth    bool
+}
+type StartupConfig struct {
+	ConnectMaxAttempts    int
+	ConnectAttemptTimeout time.Duration
+	ConnectBackoff        time.Duration
 }
 type DatabaseConfig struct {
 	PrimaryHost       string
@@ -180,6 +186,10 @@ type JobsConfig struct {
 	LeaseExpiryIntervalSec          int
 	FeeSnapshotIntervalHours        int
 	IdempotencyProcessingTimeoutSec int
+	RunTimeoutMinutes               int
+	PartitionWeeksAhead             int
+	PartitionRetentionWeeks         int
+	PartitionDropAfterDays          int
 }
 type DataRetentionConfig struct {
 	BatchSize      int
@@ -188,6 +198,7 @@ type DataRetentionConfig struct {
 }
 type Config struct {
 	App            AppConfig
+	Startup        StartupConfig
 	Database       DatabaseConfig
 	Redis          RedisConfig
 	SNS            SNSConfig
@@ -212,6 +223,11 @@ func LoadConfig() (*Config, error) {
 	c.App.ServiceVersion = getEnvDefault("SERVICE_VERSION", "unknown")
 	c.App.Port = getEnvInt("PORT", 8080, &errs)
 	c.App.MtlsStrictMode = getEnvBool("MTLS_STRICT_MODE", true, &errs)
+	c.App.AllowNoAuth = getEnvBool("ALLOW_NO_AUTH", false, &errs)
+
+	c.Startup.ConnectMaxAttempts = getEnvInt("STARTUP_CONNECT_MAX_ATTEMPTS", 5, &errs)
+	c.Startup.ConnectAttemptTimeout = getEnvDuration("STARTUP_CONNECT_ATTEMPT_TIMEOUT", 15*time.Second, &errs)
+	c.Startup.ConnectBackoff = getEnvDuration("STARTUP_CONNECT_BACKOFF", 2*time.Second, &errs)
 
 	c.Database.PrimaryHost = requireEnv("DATABASE_PRIMARY_HOST", &errs)
 	c.Database.ReplicaHost = getEnvDefault("DATABASE_REPLICA_HOST", "")
@@ -310,6 +326,10 @@ func LoadConfig() (*Config, error) {
 	c.Jobs.LeaseExpiryIntervalSec = getEnvInt("LEASE_EXPIRY_INTERVAL_SECONDS", 60, &errs)
 	c.Jobs.FeeSnapshotIntervalHours = getEnvInt("FEE_SNAPSHOT_INTERVAL_HOURS", 1, &errs)
 	c.Jobs.IdempotencyProcessingTimeoutSec = getEnvInt("LEASE_REAPER_IDEMPOTENCY_TIMEOUT_SEC", 300, &errs)
+	c.Jobs.RunTimeoutMinutes = getEnvInt("JOB_RUN_TIMEOUT_MINUTES", 10, &errs)
+	c.Jobs.PartitionWeeksAhead = getEnvInt("PARTITION_WEEKS_AHEAD", 2, &errs)
+	c.Jobs.PartitionRetentionWeeks = getEnvInt("PARTITION_RETENTION_WEEKS", 2, &errs)
+	c.Jobs.PartitionDropAfterDays = getEnvInt("PARTITION_DROP_AFTER_DAYS", 14, &errs)
 
 	c.DataRetention.BatchSize = getEnvInt("DATA_RETENTION_BATCH_SIZE", 1000, &errs)
 	c.DataRetention.BatchSleepMs = getEnvInt("DATA_RETENTION_BATCH_SLEEP_MS", 100, &errs)
