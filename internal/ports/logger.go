@@ -55,6 +55,8 @@ const (
 
 	LogEventTLSCertReloaded     = "tls.cert_reloaded"
 	LogEventTLSCertReloadFailed = "tls.cert_reload_failed"
+	LogEventTLSMTLSOptional     = "tls.mtls_optional"
+	LogEventTLSCertExpiring     = "tls.cert_expiring"
 
 	LogEventRateLimitRejected = "rate_limit.rejected"
 	LogEventRateLimitFallback = "rate_limit.fallback_activated"

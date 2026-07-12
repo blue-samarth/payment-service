@@ -63,6 +63,9 @@ const (
 	MetricConfigPushLatency    = "gateway_config_push_latency"
 	MetricConfigUpdateErrors   = "gateway_config_update_errors"
 	MetricConfigConsistencyLag = "gateway_config_consistency_lag"
+
+	MetricTLSCertReloadFailure = "tls_cert_reload_failure_total"
+	MetricTLSCertExpirySeconds = "tls_cert_expiry_seconds"
 )
 
 func StandardTags(env, version, gatewayID, paymentMethod, merchantID string) map[string]string {
