@@ -132,6 +132,10 @@ func run() error {
 	router.SetBreakerState(breakerStateAdapter{store: cbStore})
 	paymentSvc.SetMaxGatewayAttempts(cfg.Gateway.MaxAttempts)
 
+	intentStore := redis.NewIntentStore(redisClient)
+	router.SetActiveIntents(intentStore)
+	paymentSvc.SetIntentTracker(intentStore)
+
 	var authProvider middleware.TokenProvider
 	tokenProvider := middleware.NewStaticTokenProvider(
 		parseKeyValues(os.Getenv("SERVICE_TOKENS")),

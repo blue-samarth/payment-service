@@ -49,6 +49,10 @@ type CircuitBreaker interface {
 	RecordFailure(ctx context.Context, gatewayID string) error
 	RecordSuccess(ctx context.Context, gatewayID string) error
 }
+type IntentTracker interface {
+	EnterProcessing(ctx context.Context, gatewayID string, txnID uuid.UUID, ttl time.Duration) error
+	ExitProcessing(ctx context.Context, gatewayID string, txnID uuid.UUID) error
+}
 
 type RouteInput struct {
 	Amount          int64
@@ -59,13 +63,13 @@ type RouteInput struct {
 	ExcludeGateways []string
 }
 type CreatePaymentInput struct {
-	MerchantID    uuid.UUID
-	Amount        int64
-	Currency      string
-	PaymentMethod transaction.PaymentMethod
-	CustomerID    uuid.UUID
-	CustomerEmail string
-	Description   string
+	MerchantID     uuid.UUID
+	Amount         int64
+	Currency       string
+	PaymentMethod  transaction.PaymentMethod
+	CustomerID     uuid.UUID
+	CustomerEmail  string
+	Description    string
 	Metadata       map[string]any
 	MerchantTier   string
 	IsDomestic     bool
@@ -82,16 +86,18 @@ type Service struct {
 	gateways       GatewayRegistry
 	cancelResolver CancelResolver
 	breaker        CircuitBreaker
+	intents        IntentTracker
 	idem           *idempotency.Guard
 	maxAttempts    int
 	log            ports.Logger
 	metrics        ports.MetricRecorder
 }
 
-func (s *Service) SetCancelResolver(r CancelResolver)   { s.cancelResolver = r }
-func (s *Service) SetCircuitBreaker(b CircuitBreaker)   { s.breaker = b }
-func (s *Service) SetMaxGatewayAttempts(n int)          { s.maxAttempts = n }
-func (s *Service) SetIdempotency(g *idempotency.Guard)  { s.idem = g }
+func (s *Service) SetCancelResolver(r CancelResolver)  { s.cancelResolver = r }
+func (s *Service) SetCircuitBreaker(b CircuitBreaker)  { s.breaker = b }
+func (s *Service) SetIntentTracker(t IntentTracker)    { s.intents = t }
+func (s *Service) SetMaxGatewayAttempts(n int)         { s.maxAttempts = n }
+func (s *Service) SetIdempotency(g *idempotency.Guard) { s.idem = g }
 
 func NewService(
 	repo TransactionRepo,

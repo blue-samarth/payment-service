@@ -84,7 +84,7 @@ func (d *Decision) IsExpired() bool {
 func Score(c Candidate, ctx ScoringContext, w Weights) (int, Snapshot) {
 	volume := volumeScore(c.Volume7dPaise, ctx.Volume7dPaise)
 	cost := costScore(c.CalculatedFeePaise, c.MaxFeePaise)
-	reliability := reliabilityScore(c.DiscrepancyRate24h, c.CircuitBreakerState, c.LastKnownReliabilityScore)
+	reliability := reliabilityScore(c.DiscrepancyRate24h)
 	fx := fxEfficiencyScore(c.FXEfficiencyRatio, ctx.IsDomestic)
 	latency := latencyScore(c.P99LatencyMs, ctx.P99LatencySLAMs)
 
@@ -138,21 +138,31 @@ func Select(
 		results = append(results, scored{c, s, snap})
 	}
 
-	best := results[0]
+	maxScore := results[0].score
 	for _, r := range results[1:] {
-		if r.score > best.score {
+		if r.score > maxScore {
+			maxScore = r.score
+		}
+	}
+
+	best := results[0]
+	chosen := false
+	for _, r := range results {
+		if maxScore-r.score > 100 { // only tie-break within 1 point (scaled by 100) of the top score
+			continue
+		}
+		if !chosen {
+			best = r
+			chosen = true
+			continue
+		}
+		if r.candidate.ActivePaymentIntents < best.candidate.ActivePaymentIntents {
 			best = r
 			continue
 		}
-		if best.score-r.score <= 100 { // within 1 point (scaled by 100)
-			if r.candidate.ActivePaymentIntents < best.candidate.ActivePaymentIntents {
-				best = r
-				continue
-			}
-			if r.candidate.ActivePaymentIntents == best.candidate.ActivePaymentIntents &&
-				r.candidate.GatewayID < best.candidate.GatewayID {
-				best = r
-			}
+		if r.candidate.ActivePaymentIntents == best.candidate.ActivePaymentIntents &&
+			r.candidate.GatewayID < best.candidate.GatewayID {
+			best = r
 		}
 	}
 
@@ -229,10 +239,7 @@ func costScore(calculatedFee, maxFee int64) int {
 	return clamp(int(((maxFee-calculatedFee)*100)/maxFee), 0, 100)
 }
 
-func reliabilityScore(discrepancyRate24h float64, circuitBreakerState string, lastKnown int) int {
-	if circuitBreakerState == "OPEN" {
-		return clamp(lastKnown, 0, 100)
-	}
+func reliabilityScore(discrepancyRate24h float64) int {
 	if discrepancyRate24h > 0.20 {
 		return 0
 	}

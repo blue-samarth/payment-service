@@ -215,6 +215,53 @@ func TestRouter_BreakerReaderErrorFailsOpen(t *testing.T) {
 	}
 }
 
+type fakeIntents struct {
+	counts map[string]int
+	err    error
+}
+
+func (f fakeIntents) ActiveIntents(_ context.Context, gatewayIDs []string) (map[string]int, error) {
+	return f.counts, f.err
+}
+
+func TestRouter_ActiveIntentsTieBreakToLowerLoad(t *testing.T) {
+	// Two identical-score gateways: the lexicographic tie-break would pick
+	// "alpha", but the live in-flight load makes "beta" the lighter choice.
+	cfg := &fakeConfig{
+		gateways: []*ports.GatewayConfig{gatewayConfig("alpha", 0), gatewayConfig("beta", 0)},
+		weights:  equalWeights(),
+	}
+	r := NewRouter(cfg)
+	r.SetActiveIntents(fakeIntents{counts: map[string]int{"alpha": 10, "beta": 2}})
+
+	decision, err := r.Route(context.Background(), validInput())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if decision.SelectedGateway != "beta" {
+		t.Errorf("expected lower-load beta to win the tie, got %s", decision.SelectedGateway)
+	}
+}
+
+func TestRouter_ActiveIntentsReaderErrorFailsOpen(t *testing.T) {
+	// An intents-store outage must not take routing down; the load signal is
+	// simply skipped and the tie falls back to lexicographic order.
+	cfg := &fakeConfig{
+		gateways: []*ports.GatewayConfig{gatewayConfig("alpha", 0), gatewayConfig("beta", 0)},
+		weights:  equalWeights(),
+	}
+	r := NewRouter(cfg)
+	r.SetActiveIntents(fakeIntents{err: errors.New("redis down")})
+
+	decision, err := r.Route(context.Background(), validInput())
+	if err != nil {
+		t.Fatalf("intents reader error should not fail routing, got %v", err)
+	}
+	if decision.SelectedGateway != "alpha" {
+		t.Errorf("expected lexicographic fallback to alpha, got %s", decision.SelectedGateway)
+	}
+}
+
 type stateByGateway struct {
 	open map[string]bool
 }

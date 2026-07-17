@@ -23,10 +23,14 @@ type ConfigSource interface {
 type BreakerStateReader interface {
 	BreakerState(ctx context.Context, gatewayID string) (state string, cooldownUntil time.Time, err error)
 }
+type ActiveIntentsReader interface {
+	ActiveIntents(ctx context.Context, gatewayIDs []string) (map[string]int, error)
+}
 
 type Router struct {
 	config            ConfigSource
 	breaker           BreakerStateReader
+	intents           ActiveIntentsReader
 	snapshotTTLSecond int
 	p99SLAMs          int
 }
@@ -39,7 +43,8 @@ func NewRouter(config ConfigSource) *Router {
 	}
 }
 
-func (r *Router) SetBreakerState(b BreakerStateReader) { r.breaker = b }
+func (r *Router) SetBreakerState(b BreakerStateReader)   { r.breaker = b }
+func (r *Router) SetActiveIntents(a ActiveIntentsReader) { r.intents = a }
 
 func (r *Router) Route(ctx context.Context, in payment.RouteInput) (*domainrouting.Decision, error) {
 	method := string(in.PaymentMethod)
@@ -100,6 +105,8 @@ func (r *Router) Route(ctx context.Context, in payment.RouteInput) (*domainrouti
 		candidates[i].MaxFeePaise = maxFee
 	}
 
+	r.applyActiveIntents(ctx, candidates)
+
 	scoringCtx := domainrouting.ScoringContext{
 		AmountPaise:     in.Amount,
 		Currency:        in.Currency,
@@ -113,6 +120,23 @@ func (r *Router) Route(ctx context.Context, in payment.RouteInput) (*domainrouti
 		return nil, err
 	}
 	return decision, nil
+}
+
+func (r *Router) applyActiveIntents(ctx context.Context, candidates []domainrouting.Candidate) {
+	if r.intents == nil || len(candidates) == 0 {
+		return
+	}
+	ids := make([]string, len(candidates))
+	for i := range candidates {
+		ids[i] = candidates[i].GatewayID
+	}
+	counts, err := r.intents.ActiveIntents(ctx, ids)
+	if err != nil {
+		return
+	}
+	for i := range candidates {
+		candidates[i].ActivePaymentIntents = counts[candidates[i].GatewayID]
+	}
 }
 
 func (r *Router) liveBreakerState(ctx context.Context, gatewayID string, fallback ports.CircuitBreakerState) (string, time.Time) {
