@@ -11,6 +11,7 @@ import (
 	"samarth/payment-service/config"
 	"samarth/payment-service/internal/adapters/observability"
 	"samarth/payment-service/internal/adapters/postgres"
+	"samarth/payment-service/internal/adapters/sns"
 	"samarth/payment-service/internal/bootstrap"
 	"samarth/payment-service/internal/relay"
 	"samarth/payment-service/internal/relay/publisher"
@@ -66,7 +67,11 @@ func run() error {
 
 	outboxWriter := postgres.NewOutboxWriter(db, queries)
 	outboxWriter.SetClaimTTL(time.Duration(cfg.Outbox.ClaimTTLSec) * time.Second)
-	pub := publisher.NewLogPublisher(logger)
+
+	pub, err := buildPublisher(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
 
 	worker := relay.NewWorker(outboxWriter, pub, logger, metrics, relay.Config{
 		ShardMin:     0,
@@ -81,4 +86,19 @@ func run() error {
 	}
 	logger.Info("relay.stopped", nil)
 	return nil
+}
+
+func buildPublisher(ctx context.Context, cfg *config.Config, logger *observability.SlogLogger) (relay.Publisher, error) {
+	switch cfg.Outbox.Publisher {
+	case "sns":
+		pub, err := sns.NewPublisherFromConfig(ctx, cfg.AWS.Region, cfg.SNS.PaymentEventsTopic, logger)
+		if err != nil {
+			return nil, fmt.Errorf("build sns publisher: %w", err)
+		}
+		logger.Info("relay.publisher_selected", map[string]any{"publisher": "sns", "topic": cfg.SNS.PaymentEventsTopic})
+		return pub, nil
+	default:
+		logger.Info("relay.publisher_selected", map[string]any{"publisher": "log"})
+		return publisher.NewLogPublisher(logger), nil
+	}
 }

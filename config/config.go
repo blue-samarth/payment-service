@@ -125,6 +125,7 @@ type SNSConfig struct {
 	GatewayConfigUpdatesTopic string
 	DeadLetterTopic           string
 	ReconciliationJobsTopic   string
+	PaymentEventsTopic        string
 	PublishMaxRetries         int
 }
 type AWSConfig struct {
@@ -143,6 +144,7 @@ type OutboxConfig struct {
 	MaxAttempts                 int
 	BatchSize                   int
 	ClaimTTLSec                 int
+	Publisher                   string
 }
 type RateLimitConfig struct {
 	FallbackMultiplier  float64
@@ -271,6 +273,7 @@ func LoadConfig() (*Config, error) {
 	c.SNS.GatewayConfigUpdatesTopic = requireEnv("SNS_GATEWAY_CONFIG_UPDATES_TOPIC", &errs)
 	c.SNS.DeadLetterTopic = requireEnv("SNS_DEAD_LETTER_TOPIC", &errs)
 	c.SNS.ReconciliationJobsTopic = requireEnv("SNS_RECONCILIATION_JOBS_TOPIC", &errs)
+	c.SNS.PaymentEventsTopic = getEnvDefault("SNS_PAYMENT_EVENTS_TOPIC", "")
 	c.SNS.PublishMaxRetries = getEnvInt("SNS_PUBLISH_MAX_RETRIES", 3, &errs)
 
 	c.AWS.Region = requireEnv("AWS_REGION", &errs)
@@ -290,6 +293,7 @@ func LoadConfig() (*Config, error) {
 	c.Outbox.MaxAttempts = getEnvInt("OUTBOX_RELAY_MAX_ATTEMPTS", 5, &errs)
 	c.Outbox.BatchSize = getEnvInt("OUTBOX_RELAY_BATCH_SIZE", 50, &errs)
 	c.Outbox.ClaimTTLSec = getEnvInt("OUTBOX_RELAY_CLAIM_TTL_SEC", 60, &errs)
+	c.Outbox.Publisher = getEnvDefault("OUTBOX_PUBLISHER", "log")
 
 	c.RateLimit.FallbackMultiplier = getEnvFloat64("RATE_LIMIT_FALLBACK_MULTIPLIER", 0.5, &errs)
 	c.RateLimit.LocalMaxBuckets = getEnvInt("RATE_LIMIT_LOCAL_MAX_BUCKETS", 10000, &errs)
@@ -372,6 +376,15 @@ func Validate(c *Config) error {
 
 	if c.Outbox.ClaimTTLSec <= c.Outbox.PollIntervalSec {
 		errs = append(errs, "OUTBOX_RELAY_CLAIM_TTL_SEC must be > OUTBOX_RELAY_POLL_INTERVAL_SEC (and must exceed max publish duration)")
+	}
+
+	switch c.Outbox.Publisher {
+	case "", "log", "sns":
+	default:
+		errs = append(errs, "OUTBOX_PUBLISHER must be 'log' or 'sns'")
+	}
+	if c.Outbox.Publisher == "sns" && c.SNS.PaymentEventsTopic == "" {
+		errs = append(errs, "SNS_PAYMENT_EVENTS_TOPIC is required when OUTBOX_PUBLISHER=sns")
 	}
 
 	if c.Gateway.MaxAttempts > 0 && c.Gateway.HTTPTimeout > 0 {

@@ -30,6 +30,31 @@ func TestValidate_BaselineIsValid(t *testing.T) {
 	}
 }
 
+func TestValidate_SNSPublisherRequiresTopic(t *testing.T) {
+	c := validatableConfig()
+
+	// Selecting the sns publisher without a domain-events topic must fail closed
+	// rather than boot a relay that can't deliver anything.
+	c.Outbox.Publisher = "sns"
+	err := Validate(c)
+	if err == nil || !strings.Contains(err.Error(), "SNS_PAYMENT_EVENTS_TOPIC") {
+		t.Fatalf("expected missing-topic error for sns publisher, got: %v", err)
+	}
+
+	c.SNS.PaymentEventsTopic = "arn:aws:sns:us-east-1:123:payment-events"
+	if err := Validate(c); err != nil {
+		t.Fatalf("sns publisher with a topic should validate, got: %v", err)
+	}
+}
+
+func TestValidate_RejectsUnknownPublisher(t *testing.T) {
+	c := validatableConfig()
+	c.Outbox.Publisher = "kafka"
+	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "OUTBOX_PUBLISHER") {
+		t.Fatalf("expected unknown-publisher error, got: %v", err)
+	}
+}
+
 func TestValidate_IdempotencyTimeoutMustExceedGatewayBudget(t *testing.T) {
 	c := validatableConfig() // budget = 3 * 30s = 90s
 
