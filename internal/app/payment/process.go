@@ -76,6 +76,8 @@ func (s *Service) ProcessPayment(ctx context.Context, transactionID uuid.UUID) (
 		return s.repo.GetByID(ctx, txn.ID)
 	}
 
+	s.enterIntent(ctx, txn.GatewayID, txn.ID, timeout)
+
 	resp, result := s.attemptGateways(ctx, adapter, txn)
 	return s.finalize(ctx, txn, resp, result)
 }
@@ -193,6 +195,9 @@ func (s *Service) finalize(ctx context.Context, txn *transaction.Transaction, re
 	}
 
 	s.recordOutcome(txn, result)
+	if result.terminal {
+		s.exitIntent(ctx, txn.GatewayID, txn.ID)
+	}
 	s.resolveCancelIfRequested(ctx, txn, result)
 	return txn, nil
 }
@@ -252,8 +257,13 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 			"to_gateway":   next,
 		})
 
+		prevGateway := txn.GatewayID
 		txn.GatewayID = next
 		adapter = nextAdapter
+		if txn.ProcessingTimeout != nil {
+			s.exitIntent(ctx, prevGateway, txn.ID)
+			s.enterIntent(ctx, next, txn.ID, *txn.ProcessingTimeout)
+		}
 	}
 }
 
@@ -313,6 +323,34 @@ func (s *Service) recordBreaker(ctx context.Context, gatewayID string, gwErr *po
 		s.log.Warn(ports.LogEventGatewayCircuitOpen, map[string]any{
 			ports.FieldGatewayID: gatewayID,
 			"error":              err.Error(),
+		})
+	}
+}
+
+func (s *Service) enterIntent(ctx context.Context, gatewayID string, txnID uuid.UUID, ttl time.Duration) {
+	if s.intents == nil {
+		return
+	}
+	if err := s.intents.EnterProcessing(ctx, gatewayID, txnID, ttl); err != nil {
+		s.log.Warn(ports.LogEventGatewayResponse, map[string]any{
+			ports.FieldTransactionID: txnID.String(),
+			ports.FieldGatewayID:     gatewayID,
+			"error":                  err.Error(),
+			"stage":                  "intent_enter",
+		})
+	}
+}
+
+func (s *Service) exitIntent(ctx context.Context, gatewayID string, txnID uuid.UUID) {
+	if s.intents == nil {
+		return
+	}
+	if err := s.intents.ExitProcessing(ctx, gatewayID, txnID); err != nil {
+		s.log.Warn(ports.LogEventGatewayResponse, map[string]any{
+			ports.FieldTransactionID: txnID.String(),
+			ports.FieldGatewayID:     gatewayID,
+			"error":                  err.Error(),
+			"stage":                  "intent_exit",
 		})
 	}
 }
