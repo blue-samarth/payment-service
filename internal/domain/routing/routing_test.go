@@ -134,6 +134,35 @@ func TestSelect_TieBreakLowerActiveIntents(t *testing.T) {
 	}
 }
 
+func TestSelect_TieBreakDoesNotWalkBelowGlobalMax(t *testing.T) {
+	// Descending scores with descending load. Each consecutive gap is <= 100
+	// (80), but the cumulative drop from top to bottom is 160. The tie-break
+	// must only trade load for score within 100 of the global max, so gamma
+	// (160 below max) must never be selected even though it has the lowest load.
+	alpha := baseCandidate("alpha") // p99 100 -> composite 7580, highest load
+	alpha.P99LatencyMs = 100
+	alpha.ActivePaymentIntents = 30
+
+	beta := baseCandidate("beta") // p99 120 -> composite 7500 (80 below max)
+	beta.P99LatencyMs = 120
+	beta.ActivePaymentIntents = 20
+
+	gamma := baseCandidate("gamma") // p99 140 -> composite 7420 (160 below max)
+	gamma.P99LatencyMs = 140
+	gamma.ActivePaymentIntents = 10
+
+	decision, _, err := Select([]Candidate{alpha, beta, gamma}, baseContext(), equalWeights(), 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.SelectedGateway == "gamma" {
+		t.Fatalf("selected gamma, which is 160 below the top score; tie-break walked below the global max")
+	}
+	if decision.SelectedGateway != "beta" {
+		t.Errorf("expected beta (lowest load within 100 of the top score), got %s", decision.SelectedGateway)
+	}
+}
+
 func TestSelect_TieBreakLexicographic(t *testing.T) {
 	zzz := baseCandidate("zzz")
 	aaa := baseCandidate("aaa")
