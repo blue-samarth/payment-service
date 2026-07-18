@@ -23,7 +23,7 @@ type fakeOutbox struct {
 	marks   markRecord
 }
 
-func (f *fakeOutbox) PollPending(ctx context.Context, shardMin, shardMax, batchSize int) ([]ports.PendingEvent, error) {
+func (f *fakeOutbox) PollPending(ctx context.Context, shards []int, batchSize int) ([]ports.PendingEvent, error) {
 	f.polls++
 	if f.polls > 1 {
 		return nil, nil
@@ -82,7 +82,7 @@ func newWorker(outbox OutboxReader, pub Publisher, cfg Config) *Worker {
 func TestRunOnce_PublishesAndMarks(t *testing.T) {
 	outbox := &fakeOutbox{pending: []ports.PendingEvent{event(0), event(0)}}
 	pub := &fakePublisher{}
-	w := newWorker(outbox, pub, Config{ShardMin: 0, ShardMax: 63, BatchSize: 50, MaxAttempts: 5})
+	w := newWorker(outbox, pub, Config{Shards: allShards(), BatchSize: 50, MaxAttempts: 5})
 
 	n, published, err := w.RunOnce(context.Background())
 	if err != nil {
@@ -143,7 +143,15 @@ func TestRunOnce_PollError(t *testing.T) {
 
 type errOutbox struct{ fakeOutbox }
 
-func (errOutbox) PollPending(ctx context.Context, a, b, c int) ([]ports.PendingEvent, error) {
+func allShards() []int {
+	s := make([]int, 64)
+	for i := range s {
+		s[i] = i
+	}
+	return s
+}
+
+func (errOutbox) PollPending(ctx context.Context, shards []int, batchSize int) ([]ports.PendingEvent, error) {
 	return nil, errors.New("db down")
 }
 
@@ -166,7 +174,7 @@ type alwaysFullOutbox struct {
 	nPolls int
 }
 
-func (f *alwaysFullOutbox) PollPending(ctx context.Context, a, b, c int) ([]ports.PendingEvent, error) {
+func (f *alwaysFullOutbox) PollPending(ctx context.Context, shards []int, batchSize int) ([]ports.PendingEvent, error) {
 	f.nPolls++
 	out := make([]ports.PendingEvent, f.batch)
 	for i := range out {

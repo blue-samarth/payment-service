@@ -15,6 +15,7 @@ import (
 	"samarth/payment-service/internal/bootstrap"
 	"samarth/payment-service/internal/relay"
 	"samarth/payment-service/internal/relay/publisher"
+	"samarth/payment-service/internal/relay/ring"
 )
 
 func main() {
@@ -73,9 +74,22 @@ func run() error {
 		return err
 	}
 
+	shards := ring.OwnedShards(cfg.Outbox.WorkerIndex, cfg.Outbox.WorkerCount, cfg.Outbox.ShardCount)
+	logger.Info("relay.shards_assigned", map[string]any{
+		"worker_index": cfg.Outbox.WorkerIndex,
+		"worker_count": cfg.Outbox.WorkerCount,
+		"shard_count":  len(shards),
+	})
+	if len(shards) == 0 {
+		logger.Warn("relay.no_shards", map[string]any{
+			"worker_index": cfg.Outbox.WorkerIndex,
+			"worker_count": cfg.Outbox.WorkerCount,
+			"warning":      "this worker owns no shards (more workers than shards); it will publish nothing",
+		})
+	}
+
 	worker := relay.NewWorker(outboxWriter, pub, logger, metrics, relay.Config{
-		ShardMin:     0,
-		ShardMax:     cfg.Outbox.ShardCount - 1,
+		Shards:       shards,
 		BatchSize:    cfg.Outbox.BatchSize,
 		MaxAttempts:  cfg.Outbox.MaxAttempts,
 		PollInterval: time.Duration(cfg.Outbox.PollIntervalSec) * time.Second,

@@ -16,6 +16,7 @@ func validatableConfig() *Config {
 	c.Outbox.WALLagCriticalThresholdMB = 5000
 	c.Outbox.PollIntervalSec = 10
 	c.Outbox.ClaimTTLSec = 60
+	c.Outbox.WorkerCount = 1
 	c.RateLimit.FallbackMultiplier = 0.5
 	c.Routing.FXReconciliationTolerancePct = 1.0
 	c.Gateway.HTTPTimeout = 30 * time.Second

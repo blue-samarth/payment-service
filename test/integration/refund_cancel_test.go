@@ -153,7 +153,7 @@ func TestRefund_FullFlowEndToEnd(t *testing.T) {
 	}
 
 	var refundEvents int
-	events, perr := postgres.NewOutboxWriter(pg.DB, pg.Q).PollPending(ctx, 0, 63, 10)
+	events, perr := postgres.NewOutboxWriter(pg.DB, pg.Q).PollPending(ctx, testsupport.AllShards(), 10)
 	if perr != nil {
 		t.Fatalf("poll outbox: %v", perr)
 	}

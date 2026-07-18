@@ -143,10 +143,18 @@ func (w *OutboxWriter) MarkExhausted(ctx context.Context, id uuid.UUID, createdA
 // caller publishes, a second poller no longer sees the same rows — the previous
 // FOR UPDATE SKIP LOCKED SELECT released its lock at commit, before publishing,
 // so two workers could fetch and publish the same event.
-func (w *OutboxWriter) PollPending(ctx context.Context, shardMin, shardMax, batchSize int) ([]ports.PendingEvent, error) {
+func (w *OutboxWriter) PollPending(ctx context.Context, shards []int, batchSize int) ([]ports.PendingEvent, error) {
 	claimTTLSec := int64(w.claimTTL.Seconds())
 
-	rows, err := w.db.pool.Query(ctx, w.q.OutboxPollPending, shardMin, shardMax, batchSize, claimTTLSec)
+	if len(shards) == 0 {
+		return nil, nil
+	}
+	shardArg := make([]int32, len(shards))
+	for i, s := range shards {
+		shardArg[i] = int32(s)
+	}
+
+	rows, err := w.db.pool.Query(ctx, w.q.OutboxPollPending, shardArg, batchSize, claimTTLSec)
 	if err != nil {
 		return nil, fmt.Errorf("outbox: poll pending: %w", err)
 	}

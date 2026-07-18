@@ -141,3 +141,13 @@ func getEnv(key, def string) string {
 	}
 	return def
 }
+
+// AllShards returns the full shard range [0, 64) for tests that poll the whole
+// outbox without partitioning across relay workers.
+func AllShards() []int {
+	shards := make([]int, 64)
+	for i := range shards {
+		shards[i] = i
+	}
+	return shards
+}

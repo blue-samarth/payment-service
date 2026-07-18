@@ -12,7 +12,7 @@ type OutboxWriter interface {
 	MarkPublished(ctx context.Context, id uuid.UUID, createdAt time.Time) error
 	MarkFailed(ctx context.Context, id uuid.UUID, createdAt time.Time, lastErr string, nextAttempt time.Time) error
 	MarkExhausted(ctx context.Context, id uuid.UUID, createdAt time.Time, lastErr string) error
-	PollPending(ctx context.Context, shardMin, shardMax, batchSize int) ([]PendingEvent, error)
+	PollPending(ctx context.Context, shards []int, batchSize int) ([]PendingEvent, error)
 	ReplayDeadLetter(ctx context.Context, deadLetterID uuid.UUID, actor, reason string) (uuid.UUID, error)
 }
 

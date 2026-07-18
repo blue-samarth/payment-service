@@ -146,6 +146,8 @@ type OutboxConfig struct {
 	ClaimTTLSec                 int
 	Publisher                   string
 	SNSAggregateVersionAttr     bool
+	WorkerIndex                 int
+	WorkerCount                 int
 }
 type RateLimitConfig struct {
 	FallbackMultiplier  float64
@@ -296,6 +298,8 @@ func LoadConfig() (*Config, error) {
 	c.Outbox.ClaimTTLSec = getEnvInt("OUTBOX_RELAY_CLAIM_TTL_SEC", 60, &errs)
 	c.Outbox.Publisher = getEnvDefault("OUTBOX_PUBLISHER", "log")
 	c.Outbox.SNSAggregateVersionAttr = getEnvBool("OUTBOX_SNS_AGGREGATE_VERSION_ATTRIBUTE", false, &errs)
+	c.Outbox.WorkerIndex = getEnvInt("RELAY_WORKER_INDEX", 0, &errs)
+	c.Outbox.WorkerCount = getEnvInt("RELAY_WORKER_COUNT", 1, &errs)
 
 	c.RateLimit.FallbackMultiplier = getEnvFloat64("RATE_LIMIT_FALLBACK_MULTIPLIER", 0.5, &errs)
 	c.RateLimit.LocalMaxBuckets = getEnvInt("RATE_LIMIT_LOCAL_MAX_BUCKETS", 10000, &errs)
@@ -387,6 +391,13 @@ func Validate(c *Config) error {
 	}
 	if c.Outbox.Publisher == "sns" && c.SNS.PaymentEventsTopic == "" {
 		errs = append(errs, "SNS_PAYMENT_EVENTS_TOPIC is required when OUTBOX_PUBLISHER=sns")
+	}
+
+	if c.Outbox.WorkerCount < 1 {
+		errs = append(errs, "RELAY_WORKER_COUNT must be >= 1")
+	}
+	if c.Outbox.WorkerIndex < 0 || c.Outbox.WorkerIndex >= c.Outbox.WorkerCount {
+		errs = append(errs, "RELAY_WORKER_INDEX must be in [0, RELAY_WORKER_COUNT)")
 	}
 
 	if c.Gateway.MaxAttempts > 0 && c.Gateway.HTTPTimeout > 0 {

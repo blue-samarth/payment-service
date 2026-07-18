@@ -38,15 +38,15 @@ SET status = 'PUBLISHING', locked_at = NOW()
 FROM (
     SELECT id, created_at
     FROM outbox_events
-    WHERE shard_index BETWEEN $1 AND $2
+    WHERE shard_index = ANY($1::int[])
       AND next_attempt_at <= NOW()
       AND (
             status = 'PENDING'
-         OR (status = 'PUBLISHING' AND locked_at < NOW() - make_interval(secs => $4))
+         OR (status = 'PUBLISHING' AND locked_at < NOW() - make_interval(secs => $3))
       )
     ORDER BY attempts ASC, created_at ASC
     FOR UPDATE SKIP LOCKED
-    LIMIT $3
+    LIMIT $2
 ) AS claimed
 WHERE o.id = claimed.id AND o.created_at = claimed.created_at
 RETURNING o.id, o.aggregate_id, o.aggregate_type, o.event_type,
