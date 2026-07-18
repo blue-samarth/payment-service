@@ -56,10 +56,11 @@ func NewService(txns TransactionRepo, webhooks WebhookRepo, outbox EventWriter, 
 }
 
 type webhookEventPayload struct {
-	TransactionID string `json:"transaction_id"`
-	Status        string `json:"status"`
-	Gateway       string `json:"gateway"`
-	Source        string `json:"source"`
+	TransactionID    string `json:"transaction_id"`
+	Status           string `json:"status"`
+	Gateway          string `json:"gateway"`
+	Source           string `json:"source"`
+	AggregateVersion int    `json:"aggregate_version"`
 }
 
 func (s *Service) Process(ctx context.Context, gatewayID string, ev Event, rawPayload []byte) (Outcome, error) {
@@ -140,20 +141,22 @@ func (s *Service) buildEvent(txn *transaction.Transaction, status transaction.St
 		eventType = ports.EventTypePaymentSucceeded
 	}
 	payload, err := json.Marshal(webhookEventPayload{
-		TransactionID: txn.ID.String(),
-		Status:        string(status),
-		Gateway:       gatewayID,
-		Source:        "webhook",
+		TransactionID:    txn.ID.String(),
+		Status:           string(status),
+		Gateway:          gatewayID,
+		Source:           "webhook",
+		AggregateVersion: txn.Version,
 	})
 	if err != nil {
 		return ports.OutboxEvent{}, fmt.Errorf("marshal webhook event: %w", err)
 	}
 	return ports.OutboxEvent{
-		AggregateID:   txn.ID,
-		AggregateType: "transaction",
-		EventType:     eventType,
-		Payload:       payload,
-		EventVersion:  1,
+		AggregateID:      txn.ID,
+		AggregateType:    "transaction",
+		EventType:        eventType,
+		Payload:          payload,
+		EventVersion:     1,
+		AggregateVersion: txn.Version,
 	}, nil
 }
 

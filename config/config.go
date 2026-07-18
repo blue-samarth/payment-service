@@ -145,6 +145,7 @@ type OutboxConfig struct {
 	BatchSize                   int
 	ClaimTTLSec                 int
 	Publisher                   string
+	SNSAggregateVersionAttr     bool
 }
 type RateLimitConfig struct {
 	FallbackMultiplier  float64
@@ -294,6 +295,7 @@ func LoadConfig() (*Config, error) {
 	c.Outbox.BatchSize = getEnvInt("OUTBOX_RELAY_BATCH_SIZE", 50, &errs)
 	c.Outbox.ClaimTTLSec = getEnvInt("OUTBOX_RELAY_CLAIM_TTL_SEC", 60, &errs)
 	c.Outbox.Publisher = getEnvDefault("OUTBOX_PUBLISHER", "log")
+	c.Outbox.SNSAggregateVersionAttr = getEnvBool("OUTBOX_SNS_AGGREGATE_VERSION_ATTRIBUTE", false, &errs)
 
 	c.RateLimit.FallbackMultiplier = getEnvFloat64("RATE_LIMIT_FALLBACK_MULTIPLIER", 0.5, &errs)
 	c.RateLimit.LocalMaxBuckets = getEnvInt("RATE_LIMIT_LOCAL_MAX_BUCKETS", 10000, &errs)

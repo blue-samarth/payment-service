@@ -20,6 +20,7 @@ type paymentTerminalPayload struct {
 	Gateway            string `json:"gateway"`
 	GatewayReferenceID string `json:"gateway_reference_id"`
 	Amount             int64  `json:"amount"`
+	AggregateVersion   int    `json:"aggregate_version"`
 }
 
 type cachedResponse struct {
@@ -160,14 +161,6 @@ func (s *Service) finalize(ctx context.Context, txn *transaction.Transaction, re
 		return nil, fmt.Errorf("payment: marshal cached response: %w", err)
 	}
 
-	var event *ports.OutboxEvent
-	if result.terminal {
-		event, err = s.buildTerminalEvent(txn, result.newStatus)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	err = s.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if result.terminal {
 			if err := transaction.TransitionState(txn, result.newStatus, transaction.ActorGateway); err != nil {
@@ -178,7 +171,11 @@ func (s *Service) finalize(ctx context.Context, txn *transaction.Transaction, re
 		if err := s.repo.UpdateStatus(ctx, txn); err != nil {
 			return err
 		}
-		if event != nil {
+		if result.terminal {
+			event, err := s.buildTerminalEvent(txn, result.newStatus)
+			if err != nil {
+				return err
+			}
 			if err := s.outbox.Write(ctx, *event); err != nil {
 				return err
 			}
@@ -452,17 +449,19 @@ func (s *Service) buildTerminalEvent(txn *transaction.Transaction, status transa
 		Gateway:            txn.ActualGateway,
 		GatewayReferenceID: txn.GatewayReferenceID,
 		Amount:             txn.Amount,
+		AggregateVersion:   txn.Version,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("payment: marshal terminal event: %w", err)
 	}
 
 	return &ports.OutboxEvent{
-		AggregateID:   txn.ID,
-		AggregateType: "transaction",
-		EventType:     eventType,
-		Payload:       payload,
-		EventVersion:  1,
+		AggregateID:      txn.ID,
+		AggregateType:    "transaction",
+		EventType:        eventType,
+		Payload:          payload,
+		EventVersion:     1,
+		AggregateVersion: txn.Version,
 	}, nil
 }
 

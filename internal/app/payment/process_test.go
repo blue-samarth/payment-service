@@ -2,6 +2,7 @@ package payment
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -185,6 +186,45 @@ func TestProcessPayment_GatewaySucceeded(t *testing.T) {
 	}
 	if lease.written == nil {
 		t.Error("expected cached response written to lease")
+	}
+}
+
+func TestProcessPayment_TerminalEventCarriesPostTransitionVersion(t *testing.T) {
+	txn := pendingTxn() // version 1
+	repo := seedRepo(txn)
+	lease := &fakeLease{acquired: true}
+	reg := &fakeRegistry{adapter: &fakeAdapter{resp: &ports.GatewayPaymentResponse{
+		GatewayReferenceID: "pi_1",
+		Status:             ports.GatewayPaymentStatusSucceeded,
+	}}}
+	outbox := &fakeOutbox{}
+	svc := NewService(repo, outbox, &fakeRouter{}, &fakeConfig{}, &fakeTransactor{}, lease, reg, noopLogger{}, noopMetrics{})
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(outbox.events) != 1 {
+		t.Fatalf("expected one terminal event, got %d", len(outbox.events))
+	}
+
+	var p paymentTerminalPayload
+	if err := json.Unmarshal(outbox.events[0].Payload, &p); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	// The event must carry the version AFTER the terminal transition committed
+	// (PENDING->PROCESSING->SUCCEEDED bumps 1->2->3). Built before the bump it
+	// would read the stale PROCESSING version and consumers couldn't order it.
+	if p.AggregateVersion != got.Version {
+		t.Errorf("payload aggregate_version = %d, want post-transition version %d", p.AggregateVersion, got.Version)
+	}
+	if p.AggregateVersion <= 1 {
+		t.Errorf("aggregate_version %d should reflect the terminal transition, not creation", p.AggregateVersion)
+	}
+	// The envelope carries it too, so it lands in the outbox column and (opt-in)
+	// the SNS attribute — not just the JSON body.
+	if outbox.events[0].AggregateVersion != got.Version {
+		t.Errorf("envelope AggregateVersion = %d, want %d", outbox.events[0].AggregateVersion, got.Version)
 	}
 }
 

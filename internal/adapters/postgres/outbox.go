@@ -76,7 +76,7 @@ func (w *OutboxWriter) Write(ctx context.Context, event ports.OutboxEvent) error
 
 	_, err = tx.Exec(ctx, w.q.OutboxInsert,
 		id, event.AggregateID, event.AggregateType, event.EventType,
-		string(event.Payload), version, nextAttempt,
+		string(event.Payload), version, event.AggregateVersion, nextAttempt,
 	)
 	if err != nil {
 		return fmt.Errorf("outbox: write event %s: %w", event.EventType, err)
@@ -109,16 +109,17 @@ func (w *OutboxWriter) MarkFailed(ctx context.Context, id uuid.UUID, createdAt t
 func (w *OutboxWriter) MarkExhausted(ctx context.Context, id uuid.UUID, createdAt time.Time, lastErr string) error {
 	return withTx(ctx, w.db.pool, func(tx pgx.Tx) error {
 		var event struct {
-			AggregateID   uuid.UUID
-			AggregateType string
-			EventType     string
-			Payload       []byte
-			EventVersion  int
+			AggregateID      uuid.UUID
+			AggregateType    string
+			EventType        string
+			Payload          []byte
+			EventVersion     int
+			AggregateVersion int
 		}
 
 		err := tx.QueryRow(ctx, w.q.OutboxMarkExhausted, id, createdAt, lastErr).Scan(
 			&event.AggregateID, &event.AggregateType,
-			&event.EventType, &event.Payload, &event.EventVersion,
+			&event.EventType, &event.Payload, &event.EventVersion, &event.AggregateVersion,
 		)
 		if err != nil {
 			return fmt.Errorf("outbox: exhaust event %s: %w", id, err)
@@ -126,7 +127,7 @@ func (w *OutboxWriter) MarkExhausted(ctx context.Context, id uuid.UUID, createdA
 
 		_, err = tx.Exec(ctx, w.q.OutboxDeadLetterInsert,
 			id, event.AggregateID, event.AggregateType,
-			event.EventType, string(event.Payload), event.EventVersion, lastErr,
+			event.EventType, string(event.Payload), event.EventVersion, event.AggregateVersion, lastErr,
 		)
 		if err != nil {
 			return fmt.Errorf("outbox: write dead letter for %s: %w", id, err)
@@ -156,7 +157,7 @@ func (w *OutboxWriter) PollPending(ctx context.Context, shardMin, shardMax, batc
 		var e ports.PendingEvent
 		if err := rows.Scan(
 			&e.ID, &e.AggregateID, &e.AggregateType,
-			&e.EventType, &e.Payload, &e.EventVersion, &e.Attempts, &e.CreatedAt,
+			&e.EventType, &e.Payload, &e.EventVersion, &e.AggregateVersion, &e.Attempts, &e.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("outbox: scan pending event: %w", err)
 		}
@@ -170,17 +171,18 @@ func (w *OutboxWriter) ReplayDeadLetter(ctx context.Context, deadLetterID uuid.U
 
 	err := withTx(ctx, w.db.pool, func(tx pgx.Tx) error {
 		var dl struct {
-			AggregateID   uuid.UUID
-			AggregateType string
-			EventType     string
-			Payload       []byte
-			EventVersion  int
-			ResolvedAt    *time.Time
+			AggregateID      uuid.UUID
+			AggregateType    string
+			EventType        string
+			Payload          []byte
+			EventVersion     int
+			AggregateVersion int
+			ResolvedAt       *time.Time
 		}
 
 		err := tx.QueryRow(ctx, w.q.OutboxDeadLetterGet, deadLetterID).Scan(
 			&dl.AggregateID, &dl.AggregateType, &dl.EventType,
-			&dl.Payload, &dl.EventVersion, &dl.ResolvedAt,
+			&dl.Payload, &dl.EventVersion, &dl.AggregateVersion, &dl.ResolvedAt,
 		)
 		if err != nil {
 			return fmt.Errorf("outbox: dead letter %s not found: %w", deadLetterID, err)
@@ -191,7 +193,7 @@ func (w *OutboxWriter) ReplayDeadLetter(ctx context.Context, deadLetterID uuid.U
 
 		_, err = tx.Exec(ctx, w.q.OutboxReplayInsert,
 			newEventID, dl.AggregateID, dl.AggregateType,
-			dl.EventType, string(dl.Payload), dl.EventVersion,
+			dl.EventType, string(dl.Payload), dl.EventVersion, dl.AggregateVersion,
 		)
 		if err != nil {
 			return fmt.Errorf("outbox: re-enqueue dead letter %s: %w", deadLetterID, err)

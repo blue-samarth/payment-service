@@ -14,11 +14,12 @@ import (
 )
 
 type refundTerminalPayload struct {
-	RefundID        string `json:"refund_id"`
-	TransactionID   string `json:"transaction_id"`
-	Status          string `json:"status"`
-	GatewayRefundID string `json:"gateway_refund_id"`
-	Amount          int64  `json:"amount"`
+	RefundID         string `json:"refund_id"`
+	TransactionID    string `json:"transaction_id"`
+	Status           string `json:"status"`
+	GatewayRefundID  string `json:"gateway_refund_id"`
+	Amount           int64  `json:"amount"`
+	AggregateVersion int    `json:"aggregate_version"`
 }
 
 type refundOutcome struct {
@@ -73,17 +74,16 @@ func (s *Service) ProcessRefund(ctx context.Context, refundID uuid.UUID) (*refun
 		return rf, nil
 	}
 
-	event, err := s.buildTerminalEvent(rf, outcome.newStatus)
-	if err != nil {
-		return nil, err
-	}
-
 	if err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := rf.Transition(outcome.newStatus); err != nil {
 			return err
 		}
 		rf.FailureReason = outcome.failureReason
 		if err := s.refunds.UpdateStatus(ctx, rf); err != nil {
+			return err
+		}
+		event, err := s.buildTerminalEvent(rf, outcome.newStatus)
+		if err != nil {
 			return err
 		}
 		return s.outbox.Write(ctx, event)
@@ -201,21 +201,23 @@ func (s *Service) buildTerminalEvent(rf *refund.Refund, status refund.Status) (p
 	}
 
 	payload, err := json.Marshal(refundTerminalPayload{
-		RefundID:        rf.ID.String(),
-		TransactionID:   rf.TransactionID.String(),
-		Status:          string(status),
-		GatewayRefundID: rf.GatewayRefundID,
-		Amount:          rf.Amount,
+		RefundID:         rf.ID.String(),
+		TransactionID:    rf.TransactionID.String(),
+		Status:           string(status),
+		GatewayRefundID:  rf.GatewayRefundID,
+		Amount:           rf.Amount,
+		AggregateVersion: rf.Version,
 	})
 	if err != nil {
 		return ports.OutboxEvent{}, fmt.Errorf("refund: marshal terminal event: %w", err)
 	}
 
 	return ports.OutboxEvent{
-		AggregateID:   rf.ID,
-		AggregateType: "refund",
-		EventType:     eventType,
-		Payload:       payload,
-		EventVersion:  1,
+		AggregateID:      rf.ID,
+		AggregateType:    "refund",
+		EventType:        eventType,
+		Payload:          payload,
+		EventVersion:     1,
+		AggregateVersion: rf.Version,
 	}, nil
 }

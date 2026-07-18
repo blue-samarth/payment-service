@@ -91,14 +91,22 @@ func run() error {
 func buildPublisher(ctx context.Context, cfg *config.Config, logger *observability.SlogLogger) (relay.Publisher, error) {
 	switch cfg.Outbox.Publisher {
 	case "sns":
-		pub, err := sns.NewPublisherFromConfig(ctx, cfg.AWS.Region, cfg.SNS.PaymentEventsTopic, logger)
+		pub, err := sns.NewPublisherFromConfig(ctx, cfg.AWS.Region, cfg.SNS.PaymentEventsTopic, cfg.Outbox.SNSAggregateVersionAttr, logger)
 		if err != nil {
 			return nil, fmt.Errorf("build sns publisher: %w", err)
 		}
 		logger.Info("relay.publisher_selected", map[string]any{"publisher": "sns", "topic": cfg.SNS.PaymentEventsTopic})
 		return pub, nil
 	default:
-		logger.Info("relay.publisher_selected", map[string]any{"publisher": "log"})
+		if cfg.App.Environment == "dev" {
+			logger.Info("relay.publisher_selected", map[string]any{"publisher": "log"})
+		} else {
+			logger.Warn("relay.publisher_selected", map[string]any{
+				"publisher":   "log",
+				"warning":     "OUTBOX_PUBLISHER=log in a non-dev environment: the relay is up but delivers nothing (events are only logged). Set OUTBOX_PUBLISHER=sns for real delivery.",
+				"environment": cfg.App.Environment,
+			})
+		}
 		return publisher.NewLogPublisher(logger), nil
 	}
 }

@@ -22,6 +22,7 @@ func NewRefundRepository(db *DB, q *Queries) *RefundRepository {
 }
 
 var ErrRefundNotFound = errors.New("refund not found")
+var ErrRefundVersionConflict = errors.New("refund version conflict")
 
 func (r *RefundRepository) Insert(ctx context.Context, rf *refund.Refund) error {
 	tx, err := txFromContext(ctx)
@@ -37,7 +38,7 @@ func (r *RefundRepository) Insert(ctx context.Context, rf *refund.Refund) error 
 	_, err = tx.Exec(ctx, r.q.RefundInsert,
 		rf.ID, rf.TransactionID, rf.Amount, rf.Reason, rf.Status,
 		rf.InitiatedBy, rf.GatewayRefundID, rf.AttemptedGateway, rf.ActualGateway,
-		rf.Attempts, string(failureReason), rf.InitiatedAt, rf.ResolvedAt,
+		rf.Attempts, string(failureReason), rf.InitiatedAt, rf.ResolvedAt, rf.Version,
 	)
 	if err != nil {
 		return fmt.Errorf("refund: insert %s: %w", rf.ID, err)
@@ -75,17 +76,26 @@ func (r *RefundRepository) UpdateStatus(ctx context.Context, rf *refund.Refund) 
 		return fmt.Errorf("refund: marshal failure_reason: %w", err)
 	}
 
-	tag, err := tx.Exec(ctx, r.q.RefundUpdateStatus,
+	var newVersion int
+	err = tx.QueryRow(ctx, r.q.RefundUpdateStatus,
 		rf.Status, rf.GatewayRefundID, rf.ActualGateway,
 		rf.Attempts, string(failureReason), rf.ResolvedAt,
-		rf.ID,
-	)
+		rf.ID, rf.Version,
+	).Scan(&newVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var exists bool
+		if e := tx.QueryRow(ctx, r.q.RefundExists, rf.ID).Scan(&exists); e != nil {
+			return fmt.Errorf("refund: disambiguate update %s: %w", rf.ID, e)
+		}
+		if !exists {
+			return ErrRefundNotFound
+		}
+		return ErrRefundVersionConflict
+	}
 	if err != nil {
 		return fmt.Errorf("refund: update status %s: %w", rf.ID, err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrRefundNotFound
-	}
+	rf.Version = newVersion
 	return nil
 }
 
@@ -122,7 +132,7 @@ func scanRefund(row pgx.Row) (*refund.Refund, error) {
 	err := row.Scan(
 		&rf.ID, &rf.TransactionID, &rf.Amount, &rf.Reason, &rf.Status,
 		&rf.InitiatedBy, &rf.GatewayRefundID, &rf.AttemptedGateway, &rf.ActualGateway,
-		&rf.Attempts, &failureReasonRaw, &rf.InitiatedAt, &rf.ResolvedAt,
+		&rf.Attempts, &failureReasonRaw, &rf.InitiatedAt, &rf.ResolvedAt, &rf.Version,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRefundNotFound

@@ -45,7 +45,7 @@ func sampleEvent() ports.PendingEvent {
 
 func TestPublisher_PublishesToTopicWithAttributes(t *testing.T) {
 	fake := &fakeSNS{out: &awssns.PublishOutput{MessageId: aws.String("msg-1")}}
-	p := NewPublisher(fake, "arn:aws:sns:us-east-1:123:payment-events", discardLogger())
+	p := NewPublisher(fake, "arn:aws:sns:us-east-1:123:payment-events", false, discardLogger())
 	ev := sampleEvent()
 
 	if err := p.Publish(context.Background(), ev); err != nil {
@@ -73,11 +73,36 @@ func TestPublisher_PublishesToTopicWithAttributes(t *testing.T) {
 	if got := aws.ToString(attrs["aggregate_type"].StringValue); got != ev.AggregateType {
 		t.Errorf("aggregate_type attribute = %s, want %s", got, ev.AggregateType)
 	}
+	// Off by default: the ordering key rides in the payload, not as an attribute.
+	if _, ok := attrs["aggregate_version"]; ok {
+		t.Error("aggregate_version attribute should be absent unless explicitly enabled")
+	}
+}
+
+func TestPublisher_AggregateVersionAttributeWhenEnabled(t *testing.T) {
+	fake := &fakeSNS{out: &awssns.PublishOutput{MessageId: aws.String("m")}}
+	p := NewPublisher(fake, "arn:topic", true, discardLogger())
+	ev := sampleEvent()
+	ev.AggregateVersion = 7
+
+	if err := p.Publish(context.Background(), ev); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	attr, ok := fake.input.MessageAttributes["aggregate_version"]
+	if !ok {
+		t.Fatal("expected aggregate_version attribute when enabled")
+	}
+	if got := aws.ToString(attr.StringValue); got != "7" {
+		t.Errorf("aggregate_version = %s, want 7", got)
+	}
+	if got := aws.ToString(attr.DataType); got != "Number" {
+		t.Errorf("aggregate_version DataType = %s, want Number", got)
+	}
 }
 
 func TestPublisher_PropagatesPublishError(t *testing.T) {
 	fake := &fakeSNS{err: errors.New("throttled")}
-	p := NewPublisher(fake, "arn:topic", discardLogger())
+	p := NewPublisher(fake, "arn:topic", false, discardLogger())
 
 	err := p.Publish(context.Background(), sampleEvent())
 	if err == nil {

@@ -60,6 +60,7 @@ type Refund struct {
 	FailureReason    *FailureReason
 	InitiatedAt      time.Time
 	ResolvedAt       *time.Time
+	Version          int
 }
 
 const (
@@ -126,6 +127,7 @@ func New(
 		InitiatedBy:   initiatedBy,
 		Attempts:      0,
 		InitiatedAt:   time.Now().UTC(),
+		Version:       1,
 	}, nil
 }
 

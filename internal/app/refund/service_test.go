@@ -49,6 +49,7 @@ func (f *fakeRefunds) GetByID(_ context.Context, id uuid.UUID) (*domainrefund.Re
 }
 func (f *fakeRefunds) UpdateStatus(_ context.Context, rf *domainrefund.Refund) error {
 	f.updates++
+	rf.Version++
 	return nil
 }
 func (f *fakeRefunds) ExistsByReason(_ context.Context, _ uuid.UUID, _ string) (bool, error) {

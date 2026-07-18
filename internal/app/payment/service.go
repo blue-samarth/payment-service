@@ -124,14 +124,15 @@ func NewService(
 }
 
 type paymentCreatedPayload struct {
-	TransactionID string `json:"transaction_id"`
-	MerchantID    string `json:"merchant_id"`
-	Amount        int64  `json:"amount"`
-	Currency      string `json:"currency"`
-	PaymentMethod string `json:"payment_method"`
-	Gateway       string `json:"gateway"`
-	Status        string `json:"status"`
-	CreatedAt     string `json:"created_at"`
+	TransactionID    string `json:"transaction_id"`
+	MerchantID       string `json:"merchant_id"`
+	Amount           int64  `json:"amount"`
+	Currency         string `json:"currency"`
+	PaymentMethod    string `json:"payment_method"`
+	Gateway          string `json:"gateway"`
+	Status           string `json:"status"`
+	CreatedAt        string `json:"created_at"`
+	AggregateVersion int    `json:"aggregate_version"`
 }
 
 func (s *Service) GetPayment(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error) {
@@ -256,25 +257,27 @@ func (s *Service) buildTransaction(ctx context.Context, in CreatePaymentInput) (
 	txn.AttemptedGateway = gateway
 
 	payload, err := json.Marshal(paymentCreatedPayload{
-		TransactionID: txn.ID.String(),
-		MerchantID:    txn.MerchantID.String(),
-		Amount:        txn.Amount,
-		Currency:      txn.Currency,
-		PaymentMethod: string(txn.PaymentMethod),
-		Gateway:       gateway,
-		Status:        string(txn.Status),
-		CreatedAt:     txn.CreatedAt.Format(time.RFC3339Nano),
+		TransactionID:    txn.ID.String(),
+		MerchantID:       txn.MerchantID.String(),
+		Amount:           txn.Amount,
+		Currency:         txn.Currency,
+		PaymentMethod:    string(txn.PaymentMethod),
+		Gateway:          gateway,
+		Status:           string(txn.Status),
+		CreatedAt:        txn.CreatedAt.Format(time.RFC3339Nano),
+		AggregateVersion: txn.Version,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("payment: marshal created event: %w", err)
 	}
 
 	return txn, &ports.OutboxEvent{
-		AggregateID:   txn.ID,
-		AggregateType: "transaction",
-		EventType:     ports.EventTypePaymentCreated,
-		Payload:       payload,
-		EventVersion:  1,
+		AggregateID:      txn.ID,
+		AggregateType:    "transaction",
+		EventType:        ports.EventTypePaymentCreated,
+		Payload:          payload,
+		EventVersion:     1,
+		AggregateVersion: txn.Version,
 	}, nil
 }
 

@@ -1,0 +1,1 @@
+ALTER TABLE refunds ADD COLUMN version INT NOT NULL DEFAULT 1 CHECK (version >= 1);
