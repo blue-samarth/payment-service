@@ -12,29 +12,31 @@ type OutboxWriter interface {
 	MarkPublished(ctx context.Context, id uuid.UUID, createdAt time.Time) error
 	MarkFailed(ctx context.Context, id uuid.UUID, createdAt time.Time, lastErr string, nextAttempt time.Time) error
 	MarkExhausted(ctx context.Context, id uuid.UUID, createdAt time.Time, lastErr string) error
-	PollPending(ctx context.Context, shardMin, shardMax, batchSize int) ([]PendingEvent, error)
+	PollPending(ctx context.Context, shards []int, batchSize int) ([]PendingEvent, error)
 	ReplayDeadLetter(ctx context.Context, deadLetterID uuid.UUID, actor, reason string) (uuid.UUID, error)
 }
 
 type PendingEvent struct {
-	ID            uuid.UUID
-	AggregateID   uuid.UUID
-	AggregateType string
-	EventType     string
-	Payload       []byte
-	EventVersion  int
-	Attempts      int
-	CreatedAt     time.Time
+	ID               uuid.UUID
+	AggregateID      uuid.UUID
+	AggregateType    string
+	EventType        string
+	Payload          []byte
+	EventVersion     int
+	AggregateVersion int
+	Attempts         int
+	CreatedAt        time.Time
 }
 
 type OutboxEvent struct {
-	ID            uuid.UUID
-	AggregateID   uuid.UUID
-	AggregateType string // e.g. "transaction", "refund"
-	EventType     string
-	Payload       []byte // must be JSON-encoded; maps to JSONB column
-	EventVersion  int
-	NextAttemptAt *time.Time // nil = publish immediately (next_attempt_at = NOW())
+	ID               uuid.UUID
+	AggregateID      uuid.UUID
+	AggregateType    string // e.g. "transaction", "refund"
+	EventType        string
+	Payload          []byte // must be JSON-encoded; maps to JSONB column
+	EventVersion     int
+	AggregateVersion int        // per-aggregate monotonic sequence; 0 = not applicable
+	NextAttemptAt    *time.Time // nil = publish immediately (next_attempt_at = NOW())
 }
 
 const (
@@ -59,16 +61,18 @@ const (
 )
 
 type DeadLetter struct {
-	ID              uuid.UUID
-	OriginalEventID uuid.UUID
-	AggregateID     uuid.UUID
-	AggregateType   string
-	EventType       string
-	Payload         []byte
-	FailureReason   string
-	FailedAt        time.Time
-	ResolvedAt      *time.Time
-	ResolvedBy      string
+	ID               uuid.UUID
+	OriginalEventID  uuid.UUID
+	AggregateID      uuid.UUID
+	AggregateType    string
+	EventType        string
+	Payload          []byte
+	EventVersion     int
+	AggregateVersion int
+	FailureReason    string
+	FailedAt         time.Time
+	ResolvedAt       *time.Time
+	ResolvedBy       string
 }
 
 type MerchantWebhookWriter interface {

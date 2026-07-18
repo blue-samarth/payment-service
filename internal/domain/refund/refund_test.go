@@ -25,9 +25,9 @@ func TestNew_Valid(t *testing.T) {
 
 func TestNew_Validation(t *testing.T) {
 	cases := []struct {
-		name                                         string
-		amount, original, already                    int64
-		reason, initiatedBy                          string
+		name                      string
+		amount, original, already int64
+		reason, initiatedBy       string
 	}{
 		{"zero amount", 0, 150000, 0, "r", "by"},
 		{"negative amount", -1, 150000, 0, "r", "by"},

@@ -30,6 +30,7 @@ type Queries struct {
 
 	RefundInsert         string
 	RefundGetByID        string
+	RefundExists         string
 	RefundSumActive      string
 	RefundUpdateStatus   string
 	RefundLockParent     string
@@ -107,6 +108,7 @@ func LoadQueries() (*Queries, error) {
 		{&q.TransactionListExpiredLeases, "TransactionListExpiredLeases"},
 		{&q.RefundInsert, "RefundInsert"},
 		{&q.RefundGetByID, "RefundGetByID"},
+		{&q.RefundExists, "RefundExists"},
 		{&q.RefundSumActive, "RefundSumActive"},
 		{&q.RefundUpdateStatus, "RefundUpdateStatus"},
 		{&q.RefundLockParent, "RefundLockParent"},

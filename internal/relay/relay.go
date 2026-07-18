@@ -11,7 +11,7 @@ import (
 )
 
 type OutboxReader interface {
-	PollPending(ctx context.Context, shardMin, shardMax, batchSize int) ([]ports.PendingEvent, error)
+	PollPending(ctx context.Context, shards []int, batchSize int) ([]ports.PendingEvent, error)
 	MarkPublished(ctx context.Context, id uuid.UUID, createdAt time.Time) error
 	MarkFailed(ctx context.Context, id uuid.UUID, createdAt time.Time, lastErr string, nextAttempt time.Time) error
 	MarkExhausted(ctx context.Context, id uuid.UUID, createdAt time.Time, lastErr string) error
@@ -22,8 +22,7 @@ type Publisher interface {
 }
 
 type Config struct {
-	ShardMin     int
-	ShardMax     int
+	Shards       []int
 	BatchSize    int
 	MaxAttempts  int
 	PollInterval time.Duration
@@ -61,8 +60,7 @@ func NewWorker(outbox OutboxReader, publisher Publisher, log ports.Logger, metri
 func (w *Worker) Run(ctx context.Context) error {
 	w.log.Info(ports.LogEventRelayModeSwitch, map[string]any{
 		ports.FieldRelayMode: "polling",
-		"shard_min":          w.cfg.ShardMin,
-		"shard_max":          w.cfg.ShardMax,
+		"shard_count":        len(w.cfg.Shards),
 	})
 
 	for {
@@ -96,7 +94,7 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) RunOnce(ctx context.Context) (count, published int, err error) {
-	events, err := w.outbox.PollPending(ctx, w.cfg.ShardMin, w.cfg.ShardMax, w.cfg.BatchSize)
+	events, err := w.outbox.PollPending(ctx, w.cfg.Shards, w.cfg.BatchSize)
 	if err != nil {
 		return 0, 0, err
 	}

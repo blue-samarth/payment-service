@@ -11,9 +11,11 @@ import (
 	"samarth/payment-service/config"
 	"samarth/payment-service/internal/adapters/observability"
 	"samarth/payment-service/internal/adapters/postgres"
+	"samarth/payment-service/internal/adapters/sns"
 	"samarth/payment-service/internal/bootstrap"
 	"samarth/payment-service/internal/relay"
 	"samarth/payment-service/internal/relay/publisher"
+	"samarth/payment-service/internal/relay/ring"
 )
 
 func main() {
@@ -66,11 +68,28 @@ func run() error {
 
 	outboxWriter := postgres.NewOutboxWriter(db, queries)
 	outboxWriter.SetClaimTTL(time.Duration(cfg.Outbox.ClaimTTLSec) * time.Second)
-	pub := publisher.NewLogPublisher(logger)
+
+	pub, err := buildPublisher(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+
+	shards := ring.OwnedShards(cfg.Outbox.WorkerIndex, cfg.Outbox.WorkerCount, cfg.Outbox.ShardCount)
+	logger.Info("relay.shards_assigned", map[string]any{
+		"worker_index": cfg.Outbox.WorkerIndex,
+		"worker_count": cfg.Outbox.WorkerCount,
+		"shard_count":  len(shards),
+	})
+	if len(shards) == 0 {
+		logger.Warn("relay.no_shards", map[string]any{
+			"worker_index": cfg.Outbox.WorkerIndex,
+			"worker_count": cfg.Outbox.WorkerCount,
+			"warning":      "this worker owns no shards (more workers than shards); it will publish nothing",
+		})
+	}
 
 	worker := relay.NewWorker(outboxWriter, pub, logger, metrics, relay.Config{
-		ShardMin:     0,
-		ShardMax:     cfg.Outbox.ShardCount - 1,
+		Shards:       shards,
 		BatchSize:    cfg.Outbox.BatchSize,
 		MaxAttempts:  cfg.Outbox.MaxAttempts,
 		PollInterval: time.Duration(cfg.Outbox.PollIntervalSec) * time.Second,
@@ -81,4 +100,27 @@ func run() error {
 	}
 	logger.Info("relay.stopped", nil)
 	return nil
+}
+
+func buildPublisher(ctx context.Context, cfg *config.Config, logger *observability.SlogLogger) (relay.Publisher, error) {
+	switch cfg.Outbox.Publisher {
+	case "sns":
+		pub, err := sns.NewPublisherFromConfig(ctx, cfg.AWS.Region, cfg.SNS.PaymentEventsTopic, cfg.Outbox.SNSAggregateVersionAttr, logger)
+		if err != nil {
+			return nil, fmt.Errorf("build sns publisher: %w", err)
+		}
+		logger.Info("relay.publisher_selected", map[string]any{"publisher": "sns", "topic": cfg.SNS.PaymentEventsTopic})
+		return pub, nil
+	default:
+		if cfg.App.Environment == "dev" {
+			logger.Info("relay.publisher_selected", map[string]any{"publisher": "log"})
+		} else {
+			logger.Warn("relay.publisher_selected", map[string]any{
+				"publisher":   "log",
+				"warning":     "OUTBOX_PUBLISHER=log in a non-dev environment: the relay is up but delivers nothing (events are only logged). Set OUTBOX_PUBLISHER=sns for real delivery.",
+				"environment": cfg.App.Environment,
+			})
+		}
+		return publisher.NewLogPublisher(logger), nil
+	}
 }

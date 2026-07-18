@@ -79,10 +79,11 @@ type idempotencyRefundResponse struct {
 }
 
 type refundInitiatedPayload struct {
-	RefundID      string `json:"refund_id"`
-	TransactionID string `json:"transaction_id"`
-	Amount        int64  `json:"amount"`
-	Reason        string `json:"reason"`
+	RefundID         string `json:"refund_id"`
+	TransactionID    string `json:"transaction_id"`
+	Amount           int64  `json:"amount"`
+	Reason           string `json:"reason"`
+	AggregateVersion int    `json:"aggregate_version"`
 }
 
 func (s *Service) InitiateRefund(ctx context.Context, in InitiateInput) (InitiateResult, error) {
@@ -176,20 +177,22 @@ func (s *Service) insertRefund(ctx context.Context, in InitiateInput, parent *tr
 	}
 
 	payload, err := json.Marshal(refundInitiatedPayload{
-		RefundID:      r.ID.String(),
-		TransactionID: in.TransactionID.String(),
-		Amount:        r.Amount,
-		Reason:        r.Reason,
+		RefundID:         r.ID.String(),
+		TransactionID:    in.TransactionID.String(),
+		Amount:           r.Amount,
+		Reason:           r.Reason,
+		AggregateVersion: r.Version,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal refund event: %w", err)
 	}
 	if err := s.outbox.Write(ctx, ports.OutboxEvent{
-		AggregateID:   r.ID,
-		AggregateType: "refund",
-		EventType:     ports.EventTypeRefundInitiated,
-		Payload:       payload,
-		EventVersion:  1,
+		AggregateID:      r.ID,
+		AggregateType:    "refund",
+		EventType:        ports.EventTypeRefundInitiated,
+		Payload:          payload,
+		EventVersion:     1,
+		AggregateVersion: r.Version,
 	}); err != nil {
 		return nil, fmt.Errorf("write refund event: %w", err)
 	}

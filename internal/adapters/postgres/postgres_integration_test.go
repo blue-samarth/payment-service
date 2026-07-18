@@ -215,7 +215,7 @@ func TestTransactor_CommitsTransactionAndOutboxAtomically(t *testing.T) {
 	if _, err := repo.GetByID(ctx, txn.ID); err != nil {
 		t.Errorf("transaction not persisted: %v", err)
 	}
-	events, err := outbox.PollPending(ctx, 0, 63, 10)
+	events, err := outbox.PollPending(ctx, testsupport.AllShards(), 10)
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestOutbox_WritePollMarkPublished(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	events, err := outbox.PollPending(ctx, 0, 63, 10)
+	events, err := outbox.PollPending(ctx, testsupport.AllShards(), 10)
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}
@@ -299,7 +299,7 @@ func TestOutbox_WritePollMarkPublished(t *testing.T) {
 		t.Fatalf("mark published: %v", err)
 	}
 
-	remaining, err := outbox.PollPending(ctx, 0, 63, 10)
+	remaining, err := outbox.PollPending(ctx, testsupport.AllShards(), 10)
 	if err != nil {
 		t.Fatalf("poll after publish: %v", err)
 	}
@@ -354,7 +354,7 @@ func TestOutbox_ClaimHidesEventFromConcurrentPoller(t *testing.T) {
 	writeOutboxEvent(t, pg, outbox)
 
 	// First poller claims the event (PENDING -> PUBLISHING).
-	claimed, err := outbox.PollPending(ctx, 0, 63, 10)
+	claimed, err := outbox.PollPending(ctx, testsupport.AllShards(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func TestOutbox_ClaimHidesEventFromConcurrentPoller(t *testing.T) {
 
 	// A second poller (another relay worker) must not see the in-flight claim,
 	// so it cannot publish the same event a second time.
-	second, err := outbox.PollPending(ctx, 0, 63, 10)
+	second, err := outbox.PollPending(ctx, testsupport.AllShards(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,7 +382,7 @@ func TestOutbox_StaleClaimIsReclaimed(t *testing.T) {
 	outbox.SetClaimTTL(200 * time.Millisecond)
 	writeOutboxEvent(t, pg, outbox)
 
-	claimed, err := outbox.PollPending(ctx, 0, 63, 10)
+	claimed, err := outbox.PollPending(ctx, testsupport.AllShards(), 10)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("first poll should claim, got %d err=%v", len(claimed), err)
 	}
@@ -391,7 +391,7 @@ func TestOutbox_StaleClaimIsReclaimed(t *testing.T) {
 	// another poll must reclaim it rather than strand it in PUBLISHING forever.
 	time.Sleep(300 * time.Millisecond)
 
-	reclaimed, err := outbox.PollPending(ctx, 0, 63, 10)
+	reclaimed, err := outbox.PollPending(ctx, testsupport.AllShards(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -408,7 +408,7 @@ func TestOutbox_MarkFailedReleasesClaimForRetry(t *testing.T) {
 	outbox := postgres.NewOutboxWriter(pg.DB, pg.Q)
 	writeOutboxEvent(t, pg, outbox)
 
-	claimed, err := outbox.PollPending(ctx, 0, 63, 10)
+	claimed, err := outbox.PollPending(ctx, testsupport.AllShards(), 10)
 	if err != nil || len(claimed) != 1 {
 		t.Fatalf("first poll should claim, got %d err=%v", len(claimed), err)
 	}
@@ -419,7 +419,7 @@ func TestOutbox_MarkFailedReleasesClaimForRetry(t *testing.T) {
 		t.Fatalf("mark failed: %v", err)
 	}
 
-	retried, err := outbox.PollPending(ctx, 0, 63, 10)
+	retried, err := outbox.PollPending(ctx, testsupport.AllShards(), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
