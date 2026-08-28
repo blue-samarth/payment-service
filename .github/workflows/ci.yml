@@ -101,6 +101,7 @@ jobs:
   integration-test:
     name: Integration tests
     runs-on: ubuntu-latest
+    needs: [lint, secret-scan, build, unit-test]
     services:
       postgres:
         image: postgres:18
@@ -159,8 +160,9 @@ jobs:
   performance-test:
     name: Performance budgets
     runs-on: ubuntu-latest
+    needs: [lint, secret-scan, build, unit-test]
     env:
-      PERF_SCALE: ${{ vars.PERF_SCALE || '3.0' }}
+      PERF_SCALE: ${{ vars.PERF_SCALE || '2.5' }}
       PERF_ROUNDS: ${{ vars.PERF_ROUNDS || '10' }}
     steps:
       - uses: actions/checkout@v5
@@ -210,6 +212,7 @@ jobs:
   sast:
     name: SAST (gosec + govulncheck)
     runs-on: ubuntu-latest
+    needs: [lint, secret-scan, build, unit-test]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -227,74 +230,78 @@ jobs:
           go install golang.org/x/vuln/cmd/govulncheck@latest
           govulncheck ./...
 
-  dependency-scan:
-    name: Dependency and config scan (trivy)
+  trivy-scan:
+    name: Trivy scans (deps, config, images)
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          severity: ${{ env.TRIVY_SEVERITY }}
-          ignore-unfixed: true
-          exit-code: "1"
-          scanners: vuln,secret,misconfig
-
-      - name: Trivy config scan
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          scan-type: config
-          scan-ref: .
-          severity: ${{ env.TRIVY_SEVERITY }}
-          exit-code: "1"
-
-  image:
-    name: Image build and scan
-    runs-on: ubuntu-latest
-    needs: [build, unit-test]
-    strategy:
-      fail-fast: false
-      matrix:
-        service: [api, jobs, relay]
+    needs: [integration-test, performance-test, sast]
     steps:
       - uses: actions/checkout@v5
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build ${{ matrix.service }} image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: false
-          load: true
-          tags: payment-service/${{ matrix.service }}:${{ github.sha }}
-          build-args: |
-            SERVICE=${{ matrix.service }}
-            VERSION=${{ github.ref_name }}
-            COMMIT=${{ github.sha }}
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
-
-      - name: Trivy image scan
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          scan-type: image
-          image-ref: payment-service/${{ matrix.service }}:${{ github.sha }}
-          severity: ${{ env.TRIVY_SEVERITY }}
-          ignore-unfixed: true
-          exit-code: "1"
-
-      - name: Verify image runs as nonroot
+      - name: Build service images
         run: |
-          user="$(docker inspect payment-service/${{ matrix.service }}:${{ github.sha }} --format '{{.Config.User}}')"
-          echo "image user: $user"
-          if [ "$user" != "nonroot:nonroot" ]; then
-            echo "::error::image must run as nonroot, got '$user'"
-            exit 1
-          fi
+          set -o pipefail
+          for svc in api jobs relay; do
+            echo "::group::build $svc"
+            docker buildx build \
+              --load \
+              --build-arg SERVICE="$svc" \
+              --build-arg VERSION="${{ github.ref_name }}" \
+              --build-arg COMMIT="${{ github.sha }}" \
+              -t "payment-service/${svc}:${{ github.sha }}" \
+              .
+            echo "::endgroup::"
+          done
+
+      - name: Verify images run as nonroot
+        run: |
+          for svc in api jobs relay; do
+            user="$(docker inspect "payment-service/${svc}:${{ github.sha }}" --format '{{.Config.User}}')"
+            echo "$svc image user: $user"
+            if [ "$user" != "nonroot:nonroot" ]; then
+              echo "::error::$svc image must run as nonroot, got '$user'"
+              exit 1
+            fi
+          done
+
+      - name: Install trivy
+        run: |
+          set -o pipefail
+          version=0.74.0
+          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${version}/trivy_${version}_Linux-64bit.tar.gz" \
+            | tar -xz -C /usr/local/bin trivy
+          trivy --version
+
+      - name: Trivy filesystem scan
+        run: |
+          trivy fs \
+            --scanners vuln,secret,misconfig \
+            --severity "$TRIVY_SEVERITY" \
+            --ignore-unfixed \
+            --exit-code 1 \
+            .
+
+      - name: Trivy config scan
+        run: |
+          trivy config \
+            --severity "$TRIVY_SEVERITY" \
+            --exit-code 1 \
+            .
+
+      - name: Trivy image scans
+        run: |
+          rc=0
+          for svc in api jobs relay; do
+            echo "::group::trivy image $svc"
+            trivy image \
+              --severity "$TRIVY_SEVERITY" \
+              --ignore-unfixed \
+              --exit-code 1 \
+              "payment-service/${svc}:${{ github.sha }}" || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
 
   ci-passed:
     name: CI passed
@@ -302,14 +309,13 @@ jobs:
     if: always()
     needs:
       - lint
+      - secret-scan
       - build
       - unit-test
       - integration-test
       - performance-test
-      - secret-scan
       - sast
-      - dependency-scan
-      - image
+      - trivy-scan
     steps:
       - name: Check gate
         run: |
