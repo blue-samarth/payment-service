@@ -1,4 +1,6 @@
-package config
+package config_test
+
+import . "samarth/payment-service/config"
 
 import (
 	"strings"

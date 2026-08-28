@@ -1,4 +1,6 @@
-package transaction
+package transaction_test
+
+import . "samarth/payment-service/internal/domain/transaction"
 
 import (
 	"testing"

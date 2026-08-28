@@ -1,4 +1,6 @@
-package reconciliation
+package reconciliation_test
+
+import . "samarth/payment-service/internal/domain/reconciliation"
 
 import "testing"
 

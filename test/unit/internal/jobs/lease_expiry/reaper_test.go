@@ -1,4 +1,6 @@
-package leaseexpiry
+package leaseexpiry_test
+
+import . "samarth/payment-service/internal/jobs/lease_expiry"
 
 import (
 	"context"

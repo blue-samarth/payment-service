@@ -1,4 +1,6 @@
-package bootstrap
+package bootstrap_test
+
+import . "samarth/payment-service/internal/bootstrap"
 
 import (
 	"context"
