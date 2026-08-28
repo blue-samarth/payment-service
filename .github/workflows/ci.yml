@@ -1,0 +1,319 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GO_VERSION: "1.26.6"
+  TRIVY_SEVERITY: HIGH,CRITICAL
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l . | grep -v '^vendor/' || true)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt reported unformatted files:"
+            echo "$unformatted"
+            gofmt -d $unformatted
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go vet (tagged suites)
+        run: |
+          go vet -tags integration ./...
+          go vet -tags performance ./test/performance/
+
+      - name: go mod tidy is clean
+        run: |
+          cp go.mod /tmp/go.mod.bak
+          cp go.sum /tmp/go.sum.bak
+          go mod tidy
+          diff -u /tmp/go.mod.bak go.mod || { echo "::error::go.mod is not tidy"; exit 1; }
+          diff -u /tmp/go.sum.bak go.sum || { echo "::error::go.sum is not tidy"; exit 1; }
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go build
+        run: go build ./...
+
+      - name: Build service binaries
+        run: |
+          for svc in api jobs relay; do
+            echo "building cmd/$svc"
+            CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "/tmp/bin/$svc" "./cmd/$svc"
+          done
+          ls -la /tmp/bin
+
+  unit-test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go test -race
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage summary
+        run: go tool cover -func=coverage.out | tail -20
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 7
+
+  integration-test:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: payment_test
+          POSTGRES_USER: payment
+          POSTGRES_PASSWORD: payment
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U payment -d payment_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PAYMENT_TEST_DB_HOST: localhost
+      PAYMENT_TEST_DB_PORT: "5432"
+      PAYMENT_TEST_DB_NAME: payment_test
+      PAYMENT_TEST_DB_USER: payment
+      PAYMENT_TEST_DB_PASSWORD: payment
+      PAYMENT_TEST_DB_SSLMODE: disable
+      PAYMENT_TEST_REDIS_ADDR: localhost:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: go test -tags integration
+        run: go test -tags integration -v ./... 2>&1 | tee /tmp/integration.log
+
+      - name: Fail if the suite silently skipped
+        run: |
+          if grep -qE "integration (postgres|redis) unavailable" /tmp/integration.log; then
+            echo "::error::Integration tests skipped because a dependency was unreachable."
+            grep -E "integration (postgres|redis) unavailable" /tmp/integration.log
+            exit 1
+          fi
+          ran="$(grep -cE '^(=== RUN|--- PASS)' /tmp/integration.log || true)"
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::No integration tests executed."
+            exit 1
+          fi
+          echo "integration assertions executed: $ran"
+
+  performance-test:
+    name: Performance budgets
+    runs-on: ubuntu-latest
+    env:
+      PERF_SCALE: ${{ vars.PERF_SCALE || '3.0' }}
+      PERF_ROUNDS: ${{ vars.PERF_ROUNDS || '10' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Enforcement policy self-test
+        run: go test -tags performance -run TestPolicy -v ./test/performance/
+
+      - name: Performance budgets
+        run: |
+          echo "PERF_SCALE=$PERF_SCALE PERF_ROUNDS=$PERF_ROUNDS"
+          go test -tags performance -timeout 30m -v ./test/performance/ 2>&1 | tee /tmp/perf.log
+
+      - name: Measurements
+        if: always()
+        run: grep -E 'mean [0-9]+ ns/op over' /tmp/perf.log || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: performance-measurements
+          path: /tmp/perf.log
+          retention-days: 30
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          version=8.28.0
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan full history
+        run: gitleaks detect --source . --redact --verbose --exit-code 1
+
+  sast:
+    name: SAST (gosec + govulncheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec -exclude-dir=test -exclude=G115,G304,G404,G407 -severity medium -confidence medium ./...
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+  dependency-scan:
+    name: Dependency and config scan (trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: true
+          exit-code: "1"
+          scanners: vuln,secret,misconfig
+
+      - name: Trivy config scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: ${{ env.TRIVY_SEVERITY }}
+          exit-code: "1"
+
+  image:
+    name: Image build and scan
+    runs-on: ubuntu-latest
+    needs: [build, unit-test]
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [api, jobs, relay]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.service }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: payment-service/${{ matrix.service }}:${{ github.sha }}
+          build-args: |
+            SERVICE=${{ matrix.service }}
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: image
+          image-ref: payment-service/${{ matrix.service }}:${{ github.sha }}
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Verify image runs as nonroot
+        run: |
+          user="$(docker inspect payment-service/${{ matrix.service }}:${{ github.sha }} --format '{{.Config.User}}')"
+          echo "image user: $user"
+          if [ "$user" != "nonroot:nonroot" ]; then
+            echo "::error::image must run as nonroot, got '$user'"
+            exit 1
+          fi
+
+  ci-passed:
+    name: CI passed
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - lint
+      - build
+      - unit-test
+      - integration-test
+      - performance-test
+      - secret-scan
+      - sast
+      - dependency-scan
+      - image
+    steps:
+      - name: Check gate
+        run: |
+          results='${{ toJSON(needs) }}'
+          echo "$results"
+          if echo "$results" | grep -qE '"result": *"(failure|cancelled)"'; then
+            echo "::error::one or more CI jobs failed"
+            exit 1
+          fi
+          echo "all CI jobs passed"
