@@ -90,6 +90,51 @@ func TestPolicy_AllocationsNotDoubledBySpikeFactor(t *testing.T) {
 	}
 }
 
+func TestPolicy_NsLimitRoundsUp(t *testing.T) {
+	got := mkSample([]int64{12, 12, 12, 12}, 0, 0)
+	if v := violations("probe", Baseline{NsPerOp: 9}, got, 1.0); len(v) != 0 {
+		t.Fatalf("9 ns baseline x1.25 = 11.25, which must round up to 12: %v", v)
+	}
+}
+
+func TestPolicy_NsLimitRoundsUpNotPastNext(t *testing.T) {
+	got := mkSample([]int64{13, 13, 13, 13}, 0, 0)
+	v := violations("probe", Baseline{NsPerOp: 9}, got, 1.0)
+	if len(v) != 1 || !strings.Contains(v[0], "mean limit") {
+		t.Fatalf("13 ns is past the rounded-up 12 ns limit and must fail, got %v", v)
+	}
+}
+
+func TestPolicy_BytesToleratesRoundingDrift(t *testing.T) {
+	got := mkSample([]int64{100}, 0, 123309)
+	if v := violations("probe", Baseline{NsPerOp: 100, AllocsPerOp: 0, BytesPerOp: 123308}, got, 1.0); len(v) != 0 {
+		t.Fatalf("B/op is an average and rounds differently per machine; one byte must not fail: %v", v)
+	}
+}
+
+func TestPolicy_BytesStillCatchesRealGrowth(t *testing.T) {
+	got := mkSample([]int64{100}, 0, 140000)
+	v := violations("probe", Baseline{NsPerOp: 100, AllocsPerOp: 0, BytesPerOp: 123308}, got, 1.0)
+	if len(v) != 1 || !strings.Contains(v[0], "B/op") {
+		t.Fatalf("expected a bytes violation for real growth, got %v", v)
+	}
+}
+
+func TestPolicy_SmallBytesBaselineGetsAtLeastOneByte(t *testing.T) {
+	got := mkSample([]int64{100}, 1, 49)
+	if v := violations("probe", Baseline{NsPerOp: 100, AllocsPerOp: 1, BytesPerOp: 48}, got, 1.0); len(v) != 0 {
+		t.Fatalf("a 1%% tolerance rounds to zero at 48 B/op; one byte of slack is required: %v", v)
+	}
+}
+
+func TestPolicy_AllocCountStaysExact(t *testing.T) {
+	got := mkSample([]int64{100}, 2851, 123308)
+	v := violations("probe", Baseline{NsPerOp: 100, AllocsPerOp: 2850, BytesPerOp: 123308}, got, 1.0)
+	if len(v) != 1 || !strings.Contains(v[0], "allocs/op") {
+		t.Fatalf("alloc count is exact and must not get the bytes tolerance, got %v", v)
+	}
+}
+
 func TestPolicy_NegativeBaselineSkipsAllocationCheck(t *testing.T) {
 	got := mkSample([]int64{100}, 99, 9999)
 	if v := violations("probe", Baseline{NsPerOp: 100, AllocsPerOp: -1, BytesPerOp: -1}, got, 1.0); len(v) != 0 {

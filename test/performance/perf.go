@@ -4,6 +4,7 @@ package performance
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"testing"
@@ -20,6 +21,7 @@ const (
 	roundsEnv     = "PERF_ROUNDS"
 	meanFactor    = 1.25
 	spikeFactor   = 2.0
+	bytesFactor   = 1.01
 	defaultScale  = 1.0
 	defaultRounds = 10
 	minIterations = 100
@@ -119,15 +121,21 @@ func violations(name string, base Baseline, got sample, s float64) []string {
 		out = append(out, fmt.Sprintf("%s allocates %d allocs/op, baseline is %d",
 			name, got.allocs, base.AllocsPerOp))
 	}
-	if base.BytesPerOp >= 0 && got.bytes > base.BytesPerOp {
-		out = append(out, fmt.Sprintf("%s allocates %d B/op, baseline is %d",
-			name, got.bytes, base.BytesPerOp))
+	if base.BytesPerOp >= 0 {
+		bytesLimit := int64(math.Ceil(float64(base.BytesPerOp) * bytesFactor))
+		if bytesLimit <= base.BytesPerOp {
+			bytesLimit = base.BytesPerOp + 1
+		}
+		if got.bytes > bytesLimit {
+			out = append(out, fmt.Sprintf("%s allocates %d B/op, baseline is %d (limit %d)",
+				name, got.bytes, base.BytesPerOp, bytesLimit))
+		}
 	}
 	if base.NsPerOp <= 0 {
 		return out
 	}
 
-	meanLimit := int64(float64(base.NsPerOp) * meanFactor * s)
+	meanLimit := int64(math.Ceil(float64(base.NsPerOp) * meanFactor * s))
 	if got.meanNs > meanLimit {
 		out = append(out, fmt.Sprintf(
 			"%s mean %d ns/op is %.2fx the %d ns/op baseline, mean limit is %.2fx (%d ns/op)%s",
@@ -135,7 +143,7 @@ func violations(name string, base Baseline, got sample, s float64) []string {
 			meanFactor, meanLimit, hint))
 	}
 
-	spikeLimit := int64(float64(base.NsPerOp) * spikeFactor * s)
+	spikeLimit := int64(math.Ceil(float64(base.NsPerOp) * spikeFactor * s))
 	if got.maxNs > spikeLimit {
 		out = append(out, fmt.Sprintf(
 			"%s round %d of %d hit %d ns/op, %.2fx the %d ns/op baseline, spike limit is %.1fx (%d ns/op)%s",
