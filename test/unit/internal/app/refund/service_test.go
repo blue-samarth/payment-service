@@ -1,4 +1,6 @@
-package refund
+package refund_test
+
+import . "samarth/payment-service/internal/app/refund"
 
 import (
 	"context"

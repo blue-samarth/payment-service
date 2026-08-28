@@ -1,4 +1,6 @@
-package gateways
+package gateways_test
+
+import . "samarth/payment-service/internal/adapters/gateways"
 
 import (
 	"context"

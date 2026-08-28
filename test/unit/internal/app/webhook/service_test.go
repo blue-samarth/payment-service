@@ -1,4 +1,6 @@
-package webhook
+package webhook_test
+
+import . "samarth/payment-service/internal/app/webhook"
 
 import (
 	"context"

@@ -1,4 +1,6 @@
-package cancel
+package cancel_test
+
+import . "samarth/payment-service/internal/app/cancel"
 
 import (
 	"context"

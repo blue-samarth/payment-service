@@ -1,4 +1,6 @@
-package idempotency
+package idempotency_test
+
+import . "samarth/payment-service/internal/app/idempotency"
 
 import (
 	"context"

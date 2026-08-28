@@ -1,4 +1,6 @@
-package api
+package api_test
+
+import . "samarth/payment-service/internal/api"
 
 import (
 	"context"

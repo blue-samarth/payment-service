@@ -1,4 +1,6 @@
-package routing
+package routing_test
+
+import . "samarth/payment-service/internal/domain/routing"
 
 import (
 	"errors"

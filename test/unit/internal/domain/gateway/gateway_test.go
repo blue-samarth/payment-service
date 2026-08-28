@@ -1,4 +1,6 @@
-package gateway
+package gateway_test
+
+import . "samarth/payment-service/internal/domain/gateway"
 
 import (
 	"errors"
@@ -142,9 +144,9 @@ func TestDiscrepancyMetrics_ReliabilityScore(t *testing.T) {
 
 func TestDiscrepancyMetrics_CurrentAlertLevel(t *testing.T) {
 	cases := []struct {
-		name              string
-		r5min, r24h       float64
-		want              AlertLevel
+		name        string
+		r5min, r24h float64
+		want        AlertLevel
 	}{
 		{"auto disable", 0.25, 0, AlertLevelAutoDisable},
 		{"alert", 0.10, 0, AlertLevelAlert},

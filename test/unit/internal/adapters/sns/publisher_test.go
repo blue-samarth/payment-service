@@ -1,4 +1,6 @@
-package sns
+package sns_test
+
+import . "samarth/payment-service/internal/adapters/sns"
 
 import (
 	"context"

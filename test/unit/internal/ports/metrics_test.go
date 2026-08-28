@@ -1,4 +1,6 @@
-package ports
+package ports_test
+
+import . "samarth/payment-service/internal/ports"
 
 import "testing"
 
