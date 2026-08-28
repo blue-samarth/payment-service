@@ -44,16 +44,25 @@ const (
 	StateOpen     CircuitState = "OPEN"
 	StateHalfOpen CircuitState = "HALF_OPEN"
 )
+
 var transitionTable = map[CircuitState][]CircuitState{
 	StateClosed:   {StateOpen},
 	StateOpen:     {StateHalfOpen},
 	StateHalfOpen: {StateClosed, StateOpen},
 }
 
-func (e ErrInvalidTransition) Error() string { return fmt.Sprintf("circuit breaker: invalid transition %s → %s", e.From, e.To) }
-func (cb *CircuitBreaker) IsRoutable() bool { return cb.State == StateClosed || cb.State == StateHalfOpen }
-func (cb *CircuitBreaker) ShouldTransitionToHalfOpen() bool { return cb.State == StateOpen && time.Now().UTC().After(cb.CooldownUntil) }
-func (d *DiscrepancyMetrics) IsResolved() bool { return d.DaysSinceDiscrepancy >= 1 && d.EffectiveRate() < 0.001 }
+func (e ErrInvalidTransition) Error() string {
+	return fmt.Sprintf("circuit breaker: invalid transition %s → %s", e.From, e.To)
+}
+func (cb *CircuitBreaker) IsRoutable() bool {
+	return cb.State == StateClosed || cb.State == StateHalfOpen
+}
+func (cb *CircuitBreaker) ShouldTransitionToHalfOpen() bool {
+	return cb.State == StateOpen && time.Now().UTC().After(cb.CooldownUntil)
+}
+func (d *DiscrepancyMetrics) IsResolved() bool {
+	return d.DaysSinceDiscrepancy >= 1 && d.EffectiveRate() < 0.001
+}
 
 func CooldownDuration(consecutiveFailures int) time.Duration {
 	if consecutiveFailures <= 0 {
@@ -117,7 +126,6 @@ func (d *DiscrepancyMetrics) EffectiveRate() float64 {
 	decayFactor := math.Pow(0.5, float64(d.DaysSinceDiscrepancy-1)/7.0)
 	return d.Rate24H * decayFactor
 }
-
 
 func (d *DiscrepancyMetrics) ReliabilityScore() int {
 	if d.Rate24H > 0.20 {

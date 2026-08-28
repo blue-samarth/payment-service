@@ -103,4 +103,3 @@ func TestAuth_OpsTokenNotValidAsService(t *testing.T) {
 		t.Fatalf("ops token must not authenticate as a service token, got %d", rec.Code)
 	}
 }
-
