@@ -57,7 +57,7 @@ func cardInput() payment.CreatePaymentInput {
 
 func outboxEventTypes(t *testing.T, pg *testsupport.PG) []string {
 	t.Helper()
-	events, err := postgres.NewOutboxWriter(pg.DB, pg.Q).PollPending(context.Background(), 0, 63, 10)
+	events, err := postgres.NewOutboxWriter(pg.DB, pg.Q).PollPending(context.Background(), testsupport.AllShards(), 10)
 	if err != nil {
 		t.Fatalf("poll outbox: %v", err)
 	}

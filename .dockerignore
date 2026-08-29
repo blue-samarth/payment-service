@@ -17,3 +17,7 @@ vendor/
 *.cover
 .github
 .gitattributes
+Docs/
+deploy/
+migrations/
+*_test.go

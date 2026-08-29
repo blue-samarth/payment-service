@@ -9,12 +9,12 @@ import (
 )
 
 type Deps struct {
-	Payment     *handlers.PaymentHandler
-	Refund      *handlers.RefundHandler
-	Cancel      *handlers.CancelHandler
-	Webhook     *handlers.WebhookHandler
-	Health      *handlers.HealthHandler
-	Logger      ports.Logger
+	Payment       *handlers.PaymentHandler
+	Refund        *handlers.RefundHandler
+	Cancel        *handlers.CancelHandler
+	Webhook       *handlers.WebhookHandler
+	Health        *handlers.HealthHandler
+	Logger        ports.Logger
 	Auth          middleware.TokenProvider
 	Limiter       middleware.Limiter
 	RateLimit     middleware.RateLimitConfig
