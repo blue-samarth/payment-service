@@ -31,6 +31,7 @@ This document describes the architecture, the core domain logic, and the operati
 - [21. Configuration](#21-configuration)
 - [22. Running Locally](#22-running-locally)
 - [23. Testing](#23-testing)
+- [24. Continuous Integration](#24-continuous-integration)
 
 ---
 
@@ -169,7 +170,14 @@ internal/
   relay/           Generic outbox polling worker + publisher interface
   ports/           All interfaces + shared types (GatewayAdapter, Logger, ...)
   testsupport/     Shared Postgres/Redis test harness
-test/integration/  End-to-end tests exercising real Postgres/Redis
+test/
+  integration/     End-to-end tests exercising real Postgres/Redis
+  unit/            Black-box unit tests, mirroring the source tree
+  performance/     Latency and allocation budgets (performance build tag)
+migrations/        Numbered up/down SQL migrations
+deploy/docker/     docker-compose stack for local Postgres + Redis
+Dockerfile         Multi-stage build for all three binaries (SERVICE build arg)
+.github/workflows/ CI pipeline
 ```
 
 ---
@@ -717,17 +725,189 @@ JOB=partition_manager go run ./cmd/jobs
 JOB=lease_expiry go run ./cmd/jobs
 ```
 
+To build a container image instead, pass the service as a build argument (see §24):
+
+```bash
+docker build --build-arg SERVICE=api   -t payment-service/api:dev   .
+docker build --build-arg SERVICE=jobs  -t payment-service/jobs:dev  .
+docker build --build-arg SERVICE=relay -t payment-service/relay:dev .
+```
+
 ---
 
 ## 23. Testing
 
-- **Unit tests** live alongside the code they test (`*_test.go`) and use hand-written fakes for every port (`fakeRepo`, `fakeOutbox`, `fakeRegistry`, …) — no mocking framework, no real I/O.
-- **Integration tests** (`test/integration/`, and `*_integration_test.go` under `adapters/postgres` and `adapters/redis`) are gated behind the `integration` build tag and require the Postgres/Redis containers above; they exercise real concurrency (goroutine races against actual row locks, actual Redis Lua scripts) for things a fake can't prove, e.g.:
+All tests use hand-written fakes for every port (`fakeRepo`, `fakeOutbox`,
+`fakeRegistry`, …) — no mocking framework.
+
+**Unit tests** are split by what they need to reach:
+
+| Location | Count | Package style |
+|---|---|---|
+| `test/unit/`, mirroring the source tree | 20 files | Black-box (`package foo_test`), exported API only |
+| Beside the code they test | 28 files | White-box (`package foo`), reaches unexported identifiers |
+
+A test can only move out of its package if it uses nothing unexported. The 28 that stay
+exercise internals — `reverseHash`, `deriveTxnID`, `weekStart`, `replicaSets`,
+`classifyError`, and private struct fields like `mgr.cert` and `w.backoff`. Go's usual
+escape hatch, `export_test.go`, is compiled only into its own package's test binary, so
+it cannot bridge across directories; moving them would mean exporting production
+internals purely for tests.
+
+Both run under a plain `go test ./...` — neither is build-tagged.
+
+**Integration tests** are gated behind the `integration` build tag and need the
+Postgres/Redis containers above. They live in three places:
+
+| Path | Covers |
+|---|---|
+| `test/integration/` | End-to-end flows across the whole stack |
+| `test/unit/internal/adapters/postgres/` | Postgres repository behaviour |
+| `internal/adapters/redis/` | Redis Lua scripts and circuit-breaker store |
+
+The Postgres files sit under `test/unit/` because they move cleanly as black-box tests;
+the build tag, not the directory, is what gates them.
+
+They exercise real concurrency (goroutine races against actual row locks, actual Redis
+Lua scripts) for things a fake can't prove, e.g.:
   - Exactly one winner among concurrent refund/cancel-intent/lease-acquire attempts
   - Optimistic-lock conflicts under concurrent `UpdateStatus`
   - Outbox claim visibility (a claimed event is invisible to a second poller) and stale-claim reclamation
   - Circuit-breaker cooldown escalation across repeated re-opens
   - Rate-limiter atomicity under 50 concurrent goroutines against a capacity of 10
 
-Run unit tests: `go test ./...`
-Run integration tests: `go test -tags=integration ./...` (with the docker-compose stack running)
+**Performance tests** live in `test/performance/` behind a `performance` build tag, so
+they never slow the default run. Each check declares a `Baseline` holding the measured
+cost of a hot path, and speed is a build constraint on three axes:
+
+| Axis | Rule |
+|---|---|
+| Mean `ns/op` across rounds | May not exceed **1.25x** baseline |
+| Any single round | May not exceed **2x** baseline, even if the mean is healthy |
+| `allocs/op` | Exact — no multiplier, never scaled by hardware |
+| `B/op` | 1% or one byte, whichever is larger |
+
+Ten rounds run and the mean is taken. Allocation *counts* are identical on every machine,
+so they are enforced exactly; allocated *bytes* are an average whose integer division
+rounds differently at different iteration counts, hence the small tolerance. Limits round
+up to the next whole nanosecond, so a 9 ns baseline gets a 12 ns budget rather than 11.
+
+`policy_test.go` tests the enforcement logic itself against synthetic round sets,
+independent of any timing, so a refactor cannot quietly disarm the gate.
+
+`PERF_SCALE` and `PERF_ROUNDS` tune the time limits and round count for slower hardware.
+Allocation budgets ignore both.
+
+```bash
+go test ./...                                   # unit
+go test -tags=integration ./...                 # integration (needs the compose stack)
+go test -tags=performance ./test/performance/   # performance budgets
+
+PERF_ROUNDS=2 go test -tags=performance ./test/performance/   # faster local check
+```
+
+---
+
+## 24. Continuous Integration
+
+`.github/workflows/ci.yml` runs on **pull requests targeting `master`** and on **pushes to
+`master`** (what a merge produces), so the same checks gate a change before and after it
+lands.
+
+The pipeline runs in three stages rather than one flat fan-out, so a broken build stops
+the run before it spends time on the slow jobs.
+
+```mermaid
+flowchart TD
+    trigger["Pull request to master<br/>or push to master"]
+
+    subgraph S1["Stage 1 - fast feedback"]
+        direction LR
+        lint["Lint<br/>gofmt · go vet (3 tags) · go mod tidy"]
+        secret["Secret scan<br/>gitleaks, full history"]
+        build["Build<br/>go build · api, jobs, relay"]
+        unit["Unit tests<br/>go test -race + coverage"]
+    end
+
+    subgraph S2["Stage 2 - depth"]
+        direction LR
+        integration["Integration tests<br/>Postgres 18 · Redis 8<br/>fails on a silent skip"]
+        perf["Performance budgets<br/>mean 1.25x · spike 2x<br/>allocations exact"]
+        sast["SAST<br/>gosec · govulncheck"]
+    end
+
+    subgraph S3["Stage 3 - supply chain"]
+        trivy["Trivy scans<br/>filesystem · config<br/>build + scan all 3 images<br/>assert nonroot"]
+    end
+
+    gate["CI passed<br/>required status check"]
+
+    trigger --> S1
+    S1 --> S2
+    S2 --> S3
+    S3 --> gate
+```
+
+Set **`ci-passed`** as the required status check in branch protection rather than listing
+each job, so adding a job later needs no rule change.
+
+### Toolchain pinning
+
+`GO_VERSION` in the workflow and `ARG GO_VERSION` in the `Dockerfile` are pinned to the
+same patched Go release and are deliberately **not** read from `go.mod`. The `go`
+directive there is a *minimum*, not a build version, so building with it ships every
+standard-library CVE fixed since. Compiling the API image with the minimum produced 30
+HIGH/CRITICAL findings against 14 on the patched release, the difference being entirely
+standard library. Bump both together when a patch release lands.
+
+### Two jobs that do not trust a green run
+
+**Integration.** `testsupport` calls `t.Skip` when Postgres or Redis is unreachable —
+correct locally, a false green in CI. The job fails on a skip message or on zero tests
+executed, and reports the count it did run.
+
+**Every step that pipes into `tee`** sets `set -o pipefail`. Without it the step takes
+`tee`'s exit status, and a failing `go test` reports success — which is exactly what
+happened on the first run: the integration package failed to compile and the job went
+green.
+
+### gosec exclusions
+
+gosec runs with `-exclude=G115,G304,G404,G407`. Each was reviewed rather than suppressed
+wholesale:
+
+| Rule | Why excluded |
+|---|---|
+| `G407` hardcoded IV/nonce | False positive — the AES-GCM nonce is filled from `crypto/rand` immediately before use; the heuristic does not track the fill |
+| `G404` weak RNG | Retry-backoff jitter, which has no security requirement |
+| `G304` file inclusion via variable | Reads the CA bundle from an operator-supplied config path, which is the function's purpose |
+| `G115` integer overflow | Conversions on bounded, non-attacker-controlled values (a 12-byte nonce length, operator-configured pool sizes, small shard indices) |
+
+`G115` is the weakest of these: it is excluded repository-wide, so a genuinely
+attacker-controlled narrowing conversion added later would not be caught.
+
+### Performance budgets on shared runners
+
+The baselines were measured on Apple Silicon; `ubuntu-latest` runs 2.1-2.4x slower on
+pure-CPU paths and closer on AES-GCM, where hardware acceleration narrows the gap.
+`PERF_SCALE` defaults to `2.5`, calibrated from that measurement — the worst observed
+ratio was 2.40x, giving a minimum viable scale of `2.40 / 1.25 = 1.92`.
+
+Allocation budgets are never scaled and hold on any hardware. They are the part of the
+performance gate that is trustworthy in CI without calibration.
+
+### Images
+
+One `Dockerfile` builds all three services, selected by a build argument:
+
+```bash
+docker build --build-arg SERVICE=api -t payment-service/api:dev .
+```
+
+`golang-alpine` compiles a static `CGO_ENABLED=0 -trimpath` binary;
+`gcr.io/distroless/static-debian12:nonroot` runs it. Images are 30-38 MB with no shell
+and no package manager. SQL is compiled in via `go:embed`, so no `queries/` directory is
+needed at runtime.
+
+CD is intentionally absent until the infrastructure exists — the image job builds and
+scans, but never pushes.
