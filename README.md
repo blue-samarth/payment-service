@@ -851,6 +851,28 @@ flowchart TD
 Set **`ci-passed`** as the required status check in branch protection rather than listing
 each job, so adding a job later needs no rule change.
 
+### Documentation-only changes skip the pipeline
+
+Both triggers carry `paths-ignore`, so a change touching only these never starts a run:
+
+```
+**/*.md    Docs/**    LICENSE    .gitignore    .gitattributes
+```
+
+The filter is all-or-nothing: a push or PR that changes `README.md` *and* any Go file
+runs the full pipeline. Only a change confined entirely to ignored paths is skipped.
+
+**This interacts with branch protection.** GitHub reports a skipped workflow as *no
+status* rather than success, so if `ci-passed` is a required check, a documentation-only
+pull request waits forever on a check that will never run. Two ways out:
+
+- Leave `ci-passed` unrequired and rely on the run that fires for code changes.
+- Keep it required, drop `paths-ignore`, and instead gate the expensive jobs behind a
+  cheap change-detection job so `ci-passed` still reports on every pull request.
+
+The first is simpler; the second is what to reach for if merges must be blocked on a
+green check without exception.
+
 ### Toolchain pinning
 
 `GO_VERSION` in the workflow and `ARG GO_VERSION` in the `Dockerfile` are pinned to the
