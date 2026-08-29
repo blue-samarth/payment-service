@@ -33,6 +33,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -69,6 +70,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -90,6 +92,7 @@ jobs:
   unit-test:
     name: Unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -98,7 +101,7 @@ jobs:
           cache: true
 
       - name: go test -race
-        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
+        run: go test -race -coverpkg=./... -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out | tail -20
@@ -113,6 +116,7 @@ jobs:
   integration-test:
     name: Integration tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [lint, secret-scan, build, unit-test]
     services:
       postgres:
@@ -153,7 +157,7 @@ jobs:
       - name: go test -tags integration
         run: |
           set -o pipefail
-          go test -tags integration -v ./... 2>&1 | tee /tmp/integration.log
+          go test -race -tags integration -v ./... 2>&1 | tee /tmp/integration.log
 
       - name: Fail if the suite silently skipped
         run: |
@@ -172,6 +176,7 @@ jobs:
   performance-test:
     name: Performance budgets
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     needs: [lint, secret-scan, build, unit-test]
     env:
       PERF_SCALE: ${{ vars.PERF_SCALE || '2.5' }}
@@ -206,6 +211,7 @@ jobs:
   secret-scan:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
         with:
@@ -224,6 +230,7 @@ jobs:
   sast:
     name: SAST (gosec + govulncheck)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [lint, secret-scan, build, unit-test]
     steps:
       - uses: actions/checkout@v5
@@ -245,26 +252,54 @@ jobs:
   trivy-scan:
     name: Trivy scans (deps, config, images)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [integration-test, performance-test, sast]
     steps:
       - uses: actions/checkout@v5
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build service images
-        run: |
-          set -o pipefail
-          for svc in api jobs relay; do
-            echo "::group::build $svc"
-            docker buildx build \
-              --load \
-              --build-arg SERVICE="$svc" \
-              --build-arg VERSION="${{ github.ref_name }}" \
-              --build-arg COMMIT="${{ github.sha }}" \
-              -t "payment-service/${svc}:${{ github.sha }}" \
-              .
-            echo "::endgroup::"
-          done
+      - name: Build api image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: payment-service/api:${{ github.sha }}
+          build-args: |
+            SERVICE=api
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build jobs image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: payment-service/jobs:${{ github.sha }}
+          build-args: |
+            SERVICE=jobs
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=jobs
+          cache-to: type=gha,mode=max,scope=jobs
+
+      - name: Build relay image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: payment-service/relay:${{ github.sha }}
+          build-args: |
+            SERVICE=relay
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=relay
+          cache-to: type=gha,mode=max,scope=relay
 
       - name: Verify images run as nonroot
         run: |
@@ -276,6 +311,18 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Trivy DB cache key
+        id: trivy-cache-key
+        run: echo "day=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache trivy vulnerability DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ steps.trivy-cache-key.outputs.day }}
+          restore-keys: |
+            trivy-db-
 
       - name: Install trivy
         run: |
@@ -318,6 +365,7 @@ jobs:
   ci-passed:
     name: CI passed
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     if: always()
     needs:
       - lint
