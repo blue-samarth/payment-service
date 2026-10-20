@@ -171,7 +171,8 @@ internal/
   ports/           All interfaces + shared types (GatewayAdapter, Logger, ...)
   testsupport/     Shared Postgres/Redis test harness
 test/
-  integration/     End-to-end tests exercising real Postgres/Redis
+  integration/     Integration tests against real Postgres/Redis (integration build tag)
+  e2e/             Reserved for end-to-end tests of the running binary (empty)
   unit/            Black-box unit tests, mirroring the source tree
   performance/     Latency and allocation budgets (performance build tag)
 migrations/        Numbered up/down SQL migrations
@@ -744,10 +745,10 @@ All tests use hand-written fakes for every port (`fakeRepo`, `fakeOutbox`,
 
 | Location | Count | Package style |
 |---|---|---|
-| `test/unit/`, mirroring the source tree | 20 files | Black-box (`package foo_test`), exported API only |
-| Beside the code they test | 28 files | White-box (`package foo`), reaches unexported identifiers |
+| `test/unit/`, mirroring the source tree | 19 files | Black-box (`package foo_test`), exported API only |
+| Beside the code they test | 25 files | White-box (`package foo`), reaches unexported identifiers |
 
-A test can only move out of its package if it uses nothing unexported. The 28 that stay
+A test can only move out of its package if it uses nothing unexported. The 25 that stay
 exercise internals — `reverseHash`, `deriveTxnID`, `weekStart`, `replicaSets`,
 `classifyError`, and private struct fields like `mgr.cert` and `w.backoff`. Go's usual
 escape hatch, `export_test.go`, is compiled only into its own package's test binary, so
@@ -757,16 +758,19 @@ internals purely for tests.
 Both run under a plain `go test ./...` — neither is build-tagged.
 
 **Integration tests** are gated behind the `integration` build tag and need the
-Postgres/Redis containers above. They live in three places:
+Postgres/Redis containers above. All of them live under `test/integration/`, with the
+adapter tests mirroring the source tree as `test/unit/` does:
 
 | Path | Covers |
 |---|---|
-| `test/integration/` | End-to-end flows across the whole stack |
-| `test/unit/internal/adapters/postgres/` | Postgres repository behaviour |
-| `internal/adapters/redis/` | Redis Lua scripts and circuit-breaker store |
+| `test/integration/` | Service flows across the whole stack, called in-process |
+| `test/integration/internal/adapters/postgres/` | Postgres repositories, outbox and partitions |
+| `test/integration/internal/adapters/redis/` | Redis client, Lua scripts, circuit-breaker and intent stores |
 
-The Postgres files sit under `test/unit/` because they move cleanly as black-box tests;
-the build tag, not the directory, is what gates them.
+Every integration test is black-box, so none needs to sit beside the code. Each directory
+is its own package and test binary, which keeps the per-process Postgres schema isolation
+working when the packages run in parallel. `test/e2e/` is reserved for end-to-end tests
+that drive the running `cmd/api` binary over HTTP against gateway sandboxes.
 
 They exercise real concurrency (goroutine races against actual row locks, actual Redis
 Lua scripts) for things a fake can't prove, e.g.:
