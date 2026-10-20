@@ -128,7 +128,9 @@ func TestWebhookRouter_ServesWebhooksOnly(t *testing.T) {
 
 func TestHealthRouter_ServesHealthOnly(t *testing.T) {
 	txn, _ := transaction.New(uuid.New(), 1000, "INR", transaction.PaymentMethodCard, "stripe", uuid.New(), "", "", nil, 30)
-	srv := httptest.NewServer(NewHealthRouter(testDeps(txn)))
+	deps := testDeps(txn)
+	deps.Health.SetReady()
+	srv := httptest.NewServer(NewHealthRouter(deps))
 	defer srv.Close()
 
 	for _, path := range []string{"/health", "/health-db", "/health-cache", "/health-overall", "/health-gateways"} {

@@ -93,6 +93,7 @@ func TestOverall(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := NewHealthHandler(&fakePinger{err: tc.dbErr}, &fakePinger{err: tc.cacheErr}, nil, noopLog{})
+			h.SetReady()
 			code, body := serveHealth(t, h.Overall)
 			if code != tc.wantCode || body["status"] != tc.wantStatus {
 				t.Fatalf("got %d %v, want %d %s", code, body["status"], tc.wantCode, tc.wantStatus)
@@ -100,6 +101,77 @@ func TestOverall(t *testing.T) {
 			components, _ := body["components"].(map[string]any)
 			if components["app"] != "healthy" || components["database"] != tc.wantDatabase || components["cache"] != tc.wantCacheComp {
 				t.Errorf("unexpected components: %v", components)
+			}
+		})
+	}
+}
+
+type fakeCert struct {
+	name     string
+	notAfter time.Time
+}
+
+func (c fakeCert) Name() string        { return c.name }
+func (c fakeCert) NotAfter() time.Time { return c.notAfter }
+
+func TestOverall_NotReadyUntilListenersServe(t *testing.T) {
+	h := NewHealthHandler(&fakePinger{}, &fakePinger{}, nil, noopLog{})
+
+	code, body := serveHealth(t, h.Overall)
+	components, _ := body["components"].(map[string]any)
+	if code != http.StatusServiceUnavailable || components["app"] != "starting" {
+		t.Fatalf("readiness must fail before the listeners are serving, got %d %v", code, body)
+	}
+
+	h.SetReady()
+	if code, _ := serveHealth(t, h.Overall); code != http.StatusOK {
+		t.Fatalf("readiness must pass once ready, got %d", code)
+	}
+}
+
+func TestOverall_DrainingFailsReadinessButNotLiveness(t *testing.T) {
+	h := NewHealthHandler(&fakePinger{}, &fakePinger{}, nil, noopLog{})
+	h.SetReady()
+	h.SetDraining()
+
+	code, body := serveHealth(t, h.Overall)
+	components, _ := body["components"].(map[string]any)
+	if code != http.StatusServiceUnavailable || components["app"] != "draining" {
+		t.Fatalf("a draining instance must leave the load balancer, got %d %v", code, body)
+	}
+	if code, _ := serveHealth(t, h.Liveness); code != http.StatusOK {
+		t.Fatalf("draining must not fail liveness, or the orchestrator restarts a pod that is shutting down cleanly, got %d", code)
+	}
+}
+
+func TestOverall_Certificates(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name       string
+		notAfter   time.Time
+		wantCode   int
+		wantStatus string
+		wantCert   string
+	}{
+		{"valid", now.Add(90 * 24 * time.Hour), http.StatusOK, "healthy", "healthy"},
+		{"inside the renewal window", now.Add(48 * time.Hour), http.StatusOK, "healthy", "expiring"},
+		{"expired while running", now.Add(-time.Minute), http.StatusServiceUnavailable, "unhealthy", "expired"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := NewHealthHandler(&fakePinger{}, &fakePinger{}, nil, noopLog{},
+				fakeCert{name: "merchant", notAfter: now.Add(90 * 24 * time.Hour)},
+				fakeCert{name: "webhook", notAfter: tc.notAfter},
+			)
+			h.SetReady()
+
+			code, body := serveHealth(t, h.Overall)
+			components, _ := body["components"].(map[string]any)
+			if code != tc.wantCode || body["status"] != tc.wantStatus {
+				t.Fatalf("got %d %v, want %d %s", code, body["status"], tc.wantCode, tc.wantStatus)
+			}
+			if components["tls_webhook"] != tc.wantCert || components["tls_merchant"] != "healthy" {
+				t.Errorf("unexpected certificate components: %v", components)
 			}
 		})
 	}

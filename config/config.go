@@ -4,10 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func requireEnv(key string, errs *[]string) string {
@@ -98,6 +101,14 @@ type AppConfig struct {
 	WebhookTLSMode string
 	MtlsStrictMode bool
 	AllowNoAuth    bool
+
+	ShutdownDrainDelay time.Duration
+	ShutdownTimeout    time.Duration
+}
+type AuthConfig struct {
+	ServiceTokens  map[string]string
+	OpsTokens      []string
+	WebhookSecrets map[string]string
 }
 type StartupConfig struct {
 	ConnectMaxAttempts    int
@@ -161,6 +172,9 @@ type OutboxConfig struct {
 	WorkerCount                 int
 }
 type RateLimitConfig struct {
+	Capacity            int64
+	RefillPerSec        float64
+	TrustedProxies      []netip.Prefix
 	FallbackMultiplier  float64
 	LocalMaxBuckets     int
 	HealthCheckInterval time.Duration
@@ -195,8 +209,9 @@ type SecurityConfig struct {
 	DEKRotationBatchSleepMs int
 }
 type GatewayConfig struct {
-	HTTPTimeout time.Duration
-	MaxAttempts int
+	HTTPTimeout                    time.Duration
+	MaxAttempts                    int
+	CircuitBreakerFailureThreshold int
 }
 type JobsConfig struct {
 	LockRetryIntervalSec            int
@@ -216,6 +231,7 @@ type DataRetentionConfig struct {
 }
 type Config struct {
 	App            AppConfig
+	Auth           AuthConfig
 	Startup        StartupConfig
 	Database       DatabaseConfig
 	Redis          RedisConfig
@@ -245,6 +261,12 @@ func LoadConfig() (*Config, error) {
 	c.App.WebhookTLSMode = getEnvDefault("WEBHOOK_TLS_MODE", WebhookTLSModeApp)
 	c.App.MtlsStrictMode = getEnvBool("MTLS_STRICT_MODE", true, &errs)
 	c.App.AllowNoAuth = getEnvBool("ALLOW_NO_AUTH", false, &errs)
+	c.App.ShutdownDrainDelay = getEnvDuration("SHUTDOWN_DRAIN_DELAY", 5*time.Second, &errs)
+	c.App.ShutdownTimeout = getEnvDuration("SHUTDOWN_TIMEOUT", 15*time.Second, &errs)
+
+	c.Auth.ServiceTokens = parseServiceTokens(os.Getenv("SERVICE_TOKENS"), &errs)
+	c.Auth.OpsTokens = splitList(os.Getenv("OPS_TOKENS"))
+	c.Auth.WebhookSecrets = parseWebhookSecrets(os.Getenv("WEBHOOK_SECRETS"), &errs)
 
 	c.Startup.ConnectMaxAttempts = getEnvInt("STARTUP_CONNECT_MAX_ATTEMPTS", 5, &errs)
 	c.Startup.ConnectAttemptTimeout = getEnvDuration("STARTUP_CONNECT_ATTEMPT_TIMEOUT", 15*time.Second, &errs)
@@ -323,6 +345,9 @@ func LoadConfig() (*Config, error) {
 	c.RateLimit.FallbackMultiplier = getEnvFloat64("RATE_LIMIT_FALLBACK_MULTIPLIER", 0.5, &errs)
 	c.RateLimit.LocalMaxBuckets = getEnvInt("RATE_LIMIT_LOCAL_MAX_BUCKETS", 10000, &errs)
 	c.RateLimit.HealthCheckInterval = time.Duration(healthCheckMs) * time.Millisecond
+	c.RateLimit.Capacity = getEnvInt64("RATE_LIMIT_CAPACITY", 100, &errs)
+	c.RateLimit.RefillPerSec = getEnvFloat64("RATE_LIMIT_REFILL_PER_SEC", 50, &errs)
+	c.RateLimit.TrustedProxies = parseTrustedProxies(os.Getenv("TRUSTED_PROXY_CIDRS"), &errs)
 
 	c.Routing.SnapshotTTLSeconds = getEnvInt("ROUTING_SNAPSHOT_TTL_SECONDS", 30, &errs)
 	c.Routing.FeeCacheTTLSec = getEnvInt("GATEWAY_FEE_CACHE_TTL_SEC", 3600, &errs)
@@ -330,6 +355,7 @@ func LoadConfig() (*Config, error) {
 
 	c.Gateway.HTTPTimeout = getEnvDuration("GATEWAY_HTTP_TIMEOUT", 30*time.Second, &errs)
 	c.Gateway.MaxAttempts = getEnvInt("GATEWAY_MAX_ATTEMPTS", 3, &errs)
+	c.Gateway.CircuitBreakerFailureThreshold = getEnvInt("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 5, &errs)
 
 	c.Reconciliation.RunIntervalHours = getEnvInt("RECONCILIATION_RUN_INTERVAL_HOURS", 6, &errs)
 	c.Reconciliation.ReportFetchTimeoutSeconds = getEnvInt("RECONCILIATION_REPORT_FETCH_TIMEOUT_SECONDS", 120, &errs)
@@ -471,6 +497,21 @@ func Validate(c *Config) error {
 	if c.RateLimit.FallbackMultiplier <= 0 || c.RateLimit.FallbackMultiplier > 1 {
 		errs = append(errs, "RATE_LIMIT_FALLBACK_MULTIPLIER must be in (0, 1]")
 	}
+	if c.RateLimit.Capacity < 1 {
+		errs = append(errs, "RATE_LIMIT_CAPACITY must be at least 1")
+	}
+	if c.RateLimit.RefillPerSec <= 0 {
+		errs = append(errs, "RATE_LIMIT_REFILL_PER_SEC must be greater than 0")
+	}
+	if c.Gateway.CircuitBreakerFailureThreshold < 1 {
+		errs = append(errs, "CIRCUIT_BREAKER_FAILURE_THRESHOLD must be at least 1")
+	}
+	if c.App.ShutdownDrainDelay < 0 {
+		errs = append(errs, "SHUTDOWN_DRAIN_DELAY must not be negative")
+	}
+	if c.App.ShutdownTimeout <= 0 {
+		errs = append(errs, "SHUTDOWN_TIMEOUT must be greater than 0")
+	}
 
 	if c.Routing.FXReconciliationTolerancePct < 0 || c.Routing.FXReconciliationTolerancePct > 100 {
 		errs = append(errs, "FX_RECONCILIATION_TOLERANCE_PCT must be between 0 and 100")
@@ -489,6 +530,73 @@ func validHostPort(addr string) bool {
 	}
 	n, err := strconv.ParseUint(port, 10, 16)
 	return err == nil && n > 0
+}
+
+func splitList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func parseServiceTokens(raw string, errs *[]string) map[string]string {
+	out := map[string]string{}
+	for i, entry := range splitList(raw) {
+		sep := strings.LastIndex(entry, "=")
+		if sep <= 0 || sep == len(entry)-1 {
+			*errs = append(*errs, fmt.Sprintf("SERVICE_TOKENS entry %d must be token=merchantID", i+1))
+			continue
+		}
+		token, merchant := entry[:sep], entry[sep+1:]
+		if _, err := uuid.Parse(merchant); err != nil {
+			*errs = append(*errs, fmt.Sprintf("SERVICE_TOKENS entry %d: merchant ID must be a UUID", i+1))
+			continue
+		}
+		if _, dup := out[token]; dup {
+			*errs = append(*errs, fmt.Sprintf("SERVICE_TOKENS entry %d repeats an earlier token", i+1))
+			continue
+		}
+		out[token] = merchant
+	}
+	return out
+}
+
+func parseWebhookSecrets(raw string, errs *[]string) map[string]string {
+	out := map[string]string{}
+	for i, entry := range splitList(raw) {
+		sep := strings.Index(entry, "=")
+		if sep <= 0 || sep == len(entry)-1 {
+			*errs = append(*errs, fmt.Sprintf("WEBHOOK_SECRETS entry %d must be gatewayID=secret", i+1))
+			continue
+		}
+		gatewayID := entry[:sep]
+		if _, dup := out[gatewayID]; dup {
+			*errs = append(*errs, fmt.Sprintf("WEBHOOK_SECRETS entry %d repeats gateway %q", i+1, gatewayID))
+			continue
+		}
+		out[gatewayID] = entry[sep+1:]
+	}
+	return out
+}
+
+func parseTrustedProxies(raw string, errs *[]string) []netip.Prefix {
+	var out []netip.Prefix
+	for i, entry := range splitList(raw) {
+		p, err := netip.ParsePrefix(entry)
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("TRUSTED_PROXY_CIDRS entry %d must be a CIDR such as 10.1.0.0/16", i+1))
+			continue
+		}
+		out = append(out, p.Masked())
+	}
+	return out
 }
 
 func quoteDSNValue(v string) string {

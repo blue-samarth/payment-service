@@ -2,13 +2,11 @@ package main
 
 import (
 	"context"
-	"errors"
+	"crypto/tls"
 	"fmt"
-	"net/http"
+	"net"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -28,7 +26,7 @@ import (
 	approuting "samarth/payment-service/internal/app/routing"
 	"samarth/payment-service/internal/app/webhook"
 	"samarth/payment-service/internal/bootstrap"
-	"samarth/payment-service/internal/ports"
+	"samarth/payment-service/internal/server"
 )
 
 func main() {
@@ -107,7 +105,7 @@ func run() error {
 
 	webhookRepo := postgres.NewWebhookRepository(db, queries)
 	webhookSvc := webhook.NewService(txnRepo, webhookRepo, outboxWriter, transactor, logger, metrics)
-	webhookSecrets := webhook.NewStaticSecretProvider(parseKeyValues(os.Getenv("WEBHOOK_SECRETS")))
+	webhookSecrets := webhook.NewStaticSecretProvider(cfg.Auth.WebhookSecrets)
 
 	if !cfg.Redis.TLSEnabled {
 		logger.Warn("redis.tls_disabled", map[string]any{
@@ -134,7 +132,7 @@ func run() error {
 	cbStore := redis.NewCircuitBreakerStore(redisClient)
 	paymentSvc.SetCircuitBreaker(circuitBreakerAdapter{
 		store:     cbStore,
-		threshold: int(getEnvInt64("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 5)),
+		threshold: cfg.Gateway.CircuitBreakerFailureThreshold,
 	})
 	router.SetBreakerState(breakerStateAdapter{store: cbStore})
 	paymentSvc.SetMaxGatewayAttempts(cfg.Gateway.MaxAttempts)
@@ -144,10 +142,7 @@ func run() error {
 	paymentSvc.SetIntentTracker(intentStore)
 
 	var authProvider middleware.TokenProvider
-	tokenProvider := middleware.NewStaticTokenProvider(
-		parseKeyValues(os.Getenv("SERVICE_TOKENS")),
-		splitEnv("OPS_TOKENS"),
-	)
+	tokenProvider := middleware.NewStaticTokenProvider(cfg.Auth.ServiceTokens, cfg.Auth.OpsTokens)
 	if tokenProvider.HasAny() {
 		authProvider = tokenProvider
 		logger.Info("auth.enabled", nil)
@@ -159,32 +154,13 @@ func run() error {
 		return fmt.Errorf("no auth tokens configured: set SERVICE_TOKENS or OPS_TOKENS, or set ALLOW_NO_AUTH=true to explicitly run without authentication")
 	}
 
-	deps := api.Deps{
-		Payment: handlers.NewPaymentHandler(paymentSvc),
-		Refund:  handlers.NewRefundHandler(refundSvc),
-		Cancel:  handlers.NewCancelHandler(cancelSvc),
-		Webhook: handlers.NewWebhookHandler(webhookSvc, registry, webhookSecrets, configStore, logger),
-		Health: handlers.NewHealthHandler(
-			db,
-			redisClient,
-			gatewaystatus.NewService(registry, configStore, router, cbStore, logger),
-			logger,
-		),
-		Logger:  logger,
-		Auth:    authProvider,
-		Limiter: limiterAdapter{rl: rateLimiter},
-		RateLimit: middleware.RateLimitConfig{
-			Capacity:     getEnvInt64("RATE_LIMIT_CAPACITY", 100),
-			RefillPerSec: getEnvFloat("RATE_LIMIT_REFILL_PER_SEC", 50),
-		},
-	}
-
 	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
 	defer cancelRefresh()
 	refreshInterval := time.Duration(cfg.Security.CertRefreshIntervalSec) * time.Second
 
+	var certs []handlers.CertificateChecker
 	merchantTransport := "plain"
-	var merchantTLS *security.Manager
+	var merchantTLS *tls.Config
 	if cfg.Security.TLSCertFile != "" {
 		merchantTransport = "mtls"
 		if !cfg.App.MtlsStrictMode {
@@ -193,7 +169,7 @@ func run() error {
 				"warning": "MTLS_STRICT_MODE=false: client certificates are requested but not enforced",
 			})
 		}
-		merchantTLS, err = security.NewManager(security.Config{
+		mgr, err := security.NewManager(security.Config{
 			Name:            "merchant",
 			CertFile:        cfg.Security.TLSCertFile,
 			KeyFile:         cfg.Security.TLSKeyFile,
@@ -204,14 +180,16 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("configure merchant mTLS: %w", err)
 		}
-		merchantTLS.StartRefresh(refreshCtx)
+		mgr.StartRefresh(refreshCtx)
+		merchantTLS = mgr.TLSConfig()
+		certs = append(certs, mgr)
 	}
 
 	webhookTransport := "plain_lb_terminated"
-	var webhookTLS *security.Manager
+	var webhookTLS *tls.Config
 	if cfg.App.WebhookTLSMode == config.WebhookTLSModeApp {
 		webhookTransport = "tls"
-		webhookTLS, err = security.NewManager(security.Config{
+		mgr, err := security.NewManager(security.Config{
 			Name:            "webhook",
 			CertFile:        cfg.Security.WebhookTLSCertFile,
 			KeyFile:         cfg.Security.WebhookTLSKeyFile,
@@ -220,80 +198,90 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("configure webhook TLS: %w", err)
 		}
-		webhookTLS.StartRefresh(refreshCtx)
+		mgr.StartRefresh(refreshCtx)
+		webhookTLS = mgr.TLSConfig()
+		certs = append(certs, mgr)
 	} else {
 		logger.Warn("webhook.tls_terminated_upstream", map[string]any{
 			"warning": "WEBHOOK_TLS_MODE=lb: the webhook listener serves plain HTTP and relies on the load balancer to terminate TLS",
 		})
 	}
 
-	return serve(logger, []listener{
-		{name: "merchant", port: cfg.App.Port, handler: api.NewMerchantRouter(deps), tls: merchantTLS, transport: merchantTransport},
-		{name: "webhook", port: cfg.App.WebhookPort, handler: api.NewWebhookRouter(deps), tls: webhookTLS, transport: webhookTransport},
-		{name: "health", port: cfg.App.HealthPort, handler: api.NewHealthRouter(deps), transport: "plain"},
+	health := handlers.NewHealthHandler(
+		db,
+		redisClient,
+		gatewaystatus.NewService(registry, configStore, router, cbStore, logger),
+		logger,
+		certs...,
+	)
+	deps := api.Deps{
+		Payment: handlers.NewPaymentHandler(paymentSvc),
+		Refund:  handlers.NewRefundHandler(refundSvc),
+		Cancel:  handlers.NewCancelHandler(cancelSvc),
+		Webhook: handlers.NewWebhookHandler(webhookSvc, registry, webhookSecrets, configStore, logger),
+		Health:  health,
+		Logger:  logger,
+		Auth:    authProvider,
+		Limiter: limiterAdapter{rl: rateLimiter},
+		RateLimit: middleware.RateLimitConfig{
+			Capacity:     cfg.RateLimit.Capacity,
+			RefillPerSec: cfg.RateLimit.RefillPerSec,
+		},
+		ClientIP: middleware.NewClientIP(cfg.RateLimit.TrustedProxies),
+	}
+
+	gatewayBudget := time.Duration(cfg.Gateway.MaxAttempts) * cfg.Gateway.HTTPTimeout
+
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	return server.Run(sigCtx, []server.Listener{
+		{
+			Name:      "merchant",
+			Addr:      fmt.Sprintf(":%d", cfg.App.Port),
+			Handler:   api.NewMerchantRouter(deps),
+			TLS:       merchantTLS,
+			Transport: merchantTransport,
+			Timeouts: server.Timeouts{
+				ReadHeader: 10 * time.Second,
+				Read:       30 * time.Second,
+				Write:      gatewayBudget + 30*time.Second,
+				Idle:       120 * time.Second,
+			},
+		},
+		{
+			Name:      "webhook",
+			Addr:      fmt.Sprintf(":%d", cfg.App.WebhookPort),
+			Handler:   api.NewWebhookRouter(deps),
+			TLS:       webhookTLS,
+			Transport: webhookTransport,
+			Timeouts: server.Timeouts{
+				ReadHeader: 10 * time.Second,
+				Read:       15 * time.Second,
+				Write:      30 * time.Second,
+				Idle:       60 * time.Second,
+			},
+		},
+		{
+			Name:      "health",
+			Addr:      fmt.Sprintf(":%d", cfg.App.HealthPort),
+			Handler:   api.NewHealthRouter(deps),
+			Transport: "plain",
+			Timeouts: server.Timeouts{
+				ReadHeader: 5 * time.Second,
+				Read:       5 * time.Second,
+				Write:      10 * time.Second,
+				Idle:       30 * time.Second,
+			},
+			DrainLast: true,
+		},
+	}, server.Options{
+		DrainDelay:      cfg.App.ShutdownDrainDelay,
+		ShutdownTimeout: cfg.App.ShutdownTimeout,
+		OnReady:         func(map[string]net.Addr) { health.SetReady() },
+		OnDraining:      health.SetDraining,
+		Logger:          logger,
 	})
-}
-
-type listener struct {
-	name      string
-	port      int
-	handler   http.Handler
-	tls       *security.Manager
-	transport string
-}
-
-func serve(logger ports.Logger, listeners []listener) error {
-	servers := make([]*http.Server, len(listeners))
-	serverErr := make(chan error, len(listeners))
-
-	for i, l := range listeners {
-		srv := &http.Server{
-			Addr:              fmt.Sprintf(":%d", l.port),
-			Handler:           l.handler,
-			ReadHeaderTimeout: 10 * time.Second,
-		}
-		if l.tls != nil {
-			srv.TLSConfig = l.tls.TLSConfig()
-		}
-		servers[i] = srv
-
-		go func() {
-			logger.Info("http.server_starting", map[string]any{
-				"listener":  l.name,
-				"port":      l.port,
-				"transport": l.transport,
-			})
-			var err error
-			if l.tls != nil {
-				err = srv.ListenAndServeTLS("", "")
-			} else {
-				err = srv.ListenAndServe()
-			}
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				serverErr <- fmt.Errorf("%s listener: %w", l.name, err)
-			}
-		}()
-	}
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(stop)
-
-	var runErr error
-	select {
-	case runErr = <-serverErr:
-	case <-stop:
-	}
-
-	logger.Info("http.server_stopping", nil)
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	for _, srv := range servers {
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			runErr = errors.Join(runErr, err)
-		}
-	}
-	return runErr
 }
 
 type circuitBreakerAdapter struct {
@@ -322,51 +310,4 @@ func (a breakerStateAdapter) BreakerState(ctx context.Context, gatewayID string)
 func (a limiterAdapter) Allow(ctx context.Context, userID, merchantID, ip string, capacity int64, ratePerSec float64) middleware.RateDecision {
 	res := a.rl.Allow(ctx, userID, merchantID, ip, capacity, ratePerSec)
 	return middleware.RateDecision{Allowed: res.Allowed, RetryAfter: res.RetryAfter}
-}
-
-func getEnvInt64(key string, def int64) int64 {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			return n
-		}
-	}
-	return def
-}
-
-func parseKeyValues(raw string) map[string]string {
-	out := map[string]string{}
-	if raw == "" {
-		return out
-	}
-	for _, pair := range strings.Split(raw, ",") {
-		kv := strings.SplitN(strings.TrimSpace(pair), "=", 2)
-		if len(kv) == 2 && kv[0] != "" {
-			out[kv[0]] = kv[1]
-		}
-	}
-	return out
-}
-
-func splitEnv(key string) []string {
-	v := os.Getenv(key)
-	if v == "" {
-		return nil
-	}
-	parts := strings.Split(v, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if t := strings.TrimSpace(p); t != "" {
-			out = append(out, t)
-		}
-	}
-	return out
-}
-
-func getEnvFloat(key string, def float64) float64 {
-	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
-	}
-	return def
 }

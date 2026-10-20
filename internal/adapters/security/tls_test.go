@@ -465,11 +465,15 @@ func TestManager_Reload_ExpiredKeepsLastGoodAndCountsMetric(t *testing.T) {
 	writeFile(t, mgr.cfg.CertFile, expiredCert)
 	writeFile(t, mgr.cfg.KeyFile, expiredKey)
 
+	goodNotAfter := mgr.NotAfter()
 	if err := mgr.reload(); err == nil {
 		t.Fatal("reload must reject an expired certificate")
 	}
 	if string(mgr.cert.Certificate[0]) != string(goodLeaf) {
 		t.Error("a failed reload must keep the last-known-good certificate serving")
+	}
+	if !mgr.NotAfter().Equal(goodNotAfter) {
+		t.Error("NotAfter must describe the certificate being served, not the rejected one")
 	}
 
 	// The background refresh path increments the failure counter.
@@ -538,5 +542,27 @@ func TestManager_NameTagsExpiryGauge(t *testing.T) {
 	}
 	if got := rec.tags[ports.MetricTLSCertExpirySeconds]["listener"]; got != "webhook" {
 		t.Errorf("expiry gauge must carry listener=webhook, got tags %v", rec.tags[ports.MetricTLSCertExpirySeconds])
+	}
+}
+
+func TestManager_ExposesNameAndNotAfter(t *testing.T) {
+	ca := newCA(t)
+	notAfter := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+	certPEM, keyPEM := issueExpiring(t, ca, time.Now().Add(-time.Hour), notAfter)
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "server.crt")
+	keyFile := filepath.Join(dir, "server.key")
+	writeFile(t, certFile, certPEM)
+	writeFile(t, keyFile, keyPEM)
+
+	mgr, err := NewManager(Config{Name: "merchant", CertFile: certFile, KeyFile: keyFile}, noopLogger{}, noopMetrics{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mgr.Name() != "merchant" {
+		t.Errorf("Name() = %q", mgr.Name())
+	}
+	if !mgr.NotAfter().Equal(notAfter) {
+		t.Errorf("NotAfter() = %v, want %v", mgr.NotAfter(), notAfter)
 	}
 }

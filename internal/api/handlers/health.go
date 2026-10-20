@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"samarth/payment-service/internal/app/gatewaystatus"
@@ -11,10 +12,16 @@ import (
 
 const healthCheckTimeout = 3 * time.Second
 
+const certExpiringWindow = 14 * 24 * time.Hour
+
 const (
 	statusHealthy   = "healthy"
 	statusUnhealthy = "unhealthy"
 	statusDegraded  = "degraded"
+	statusStarting  = "starting"
+	statusDraining  = "draining"
+	statusExpiring  = "expiring"
+	statusExpired   = "expired"
 )
 
 type Pinger interface {
@@ -25,15 +32,32 @@ type GatewayStatusReader interface {
 	Statuses(ctx context.Context) []gatewaystatus.Status
 }
 
+type CertificateChecker interface {
+	Name() string
+	NotAfter() time.Time
+}
+
 type HealthHandler struct {
 	db       Pinger
 	cache    Pinger
 	gateways GatewayStatusReader
+	certs    []CertificateChecker
 	log      ports.Logger
+
+	ready    atomic.Bool
+	draining atomic.Bool
 }
 
-func NewHealthHandler(db, cache Pinger, gateways GatewayStatusReader, log ports.Logger) *HealthHandler {
-	return &HealthHandler{db: db, cache: cache, gateways: gateways, log: log}
+func NewHealthHandler(db, cache Pinger, gateways GatewayStatusReader, log ports.Logger, certs ...CertificateChecker) *HealthHandler {
+	return &HealthHandler{db: db, cache: cache, gateways: gateways, certs: certs, log: log}
+}
+
+func (h *HealthHandler) SetReady() {
+	h.ready.Store(true)
+}
+
+func (h *HealthHandler) SetDraining() {
+	h.draining.Store(true)
 }
 
 type componentResponse struct {
@@ -74,6 +98,30 @@ func (h *HealthHandler) Cache(w http.ResponseWriter, r *http.Request) {
 func (h *HealthHandler) Overall(w http.ResponseWriter, r *http.Request) {
 	components := map[string]string{"app": statusHealthy}
 	status, code := statusHealthy, http.StatusOK
+
+	switch {
+	case h.draining.Load():
+		components["app"] = statusDraining
+		status, code = statusUnhealthy, http.StatusServiceUnavailable
+	case !h.ready.Load():
+		components["app"] = statusStarting
+		status, code = statusUnhealthy, http.StatusServiceUnavailable
+	}
+
+	now := time.Now()
+	for _, c := range h.certs {
+		key := "tls_" + c.Name()
+		remaining := c.NotAfter().Sub(now)
+		switch {
+		case remaining <= 0:
+			components[key] = statusExpired
+			status, code = statusUnhealthy, http.StatusServiceUnavailable
+		case remaining < certExpiringWindow:
+			components[key] = statusExpiring
+		default:
+			components[key] = statusHealthy
+		}
+	}
 
 	if h.check(r.Context(), "database", h.db) {
 		components["database"] = statusHealthy

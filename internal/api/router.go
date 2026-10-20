@@ -18,6 +18,7 @@ type Deps struct {
 	Auth          middleware.TokenProvider
 	Limiter       middleware.Limiter
 	RateLimit     middleware.RateLimitConfig
+	ClientIP      *middleware.ClientIP
 	ResponseCache middleware.ResponseCacheStore
 }
 
@@ -36,7 +37,7 @@ func NewMerchantRouter(deps Deps) http.Handler {
 		chain = append(chain, middleware.Authenticate(deps.Auth, deps.Logger))
 	}
 	if deps.Limiter != nil {
-		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.RateLimit, deps.Logger))
+		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.RateLimit, deps.Logger, middleware.RequestKeys(deps.ClientIP)))
 	}
 	if deps.ResponseCache != nil {
 		chain = append(chain, middleware.ResponseCache(deps.ResponseCache, deps.Logger))
@@ -55,7 +56,7 @@ func NewWebhookRouter(deps Deps) http.Handler {
 		middleware.Recover(deps.Logger),
 	}
 	if deps.Limiter != nil {
-		chain = append(chain, middleware.RateLimitWithKeys(deps.Limiter, deps.RateLimit, deps.Logger, middleware.WebhookKeys))
+		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.RateLimit, deps.Logger, middleware.WebhookKeys(deps.ClientIP)))
 	}
 	return middleware.Chain(mux, chain...)
 }

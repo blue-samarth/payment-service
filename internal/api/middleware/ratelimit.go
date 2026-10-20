@@ -2,10 +2,8 @@ package middleware
 
 import (
 	"context"
-	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"samarth/payment-service/internal/ports"
@@ -27,20 +25,20 @@ type RateLimitConfig struct {
 
 type RateLimitKeys func(r *http.Request) (userID, merchantID, ip string)
 
-func RateLimit(limiter Limiter, cfg RateLimitConfig, log ports.Logger) func(http.Handler) http.Handler {
-	return RateLimitWithKeys(limiter, cfg, log, RequestKeys)
+func RequestKeys(clientIP *ClientIP) RateLimitKeys {
+	return func(r *http.Request) (string, string, string) {
+		return r.Header.Get("X-User-ID"), merchantBucketID(r.Context()), clientIP.From(r)
+	}
 }
 
-func RequestKeys(r *http.Request) (userID, merchantID, ip string) {
-	return r.Header.Get("X-User-ID"), merchantBucketID(r.Context()), clientIP(r)
+func WebhookKeys(clientIP *ClientIP) RateLimitKeys {
+	return func(r *http.Request) (string, string, string) {
+		ip := clientIP.From(r)
+		return "webhook:" + ip, "webhook:" + ip, ip
+	}
 }
 
-func WebhookKeys(r *http.Request) (userID, merchantID, ip string) {
-	ip = clientIP(r)
-	return "webhook:" + ip, "webhook:" + ip, ip
-}
-
-func RateLimitWithKeys(limiter Limiter, cfg RateLimitConfig, log ports.Logger, keys RateLimitKeys) func(http.Handler) http.Handler {
+func RateLimit(limiter Limiter, cfg RateLimitConfig, log ports.Logger, keys RateLimitKeys) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			userID, merchantID, ip := keys(r)
@@ -75,15 +73,4 @@ func merchantBucketID(ctx context.Context) string {
 		return "principal:" + string(p.Role)
 	}
 	return ""
-}
-
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.TrimSpace(strings.SplitN(fwd, ",", 2)[0])
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

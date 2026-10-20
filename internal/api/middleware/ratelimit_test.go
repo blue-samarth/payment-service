@@ -39,9 +39,11 @@ func okHandler() http.Handler {
 	})
 }
 
+var testCfg = RateLimitConfig{Capacity: 10, RefillPerSec: 5}
+
 func TestRateLimit_Allows(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	h := RateLimit(lim, RateLimitConfig{Capacity: 10, RefillPerSec: 5}, noopLog{})(okHandler())
+	h := RateLimit(lim, testCfg, noopLog{}, RequestKeys(nil))(okHandler())
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
@@ -58,7 +60,7 @@ func TestRateLimit_Allows(t *testing.T) {
 
 func TestRateLimit_Rejects429(t *testing.T) {
 	lim := &fakeLimiter{allow: false, retryAfter: 2 * time.Second}
-	h := RateLimit(lim, RateLimitConfig{Capacity: 10, RefillPerSec: 5}, noopLog{})(okHandler())
+	h := RateLimit(lim, testCfg, noopLog{}, RequestKeys(nil))(okHandler())
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/payments", nil))
@@ -77,7 +79,7 @@ func TestRateLimit_MerchantBucketFromTokenNotHeader(t *testing.T) {
 	// Authenticate resolves the token to merchant "attacker"; RateLimit must key
 	// on that, ignoring the spoofed X-Merchant-ID header naming the victim.
 	h := Authenticate(provider, noopLog{})(
-		RateLimit(lim, RateLimitConfig{Capacity: 10, RefillPerSec: 5}, noopLog{})(okHandler()),
+		RateLimit(lim, testCfg, noopLog{}, RequestKeys(nil))(okHandler()),
 	)
 
 	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
@@ -93,23 +95,33 @@ func TestRateLimit_MerchantBucketFromTokenNotHeader(t *testing.T) {
 	}
 }
 
-func TestRateLimit_PrefersForwardedFor(t *testing.T) {
-	lim := &fakeLimiter{allow: true}
-	h := RateLimit(lim, RateLimitConfig{Capacity: 10, RefillPerSec: 5}, noopLog{})(okHandler())
+func TestRateLimit_IgnoresForwardedForFromUntrustedPeer(t *testing.T) {
+	for name, keys := range map[string]RateLimitKeys{
+		"merchant": RequestKeys(NewClientIP(nil)),
+		"webhook":  WebhookKeys(NewClientIP(nil)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			lim := &fakeLimiter{allow: true}
+			h := RateLimit(lim, testCfg, noopLog{}, keys)(okHandler())
 
-	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
-	req.Header.Set("X-Forwarded-For", "198.51.100.7, 10.0.0.1")
-	req.RemoteAddr = "10.0.0.1:5555"
-	h.ServeHTTP(httptest.NewRecorder(), req)
+			for _, spoofed := range []string{"198.51.100.7", "198.51.100.8", "198.51.100.9"} {
+				req := httptest.NewRequest(http.MethodPost, "/", nil)
+				req.Header.Set("X-Forwarded-For", spoofed)
+				req.RemoteAddr = "203.0.113.5:5555"
+				h.ServeHTTP(httptest.NewRecorder(), req)
 
-	if lim.gotIP != "198.51.100.7" {
-		t.Errorf("expected client IP from X-Forwarded-For, got %q", lim.gotIP)
+				if lim.gotIP != "203.0.113.5" {
+					t.Fatalf("a rotated X-Forwarded-For must not change the IP bucket, got %q", lim.gotIP)
+				}
+			}
+		})
 	}
 }
 
 func TestRateLimit_WebhookKeysArePerIP(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	h := RateLimitWithKeys(lim, RateLimitConfig{Capacity: 10, RefillPerSec: 5}, noopLog{}, WebhookKeys)(okHandler())
+	keys := WebhookKeys(nil)
+	h := RateLimit(lim, testCfg, noopLog{}, keys)(okHandler())
 
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/gateway/stripe", nil)
 	req.RemoteAddr = "203.0.113.5:4444"
@@ -119,7 +131,7 @@ func TestRateLimit_WebhookKeysArePerIP(t *testing.T) {
 	if lim.gotIP != "203.0.113.5" || lim.gotMerchant != "webhook:203.0.113.5" {
 		t.Errorf("webhook buckets must be keyed on the caller IP, got ip=%q merchant=%q", lim.gotIP, lim.gotMerchant)
 	}
-	if user, _, _ := WebhookKeys(req); user != "webhook:203.0.113.5" {
+	if user, _, _ := keys(req); user != "webhook:203.0.113.5" {
 		t.Errorf("the client-supplied X-User-ID must not key webhook buckets, got %q", user)
 	}
 }

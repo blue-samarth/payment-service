@@ -28,9 +28,10 @@ type Manager struct {
 	log     ports.Logger
 	metrics ports.MetricRecorder
 
-	mu     sync.RWMutex
-	cert   *tls.Certificate
-	caPool *x509.CertPool
+	mu       sync.RWMutex
+	cert     *tls.Certificate
+	notAfter time.Time
+	caPool   *x509.CertPool
 }
 
 func NewManager(cfg Config, log ports.Logger, metrics ports.MetricRecorder) (*Manager, error) {
@@ -132,9 +133,20 @@ func (m *Manager) reload() error {
 
 	m.mu.Lock()
 	m.cert = &cert
+	m.notAfter = leaf.NotAfter
 	m.caPool = pool
 	m.mu.Unlock()
 	return nil
+}
+
+func (m *Manager) Name() string {
+	return m.cfg.Name
+}
+
+func (m *Manager) NotAfter() time.Time {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.notAfter
 }
 
 func (m *Manager) checkExpiry(leaf *x509.Certificate) error {

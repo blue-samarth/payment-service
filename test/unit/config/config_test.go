@@ -20,9 +20,14 @@ func validatableConfig() *Config {
 	c.Outbox.ClaimTTLSec = 60
 	c.Outbox.WorkerCount = 1
 	c.RateLimit.FallbackMultiplier = 0.5
+	c.RateLimit.Capacity = 100
+	c.RateLimit.RefillPerSec = 50
 	c.Routing.FXReconciliationTolerancePct = 1.0
 	c.Gateway.HTTPTimeout = 30 * time.Second
 	c.Gateway.MaxAttempts = 3
+	c.Gateway.CircuitBreakerFailureThreshold = 5
+	c.App.ShutdownDrainDelay = 5 * time.Second
+	c.App.ShutdownTimeout = 15 * time.Second
 	c.Jobs.IdempotencyProcessingTimeoutSec = 300
 	c.Redis.Addrs = []string{"localhost:6379"}
 	c.Redis.RateLimitDB = 0
@@ -64,6 +69,9 @@ func setRequiredEnv(t *testing.T) {
 	for _, k := range []string{
 		"REDIS_TLS_ENABLED", "REDIS_USERNAME", "REDIS_PASSWORD", "REDIS_RATE_LIMIT_DB", "REDIS_CACHE_DB",
 		"PORT", "WEBHOOK_PORT", "HEALTH_PORT", "WEBHOOK_TLS_MODE",
+		"SERVICE_TOKENS", "OPS_TOKENS", "WEBHOOK_SECRETS", "TRUSTED_PROXY_CIDRS",
+		"RATE_LIMIT_CAPACITY", "RATE_LIMIT_REFILL_PER_SEC", "CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+		"SHUTDOWN_DRAIN_DELAY", "SHUTDOWN_TIMEOUT",
 	} {
 		t.Setenv(k, "")
 	}
@@ -283,5 +291,183 @@ func TestLoadConfig_AppModeWithoutWebhookCertFails(t *testing.T) {
 
 	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "WEBHOOK_TLS_CERT_FILE") {
 		t.Fatalf("a missing webhook certificate must fail startup in the default mode, got: %v", err)
+	}
+}
+
+const merchantA = "0b7c3a52-6a3e-4c1f-9d2e-6f1a2b3c4d5e"
+const merchantB = "5f0d9e7a-1b2c-4d3e-8f4a-9b0c1d2e3f4a"
+
+func TestLoadConfig_ServiceTokens(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("SERVICE_TOKENS", " svc-1="+merchantA+", c3ZjLTI===="+merchantB+" ")
+	t.Setenv("OPS_TOKENS", "ops-1, ,ops-2")
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := c.Auth.ServiceTokens["svc-1"]; got != merchantA {
+		t.Errorf("svc-1 merchant = %q, want %q", got, merchantA)
+	}
+	if got := c.Auth.ServiceTokens["c3ZjLTI==="]; got != merchantB {
+		t.Errorf("a token containing '=' must split on the last '=', got map %v", c.Auth.ServiceTokens)
+	}
+	if len(c.Auth.OpsTokens) != 2 || c.Auth.OpsTokens[0] != "ops-1" || c.Auth.OpsTokens[1] != "ops-2" {
+		t.Errorf("ops tokens = %v, want [ops-1 ops-2]", c.Auth.OpsTokens)
+	}
+}
+
+func TestLoadConfig_RejectsMalformedServiceTokens(t *testing.T) {
+	cases := map[string]struct {
+		raw  string
+		want string
+	}{
+		"empty merchant":     {"svc-1=", "entry 1 must be token=merchantID"},
+		"empty token":        {"=" + merchantA, "entry 1 must be token=merchantID"},
+		"no separator":       {"svc-1", "entry 1 must be token=merchantID"},
+		"merchant not uuid":  {"svc-1=merchant-9", "entry 1: merchant ID must be a UUID"},
+		"duplicate token":    {"svc-1=" + merchantA + ",svc-1=" + merchantB, "entry 2 repeats an earlier token"},
+		"second entry wrong": {"svc-1=" + merchantA + ",svc-2=", "entry 2 must be token=merchantID"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("SERVICE_TOKENS", tc.raw)
+
+			_, err := LoadConfig()
+			if err == nil || !strings.Contains(err.Error(), "SERVICE_TOKENS "+tc.want) {
+				t.Fatalf("want error containing %q, got: %v", tc.want, err)
+			}
+			if strings.Contains(err.Error(), "svc-1") {
+				t.Fatalf("the error must not echo token values, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_WebhookSecrets(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("WEBHOOK_SECRETS", "stripe=whsec_abc=def,razorpay=rzp")
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := c.Auth.WebhookSecrets["stripe"]; got != "whsec_abc=def" {
+		t.Errorf("a secret containing '=' must split on the first '=', got %q", got)
+	}
+	if got := c.Auth.WebhookSecrets["razorpay"]; got != "rzp" {
+		t.Errorf("razorpay secret = %q", got)
+	}
+}
+
+func TestLoadConfig_RejectsMalformedWebhookSecrets(t *testing.T) {
+	for _, raw := range []string{"stripe=", "=whsec_abc", "stripe", "stripe=a,stripe=b"} {
+		t.Run(raw, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("WEBHOOK_SECRETS", raw)
+
+			_, err := LoadConfig()
+			if err == nil || !strings.Contains(err.Error(), "WEBHOOK_SECRETS entry") {
+				t.Fatalf("want a WEBHOOK_SECRETS error, got: %v", err)
+			}
+			if strings.Contains(err.Error(), "whsec_abc") {
+				t.Fatalf("the error must not echo secret values, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_TrustedProxies(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("TRUSTED_PROXY_CIDRS", "10.1.0.0/16, 192.168.1.7/24,fd00::/8")
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	got := make([]string, len(c.RateLimit.TrustedProxies))
+	for i, p := range c.RateLimit.TrustedProxies {
+		got[i] = p.String()
+	}
+	if strings.Join(got, ",") != "10.1.0.0/16,192.168.1.0/24,fd00::/8" {
+		t.Errorf("trusted proxies = %v", got)
+	}
+
+	t.Setenv("TRUSTED_PROXY_CIDRS", "10.1.0.0")
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "TRUSTED_PROXY_CIDRS entry 1") {
+		t.Fatalf("a bare address must be rejected, got: %v", err)
+	}
+}
+
+func TestLoadConfig_TrustedProxiesDefaultEmpty(t *testing.T) {
+	setRequiredEnv(t)
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if len(c.RateLimit.TrustedProxies) != 0 {
+		t.Errorf("no proxy may be trusted by default, got %v", c.RateLimit.TrustedProxies)
+	}
+}
+
+func TestLoadConfig_RejectsInvalidNumbersInsteadOfFallingBack(t *testing.T) {
+	cases := map[string]string{
+		"RATE_LIMIT_CAPACITY":               "lots",
+		"RATE_LIMIT_REFILL_PER_SEC":         "fast",
+		"CIRCUIT_BREAKER_FAILURE_THRESHOLD": "5.5",
+		"SHUTDOWN_DRAIN_DELAY":              "5",
+		"SHUTDOWN_TIMEOUT":                  "soon",
+	}
+	for key, raw := range cases {
+		t.Run(key, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(key, raw)
+
+			if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("an unparseable %s must fail startup, got: %v", key, err)
+			}
+		})
+	}
+}
+
+func TestValidate_RuntimeLimits(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(*Config)
+		want   string
+	}{
+		"zero capacity":      {func(c *Config) { c.RateLimit.Capacity = 0 }, "RATE_LIMIT_CAPACITY"},
+		"zero refill":        {func(c *Config) { c.RateLimit.RefillPerSec = 0 }, "RATE_LIMIT_REFILL_PER_SEC"},
+		"zero threshold":     {func(c *Config) { c.Gateway.CircuitBreakerFailureThreshold = 0 }, "CIRCUIT_BREAKER_FAILURE_THRESHOLD"},
+		"negative drain":     {func(c *Config) { c.App.ShutdownDrainDelay = -time.Second }, "SHUTDOWN_DRAIN_DELAY"},
+		"zero shutdown time": {func(c *Config) { c.App.ShutdownTimeout = 0 }, "SHUTDOWN_TIMEOUT"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := validatableConfig()
+			tc.mutate(c)
+			if err := Validate(c); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error mentioning %s, got: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_RuntimeDefaults(t *testing.T) {
+	setRequiredEnv(t)
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.RateLimit.Capacity != 100 || c.RateLimit.RefillPerSec != 50 {
+		t.Errorf("rate limit defaults = %d/%v", c.RateLimit.Capacity, c.RateLimit.RefillPerSec)
+	}
+	if c.Gateway.CircuitBreakerFailureThreshold != 5 {
+		t.Errorf("breaker threshold default = %d", c.Gateway.CircuitBreakerFailureThreshold)
+	}
+	if c.App.ShutdownDrainDelay != 5*time.Second || c.App.ShutdownTimeout != 15*time.Second {
+		t.Errorf("shutdown defaults = %v/%v", c.App.ShutdownDrainDelay, c.App.ShutdownTimeout)
 	}
 }

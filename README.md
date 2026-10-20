@@ -163,7 +163,8 @@ internal/
     observability/ slog logger with field redaction, no-op metrics
   api/
     handlers/      HTTP handlers (payment, refund, cancel, webhook, health)
-    middleware/    Auth, RateLimit, Idempotency, RequestID, Recover
+    middleware/    Auth, RateLimit, ClientIP, Idempotency, RequestID, Recover
+  server/          Listener lifecycle: bind, serve, drain, concurrent shutdown
   jobs/
     partition_manager/  Weekly outbox partition lifecycle
     lease_expiry/       Stuck-transaction reaper + idempotency-key sweep
@@ -629,7 +630,9 @@ Responsibilities, all guarded by a single Postgres advisory lock (`AcquireLock`/
 
 - **Local in-memory fallback**: if Redis is unavailable for `failureThreshold` (3) consecutive calls, the limiter flips to a local, per-process token bucket sized at `capacity × FallbackMultiplier` (default 0.5 — deliberately more conservative than the Redis-backed limit), backed by an LRU (`container/list`) capped at `LocalMaxBuckets` to bound memory. A background health check restores the Redis-backed path once it recovers.
 - **Merchant bucket key comes from the authenticated principal**, never a client-supplied header — `merchantBucketID` reads from request context (set by the auth middleware), so a spoofed `X-Merchant-ID` header can't be used to attribute load to (or rate-limit) a different merchant.
+- **The IP bucket key is the TCP peer by default.** `X-Forwarded-For` is honoured only when the peer is inside `TRUSTED_PROXY_CIDRS` (empty by default). Even then the header is walked right to left and the first hop outside the trusted ranges is used, so entries a caller prepends are never chosen. Behind the planned layer-4 NLB, which adds no such header, leave `TRUSTED_PROXY_CIDRS` empty and enable client IP preservation on the target group.
 - Rejections return `429` with a computed `Retry-After` header (minimum 1 second).
+- `RATE_LIMIT_CAPACITY` and `RATE_LIMIT_REFILL_PER_SEC` are validated at startup; a malformed value fails `LoadConfig` instead of silently using the default.
 
 ---
 
@@ -658,11 +661,30 @@ The split exists because a TLS handshake happens before any HTTP routing: with o
 mTLS listener, Stripe, Razorpay, PayU and the kubelet's probes (none of which hold a
 certificate from our CA) were refused before any path-based exemption could apply.
 
+`internal/server.Run` owns the listener lifecycle:
+
+- **Startup:** every port is bound before any is served, so a port conflict fails startup at once and names the listener. Readiness (`/health-overall`) reports `starting` with `503` until all three are serving.
+- **Timeouts per listener:**
+
+  | Listener | Read header | Read | Write | Idle |
+  |---|---|---|---|---|
+  | Merchant | 10s | 30s | gateway budget (`GATEWAY_HTTP_TIMEOUT` × `GATEWAY_MAX_ATTEMPTS`) + 30s | 120s |
+  | Webhook | 10s | 15s | 30s | 60s |
+  | Health | 5s | 5s | 10s | 30s |
+
+- **Shutdown on `SIGTERM`/`SIGINT`**, or when any listener fails:
+  1. Readiness flips to `draining` (`503`) while every listener keeps serving for `SHUTDOWN_DRAIN_DELAY` (default 5s), so the load balancer deregisters the instance before connections are refused. Liveness stays `200`.
+  2. The merchant and webhook servers shut down **concurrently** within `SHUTDOWN_TIMEOUT` (default 15s). A server still busy at the deadline is force-closed, and the error names it.
+  3. The health server stops last, so probes get an answer throughout.
+
+  Keep `SHUTDOWN_DRAIN_DELAY + SHUTDOWN_TIMEOUT` below the pod's `terminationGracePeriodSeconds` (30s by default).
+
 `internal/adapters/security.Manager` wraps Go's `crypto/tls` with **hot certificate rotation**:
 
 - Loads the server keypair and an optional client-CA pool. With a CA and `MtlsStrictMode`, untrusted or missing client certificates are rejected (`RequireAndVerifyClientCert`); with `MTLS_STRICT_MODE=false` they are verified only if presented (`VerifyClientCertIfGiven`). Without a CA it requests no client certificate, which is how the webhook listener runs.
 - `StartRefresh(ctx)` runs a background ticker (`CertRefreshIntervalSec`) that reloads the certificate and CA pool from disk without restarting the process — new connections pick up the rotated cert immediately via `GetConfigForClient`, existing connections are unaffected.
 - Each manager has a name (`merchant`, `webhook`) that tags its certificate-expiry gauge and reload metrics, so the two certificates are alerted on separately.
+- A reload that finds an expired certificate is rejected and the last good certificate keeps serving. Once that certificate itself expires, `/health-overall` reports `tls_<name>: expired` with `503`, so the instance leaves the load balancer instead of failing every handshake while still showing green. Inside 14 days of expiry it reports `expiring` and stays `200`.
 
 The webhook listener needs a publicly trusted certificate, unlike the private-CA certificate on the merchant listener. `WEBHOOK_TLS_MODE` selects how it gets TLS:
 
@@ -702,7 +724,7 @@ The webhook listener needs a publicly trusted certificate, unlike the private-CA
 | Health | `GET` | `/health` | none | Liveness: the process is serving; no dependency calls |
 | Health | `GET` | `/health-db` | none | Postgres reachability (`503` when down) |
 | Health | `GET` | `/health-cache` | none | Redis reachability (`503` when down) |
-| Health | `GET` | `/health-overall` | none | Readiness: `503` if the database is down; a Redis outage reports `degraded` with `200`, because the service keeps working without Redis |
+| Health | `GET` | `/health-overall` | none | Readiness: `503` before all listeners are serving (`app: starting`), while shutting down (`app: draining`), if a served TLS certificate has expired (`tls_<name>: expired`), or if the database is down. A Redis outage reports `degraded` with `200`, because the service keeps working without Redis |
 | Health | `GET` | `/health-gateways` | none | Per-gateway availability (routable now, and why not if not), breaker state, cooldown and failure count. Always `200`; diagnostic, not a probe |
 
 Use `/health` for the liveness probe and `/health-overall` for the readiness probe and the load balancer health check. None of the health endpoints are rate-limited.
@@ -722,18 +744,36 @@ All configuration is via environment variables, loaded and validated in `config/
 
 | Area | Key variables | Notes |
 |---|---|---|
-| App | `ENVIRONMENT` (prod/staging/dev), `PORT`, `WEBHOOK_PORT`, `HEALTH_PORT`, `WEBHOOK_TLS_MODE` (`app`\|`lb`), `MTLS_STRICT_MODE` | The three ports must be distinct |
+| App | `ENVIRONMENT` (prod/staging/dev), `PORT`, `WEBHOOK_PORT`, `HEALTH_PORT`, `WEBHOOK_TLS_MODE` (`app`\|`lb`), `MTLS_STRICT_MODE`, `SHUTDOWN_DRAIN_DELAY` (5s), `SHUTDOWN_TIMEOUT` (15s) | The three ports must be distinct |
 | Database | `DATABASE_PRIMARY_HOST`, `DATABASE_REPLICA_HOST`, `DATABASE_NAME/USER/PASSWORD`, `DATABASE_SSL_MODE` | Pool sizing via `DATABASE_MAX_OPEN_CONNS` etc. |
 | Redis | `REDIS_ADDRS` (single primary endpoint), `REDIS_TLS_ENABLED`, `REDIS_USERNAME`, `REDIS_PASSWORD`, separate DBs for rate-limit vs. cache | Cluster mode is unsupported: it has only database 0 |
 | Outbox | `OUTBOX_RELAY_MODE` (`cdc`\|`polling`), `OUTBOX_RELAY_BATCH_SIZE`, `OUTBOX_RELAY_MAX_ATTEMPTS`, WAL-lag alert thresholds | Shard count fixed at 64 by schema |
-| Rate limit | `RATE_LIMIT_FALLBACK_MULTIPLIER` (0,1], `RATE_LIMIT_LOCAL_MAX_BUCKETS` | |
+| Rate limit | `RATE_LIMIT_CAPACITY` (100), `RATE_LIMIT_REFILL_PER_SEC` (50), `TRUSTED_PROXY_CIDRS` (empty), `RATE_LIMIT_FALLBACK_MULTIPLIER` (0,1], `RATE_LIMIT_LOCAL_MAX_BUCKETS` | `X-Forwarded-For` is ignored unless the peer is in `TRUSTED_PROXY_CIDRS` |
 | Routing | `ROUTING_SNAPSHOT_TTL_SECONDS`, `GATEWAY_FEE_CACHE_TTL_SEC`, `FX_RECONCILIATION_TOLERANCE_PCT` | |
 | Security | `TLS_CERT_FILE/KEY_FILE/CA_FILE`, `WEBHOOK_TLS_CERT_FILE/KEY_FILE`, `TLS_CERT_REFRESH_INTERVAL_SECONDS`, `DEK_CACHE_TTL_SECONDS` | Merchant TLS files are required; webhook files are required when `WEBHOOK_TLS_MODE=app` |
 | Jobs | `LEASE_EXPIRY_INTERVAL_SECONDS`, `JOB_LOCK_TIMEOUT_MINUTES` | |
-| Gateways | `STRIPE_API_KEY`, `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`, `PAYU_MERCHANT_KEY`/`PAYU_MERCHANT_SALT`, plus `*_BASE_URL` overrides for testing | |
-| Auth | `SERVICE_TOKENS` (`token=merchantID,...`), `OPS_TOKENS` (comma-separated) | Omit entirely to disable auth (dev only) |
+| Gateways | `STRIPE_API_KEY`, `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`, `PAYU_MERCHANT_KEY`/`PAYU_MERCHANT_SALT`, plus `*_BASE_URL` overrides for testing, `CIRCUIT_BREAKER_FAILURE_THRESHOLD` (5) | |
+| Auth | `SERVICE_TOKENS` (`token=merchantUUID,...`), `OPS_TOKENS` (comma-separated), `WEBHOOK_SECRETS` (`gatewayID=secret,...`) | `SERVICE_TOKENS` splits each entry on its **last** `=`, so tokens may contain `=`; the merchant must be a UUID. `WEBHOOK_SECRETS` splits on the **first** `=`, so secrets may contain `=`. Empty parts and duplicates fail startup; errors name the entry number, never the value. Omit all tokens and set `ALLOW_NO_AUTH=true` to run without auth (dev only) |
 
 `Validate(c)` additionally enforces cross-field invariants, e.g. `OUTBOX_RELAY_WAL_LAG_ALERT_THRESHOLD_MB < OUTBOX_RELAY_WAL_LAG_CRITICAL_THRESHOLD_MB`.
+
+### Upgrading to the three-listener layout
+
+Deployments that ran the single-listener build must change the following together with the image. Each item is breaking.
+
+| What changed | Before | After | Action |
+|---|---|---|---|
+| Gateway webhook URL | `https://<host>:<PORT>/webhooks/gateway/{id}` | `https://<host>:<WEBHOOK_PORT>/webhooks/gateway/{id}` (8081) | Update the endpoint in the Stripe, Razorpay and PayU dashboards. Add a load balancer listener for `WEBHOOK_PORT`. The old URL now gets a TLS handshake failure (no client certificate), so webhooks are lost until this is done. |
+| Webhook TLS | Merchant certificate | `WEBHOOK_TLS_CERT_FILE`/`WEBHOOK_TLS_KEY_FILE`, a publicly trusted certificate | Mount the files, or set `WEBHOOK_TLS_MODE=lb` if the load balancer terminates TLS. With neither, startup fails. |
+| Liveness probe | `GET /health` on `PORT` | `GET /health` on `HEALTH_PORT` (8082), plain HTTP | Point the probe at the new port and scheme. `/health` no longer checks Postgres or Redis. |
+| Readiness probe and LB health check | `GET /health` on `PORT` | `GET /health-overall` on `HEALTH_PORT` | Point both at the new path and port. It returns `503` until every listener is serving and while draining. |
+| Health exposure | Public on `PORT` | `HEALTH_PORT`, never exposed | Do not add an LB listener for it. |
+| `SERVICE_TOKENS` | Any `token=merchant`, bad entries skipped | Merchant must be a UUID; bad entries fail startup | Fix entries before rolling out. A non-UUID merchant could never have stored a transaction (`merchant_id` is `UUID`). |
+| Numeric env vars | `RATE_LIMIT_*`, `CIRCUIT_BREAKER_FAILURE_THRESHOLD` fell back to defaults silently | Malformed values fail startup | Check these values. |
+| Client IP for rate limits | First `X-Forwarded-For` entry | TCP peer unless it is in `TRUSTED_PROXY_CIDRS` | Behind an L7 proxy that sets the header, list its CIDRs. Behind the NLB, enable client IP preservation. |
+| Pod termination | 15s shared shutdown | `SHUTDOWN_DRAIN_DELAY` + `SHUTDOWN_TIMEOUT` (20s by default) | Keep `terminationGracePeriodSeconds` above the sum. |
+
+Suggested order: add the new LB listener and probes, roll out the image, then switch the gateway dashboards and confirm deliveries arrive on the new URL.
 
 ---
 

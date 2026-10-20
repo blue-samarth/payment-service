@@ -47,6 +47,11 @@ const (
 
 	LogEventHealthCheckFailed = "health.check_failed"
 
+	LogEventHTTPServerStarting     = "http.server_starting"
+	LogEventHTTPServerDraining     = "http.server_draining"
+	LogEventHTTPServerStopped      = "http.server_stopped"
+	LogEventHTTPServerForcedClosed = "http.server_forced_close"
+
 	LogEventReconciliationStart    = "reconciliation.started"
 	LogEventReconciliationComplete = "reconciliation.completed"
 	LogEventReconciliationMismatch = "reconciliation.mismatch_detected"
