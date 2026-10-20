@@ -45,6 +45,8 @@ const (
 
 	LogEventIdempotencySweep = "idempotency.sweep"
 
+	LogEventHealthCheckFailed = "health.check_failed"
+
 	LogEventReconciliationStart    = "reconciliation.started"
 	LogEventReconciliationComplete = "reconciliation.completed"
 	LogEventReconciliationMismatch = "reconciliation.mismatch_detected"

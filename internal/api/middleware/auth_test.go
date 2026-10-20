@@ -80,14 +80,18 @@ func TestAuth_MissingToken401(t *testing.T) {
 	}
 }
 
-func TestAuth_HealthExempt(t *testing.T) {
+func TestAuth_NoPathIsExempt(t *testing.T) {
 	provider := NewStaticTokenProvider(map[string]string{"svc-secret": "merchant-1"}, nil)
 	h := Authenticate(provider, noopLog{})(okHandler())
 
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected /health to be exempt from auth, got %d", rec.Code)
+	// Health and webhooks are served on their own listeners, so the auth layer
+	// has no path-based bypass: every request it sees needs a token.
+	for _, path := range []string{"/health", "/webhooks/gateway/stripe", "/payments"} {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s without a token: expected 401, got %d", path, rec.Code)
+		}
 	}
 }
 

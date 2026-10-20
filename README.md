@@ -289,6 +289,11 @@ Filtering (candidates are dropped before scoring, `filterReason`):
 - Live circuit breaker `OPEN` and still within cooldown
 - 24h discrepancy rate > 20%
 
+The request-independent checks (inactive, breaker, discrepancy) live in `UnavailableReason`,
+which `filterReason` calls after the amount and currency checks. `Router.Availability` applies
+that same function, with the same live breaker lookup, to answer "is this gateway routable
+right now" for `/health-gateways` (§20), so the health view cannot disagree with routing.
+
 Scoring (each candidate gets a 0–100 sub-score per dimension, combined via configurable `Weights` that must sum to 1.0, ±0.001 tolerance, with at most 2 zero-weighted dimensions):
 
 | Dimension | Signal |
@@ -635,17 +640,34 @@ Responsibilities, all guarded by a single Postgres advisory lock (`AcquireLock`/
 - **Service tokens** (`X-Service-Token`) map to a specific `MerchantID` — the merchant identity is *bound to the token*, not read from any request header, which is what makes the rate-limiter merchant-key spoofing protection in §15 possible.
 - **Ops tokens** (`X-Ops-Token`) grant the `ops` role without a merchant binding (used for cancel/refund operational actions).
 
-Tokens are stored hashed (SHA-256) in memory; `/health` and `/webhooks/*` are exempt from authentication (webhooks authenticate via gateway signature instead, §11). If no tokens are configured at all, auth middleware is skipped entirely and a warning is logged — appropriate for local development, not for production.
+Tokens are stored hashed (SHA-256) in memory. Authentication runs only on the merchant listener (§17) and has no path-based exemptions: webhooks are served on their own listener and authenticate via gateway signature (§11), and health endpoints are served on an internal-only listener. If no tokens are configured, the API refuses to start unless `ALLOW_NO_AUTH=true` is set explicitly, in which case it logs a warning and serves unauthenticated — for local development only.
 
 ---
 
 ## 17. Transport Security (mTLS)
 
-`internal/adapters/security.Manager` wraps Go's `crypto/tls` to support mutual TLS with **hot certificate rotation**:
+`cmd/api` serves three listeners, so each kind of caller gets the transport it can use:
 
-- Loads the server keypair and (optionally) a client-CA pool; if `MtlsStrictMode` is enabled, unauthenticated/untrusted client certificates are rejected (`RequireAndVerifyClientCert`), otherwise client certs are verified only if presented (`VerifyClientCertIfGiven`).
+| Listener | Port (default) | Transport | Routes |
+|---|---|---|---|
+| Merchant API | `PORT` (8080) | mTLS, strict by default | payments, refunds, cancel |
+| Webhooks | `WEBHOOK_PORT` (8081) | server TLS, no client certificate | `POST /webhooks/gateway/{gateway_id}` |
+| Health | `HEALTH_PORT` (8082) | plain HTTP, never exposed through the load balancer | health endpoints (§20) |
+
+The split exists because a TLS handshake happens before any HTTP routing: with one strict
+mTLS listener, Stripe, Razorpay, PayU and the kubelet's probes (none of which hold a
+certificate from our CA) were refused before any path-based exemption could apply.
+
+`internal/adapters/security.Manager` wraps Go's `crypto/tls` with **hot certificate rotation**:
+
+- Loads the server keypair and an optional client-CA pool. With a CA and `MtlsStrictMode`, untrusted or missing client certificates are rejected (`RequireAndVerifyClientCert`); with `MTLS_STRICT_MODE=false` they are verified only if presented (`VerifyClientCertIfGiven`). Without a CA it requests no client certificate, which is how the webhook listener runs.
 - `StartRefresh(ctx)` runs a background ticker (`CertRefreshIntervalSec`) that reloads the certificate and CA pool from disk without restarting the process — new connections pick up the rotated cert immediately via `GetConfigForClient`, existing connections are unaffected.
-- If `TLS_CERT_FILE` isn't configured, the server runs plain HTTP (suitable for local dev or when TLS is terminated upstream, e.g. behind a load balancer).
+- Each manager has a name (`merchant`, `webhook`) that tags its certificate-expiry gauge and reload metrics, so the two certificates are alerted on separately.
+
+The webhook listener needs a publicly trusted certificate, unlike the private-CA certificate on the merchant listener. `WEBHOOK_TLS_MODE` selects how it gets TLS:
+
+- `app` (default): TLS terminates in the process with `WEBHOOK_TLS_CERT_FILE`/`WEBHOOK_TLS_KEY_FILE`; startup fails if either is missing.
+- `lb`: the listener serves plain HTTP and the load balancer terminates TLS; a startup warning is logged. Plaintext is therefore always an explicit choice, never the result of a missing variable.
 
 ---
 
@@ -670,14 +692,20 @@ Tokens are stored hashed (SHA-256) in memory; `/health` and `/webhooks/*` are ex
 
 ## 20. API Reference
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `GET` | `/health` | none | DB connectivity check |
-| `POST` | `/payments` | service/ops token | Create + immediately attempt a payment. Requires `Idempotency-Key`. |
-| `GET` | `/payments/{id}` | service/ops token | Fetch a transaction by ID |
-| `POST` | `/payments/{id}/refunds` | service/ops token | Initiate + immediately attempt a refund. Requires `Idempotency-Key`. |
-| `POST` | `/payments/{id}/cancel` | service/ops token | Request cancellation (idempotent; safe on already-terminal transactions) |
-| `POST` | `/webhooks/gateway/{gateway_id}` | gateway signature | Inbound gateway status callback |
+| Listener | Method | Path | Auth | Description |
+|---|---|---|---|---|
+| Merchant | `POST` | `/payments` | service/ops token | Create + immediately attempt a payment. Requires `Idempotency-Key`. |
+| Merchant | `GET` | `/payments/{id}` | service/ops token | Fetch a transaction by ID |
+| Merchant | `POST` | `/payments/{id}/refunds` | service/ops token | Initiate + immediately attempt a refund. Requires `Idempotency-Key`. |
+| Merchant | `POST` | `/payments/{id}/cancel` | service/ops token | Request cancellation (idempotent; safe on already-terminal transactions) |
+| Webhook | `POST` | `/webhooks/gateway/{gateway_id}` | gateway signature | Inbound gateway status callback |
+| Health | `GET` | `/health` | none | Liveness: the process is serving; no dependency calls |
+| Health | `GET` | `/health-db` | none | Postgres reachability (`503` when down) |
+| Health | `GET` | `/health-cache` | none | Redis reachability (`503` when down) |
+| Health | `GET` | `/health-overall` | none | Readiness: `503` if the database is down; a Redis outage reports `degraded` with `200`, because the service keeps working without Redis |
+| Health | `GET` | `/health-gateways` | none | Per-gateway availability (routable now, and why not if not), breaker state, cooldown and failure count. Always `200`; diagnostic, not a probe |
+
+Use `/health` for the liveness probe and `/health-overall` for the readiness probe and the load balancer health check. None of the health endpoints are rate-limited.
 
 Common error shape: `{"error": {"code": "...", "message": "..."}}`. Notable status codes beyond the obvious 200/201/400/404:
 
@@ -694,13 +722,13 @@ All configuration is via environment variables, loaded and validated in `config/
 
 | Area | Key variables | Notes |
 |---|---|---|
-| App | `ENVIRONMENT` (prod/staging/dev), `PORT`, `MTLS_STRICT_MODE` | |
+| App | `ENVIRONMENT` (prod/staging/dev), `PORT`, `WEBHOOK_PORT`, `HEALTH_PORT`, `WEBHOOK_TLS_MODE` (`app`\|`lb`), `MTLS_STRICT_MODE` | The three ports must be distinct |
 | Database | `DATABASE_PRIMARY_HOST`, `DATABASE_REPLICA_HOST`, `DATABASE_NAME/USER/PASSWORD`, `DATABASE_SSL_MODE` | Pool sizing via `DATABASE_MAX_OPEN_CONNS` etc. |
-| Redis | `REDIS_ADDRS` (comma-separated), separate DBs for rate-limit vs. cache | |
+| Redis | `REDIS_ADDRS` (single primary endpoint), `REDIS_TLS_ENABLED`, `REDIS_USERNAME`, `REDIS_PASSWORD`, separate DBs for rate-limit vs. cache | Cluster mode is unsupported: it has only database 0 |
 | Outbox | `OUTBOX_RELAY_MODE` (`cdc`\|`polling`), `OUTBOX_RELAY_BATCH_SIZE`, `OUTBOX_RELAY_MAX_ATTEMPTS`, WAL-lag alert thresholds | Shard count fixed at 64 by schema |
 | Rate limit | `RATE_LIMIT_FALLBACK_MULTIPLIER` (0,1], `RATE_LIMIT_LOCAL_MAX_BUCKETS` | |
 | Routing | `ROUTING_SNAPSHOT_TTL_SECONDS`, `GATEWAY_FEE_CACHE_TTL_SEC`, `FX_RECONCILIATION_TOLERANCE_PCT` | |
-| Security | `TLS_CERT_FILE/KEY_FILE/CA_FILE`, `TLS_CERT_REFRESH_INTERVAL_SECONDS`, `DEK_CACHE_TTL_SECONDS` | TLS optional; omit to run plain HTTP |
+| Security | `TLS_CERT_FILE/KEY_FILE/CA_FILE`, `WEBHOOK_TLS_CERT_FILE/KEY_FILE`, `TLS_CERT_REFRESH_INTERVAL_SECONDS`, `DEK_CACHE_TTL_SECONDS` | Merchant TLS files are required; webhook files are required when `WEBHOOK_TLS_MODE=app` |
 | Jobs | `LEASE_EXPIRY_INTERVAL_SECONDS`, `JOB_LOCK_TIMEOUT_MINUTES` | |
 | Gateways | `STRIPE_API_KEY`, `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`, `PAYU_MERCHANT_KEY`/`PAYU_MERCHANT_SALT`, plus `*_BASE_URL` overrides for testing | |
 | Auth | `SERVICE_TOKENS` (`token=merchantID,...`), `OPS_TOKENS` (comma-separated) | Omit entirely to disable auth (dev only) |

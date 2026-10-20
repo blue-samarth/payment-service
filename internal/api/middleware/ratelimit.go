@@ -25,12 +25,25 @@ type RateLimitConfig struct {
 	RefillPerSec float64
 }
 
+type RateLimitKeys func(r *http.Request) (userID, merchantID, ip string)
+
 func RateLimit(limiter Limiter, cfg RateLimitConfig, log ports.Logger) func(http.Handler) http.Handler {
+	return RateLimitWithKeys(limiter, cfg, log, RequestKeys)
+}
+
+func RequestKeys(r *http.Request) (userID, merchantID, ip string) {
+	return r.Header.Get("X-User-ID"), merchantBucketID(r.Context()), clientIP(r)
+}
+
+func WebhookKeys(r *http.Request) (userID, merchantID, ip string) {
+	ip = clientIP(r)
+	return "webhook:" + ip, "webhook:" + ip, ip
+}
+
+func RateLimitWithKeys(limiter Limiter, cfg RateLimitConfig, log ports.Logger, keys RateLimitKeys) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			userID := r.Header.Get("X-User-ID")
-			merchantID := merchantBucketID(r.Context())
-			ip := clientIP(r)
+			userID, merchantID, ip := keys(r)
 
 			decision := limiter.Allow(r.Context(), userID, merchantID, ip, cfg.Capacity, cfg.RefillPerSec)
 			if !decision.Allowed {

@@ -27,6 +27,12 @@ func validatableConfig() *Config {
 	c.Redis.Addrs = []string{"localhost:6379"}
 	c.Redis.RateLimitDB = 0
 	c.Redis.CacheDB = 1
+	c.App.Port = 8080
+	c.App.WebhookPort = 8081
+	c.App.HealthPort = 8082
+	c.App.WebhookTLSMode = WebhookTLSModeApp
+	c.Security.WebhookTLSCertFile = "/etc/tls/webhook.pem"
+	c.Security.WebhookTLSKeyFile = "/etc/tls/webhook-key.pem"
 	return c
 }
 
@@ -48,12 +54,17 @@ func setRequiredEnv(t *testing.T) {
 		"TLS_CERT_FILE":                    "/etc/tls/cert.pem",
 		"TLS_KEY_FILE":                     "/etc/tls/key.pem",
 		"TLS_CA_FILE":                      "/etc/tls/ca.pem",
+		"WEBHOOK_TLS_CERT_FILE":            "/etc/tls/webhook.pem",
+		"WEBHOOK_TLS_KEY_FILE":             "/etc/tls/webhook-key.pem",
 		"AUDIT_LOG_BUCKET":                 "audit",
 	}
 	for k, v := range required {
 		t.Setenv(k, v)
 	}
-	for _, k := range []string{"REDIS_TLS_ENABLED", "REDIS_USERNAME", "REDIS_PASSWORD", "REDIS_RATE_LIMIT_DB", "REDIS_CACHE_DB"} {
+	for _, k := range []string{
+		"REDIS_TLS_ENABLED", "REDIS_USERNAME", "REDIS_PASSWORD", "REDIS_RATE_LIMIT_DB", "REDIS_CACHE_DB",
+		"PORT", "WEBHOOK_PORT", "HEALTH_PORT", "WEBHOOK_TLS_MODE",
+	} {
 		t.Setenv(k, "")
 	}
 }
@@ -203,5 +214,74 @@ func TestLoadConfig_RejectsInvalidRedisTLSFlag(t *testing.T) {
 	_, err := LoadConfig()
 	if err == nil || !strings.Contains(err.Error(), "REDIS_TLS_ENABLED") {
 		t.Fatalf("an unparseable REDIS_TLS_ENABLED must fail startup, not fall back to the default, got: %v", err)
+	}
+}
+
+func TestValidate_ListenerPortsMustBeDistinct(t *testing.T) {
+	c := validatableConfig()
+	c.App.HealthPort = c.App.Port
+	err := Validate(c)
+	if err == nil || !strings.Contains(err.Error(), "must be distinct") {
+		t.Fatalf("expected a shared port to be rejected, got: %v", err)
+	}
+}
+
+func TestValidate_ListenerPortRange(t *testing.T) {
+	for _, port := range []int{0, -1, 65536} {
+		c := validatableConfig()
+		c.App.WebhookPort = port
+		err := Validate(c)
+		if err == nil || !strings.Contains(err.Error(), "between 1 and 65535") {
+			t.Errorf("WEBHOOK_PORT=%d: expected a range error, got: %v", port, err)
+		}
+	}
+}
+
+func TestValidate_WebhookTLSMode(t *testing.T) {
+	t.Run("unknown mode", func(t *testing.T) {
+		c := validatableConfig()
+		c.App.WebhookTLSMode = "none"
+		if err := Validate(c); err == nil || !strings.Contains(err.Error(), "WEBHOOK_TLS_MODE") {
+			t.Fatalf("expected an unknown mode to be rejected, got: %v", err)
+		}
+	})
+	t.Run("app mode requires a certificate pair", func(t *testing.T) {
+		c := validatableConfig()
+		c.Security.WebhookTLSKeyFile = ""
+		if err := Validate(c); err == nil || !strings.Contains(err.Error(), "WEBHOOK_TLS_CERT_FILE") {
+			t.Fatalf("app mode without a key file must fail, not fall back to plaintext, got: %v", err)
+		}
+	})
+	t.Run("lb mode needs no certificate", func(t *testing.T) {
+		c := validatableConfig()
+		c.App.WebhookTLSMode = WebhookTLSModeLB
+		c.Security.WebhookTLSCertFile, c.Security.WebhookTLSKeyFile = "", ""
+		if err := Validate(c); err != nil {
+			t.Fatalf("lb mode should validate without certificate files, got: %v", err)
+		}
+	})
+}
+
+func TestLoadConfig_ListenerDefaults(t *testing.T) {
+	setRequiredEnv(t)
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.App.Port != 8080 || c.App.WebhookPort != 8081 || c.App.HealthPort != 8082 {
+		t.Errorf("unexpected default ports: merchant=%d webhook=%d health=%d", c.App.Port, c.App.WebhookPort, c.App.HealthPort)
+	}
+	if c.App.WebhookTLSMode != WebhookTLSModeApp {
+		t.Errorf("WEBHOOK_TLS_MODE must default to app so plaintext is always an explicit choice, got %q", c.App.WebhookTLSMode)
+	}
+}
+
+func TestLoadConfig_AppModeWithoutWebhookCertFails(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("WEBHOOK_TLS_CERT_FILE", "")
+
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "WEBHOOK_TLS_CERT_FILE") {
+		t.Fatalf("a missing webhook certificate must fail startup in the default mode, got: %v", err)
 	}
 }

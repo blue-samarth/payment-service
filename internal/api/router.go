@@ -21,17 +21,12 @@ type Deps struct {
 	ResponseCache middleware.ResponseCacheStore
 }
 
-func NewRouter(deps Deps) http.Handler {
+func NewMerchantRouter(deps Deps) http.Handler {
 	mux := http.NewServeMux()
-
-	mux.HandleFunc("GET /health", deps.Health.Health)
 	mux.HandleFunc("POST /payments", deps.Payment.Create)
 	mux.HandleFunc("GET /payments/{id}", deps.Payment.Get)
 	mux.HandleFunc("POST /payments/{id}/refunds", deps.Refund.Create)
 	mux.HandleFunc("POST /payments/{id}/cancel", deps.Cancel.Cancel)
-	if deps.Webhook != nil {
-		mux.HandleFunc("POST /webhooks/gateway/{gateway_id}", deps.Webhook.Handle)
-	}
 
 	chain := []func(http.Handler) http.Handler{
 		middleware.RequestID,
@@ -46,6 +41,31 @@ func NewRouter(deps Deps) http.Handler {
 	if deps.ResponseCache != nil {
 		chain = append(chain, middleware.ResponseCache(deps.ResponseCache, deps.Logger))
 	}
-
 	return middleware.Chain(mux, chain...)
+}
+
+func NewWebhookRouter(deps Deps) http.Handler {
+	mux := http.NewServeMux()
+	if deps.Webhook != nil {
+		mux.HandleFunc("POST /webhooks/gateway/{gateway_id}", deps.Webhook.Handle)
+	}
+
+	chain := []func(http.Handler) http.Handler{
+		middleware.RequestID,
+		middleware.Recover(deps.Logger),
+	}
+	if deps.Limiter != nil {
+		chain = append(chain, middleware.RateLimitWithKeys(deps.Limiter, deps.RateLimit, deps.Logger, middleware.WebhookKeys))
+	}
+	return middleware.Chain(mux, chain...)
+}
+
+func NewHealthRouter(deps Deps) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", deps.Health.Liveness)
+	mux.HandleFunc("GET /health-db", deps.Health.Database)
+	mux.HandleFunc("GET /health-cache", deps.Health.Cache)
+	mux.HandleFunc("GET /health-overall", deps.Health.Overall)
+	mux.HandleFunc("GET /health-gateways", deps.Health.Gateways)
+	return middleware.Chain(mux, middleware.Recover(deps.Logger))
 }

@@ -15,6 +15,7 @@ import (
 const certExpiryWarnWindow = 14 * 24 * time.Hour
 
 type Config struct {
+	Name            string
 	CertFile        string
 	KeyFile         string
 	CAFile          string
@@ -91,16 +92,17 @@ func (m *Manager) StartRefresh(ctx context.Context) {
 			case <-ticker.C:
 				if err := m.reload(); err != nil {
 					if m.metrics != nil {
-						m.metrics.Increment(ports.MetricTLSCertReloadFailure, nil)
+						m.metrics.Increment(ports.MetricTLSCertReloadFailure, m.tags())
 					}
 					m.log.Error(ports.LogEventTLSCertReloadFailed, map[string]any{
 						ports.FieldErrorCode:     "tls_cert_reload_failed",
 						ports.FieldTraceID:       "",
 						ports.FieldTransactionID: "",
+						"listener":               m.cfg.Name,
 					}, err)
 					continue
 				}
-				m.log.Info(ports.LogEventTLSCertReloaded, nil)
+				m.log.Info(ports.LogEventTLSCertReloaded, map[string]any{"listener": m.cfg.Name})
 			}
 		}
 	}()
@@ -138,7 +140,7 @@ func (m *Manager) reload() error {
 func (m *Manager) checkExpiry(leaf *x509.Certificate) error {
 	remaining := time.Until(leaf.NotAfter)
 	if m.metrics != nil {
-		m.metrics.Gauge(ports.MetricTLSCertExpirySeconds, remaining.Seconds(), nil)
+		m.metrics.Gauge(ports.MetricTLSCertExpirySeconds, remaining.Seconds(), m.tags())
 	}
 	if remaining <= 0 {
 		return fmt.Errorf("security: server certificate expired at %s", leaf.NotAfter.UTC().Format(time.RFC3339))
@@ -147,9 +149,17 @@ func (m *Manager) checkExpiry(leaf *x509.Certificate) error {
 		m.log.Warn(ports.LogEventTLSCertExpiring, map[string]any{
 			"expires_at":      leaf.NotAfter.UTC().Format(time.RFC3339),
 			"remaining_hours": int(remaining.Hours()),
+			"listener":        m.cfg.Name,
 		})
 	}
 	return nil
+}
+
+func (m *Manager) tags() map[string]string {
+	if m.cfg.Name == "" {
+		return nil
+	}
+	return map[string]string{"listener": m.cfg.Name}
 }
 
 func loadCAPool(caFile string) (*x509.CertPool, error) {

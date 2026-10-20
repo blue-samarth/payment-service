@@ -84,10 +84,18 @@ func getEnvDuration(key string, def time.Duration, errs *[]string) time.Duration
 	return d
 }
 
+const (
+	WebhookTLSModeApp = "app"
+	WebhookTLSModeLB  = "lb"
+)
+
 type AppConfig struct {
 	Environment    string
 	ServiceVersion string
 	Port           int
+	WebhookPort    int
+	HealthPort     int
+	WebhookTLSMode string
 	MtlsStrictMode bool
 	AllowNoAuth    bool
 }
@@ -178,6 +186,8 @@ type SecurityConfig struct {
 	TLSCertFile             string
 	TLSKeyFile              string
 	TLSCAFile               string
+	WebhookTLSCertFile      string
+	WebhookTLSKeyFile       string
 	CertRefreshIntervalSec  int
 	TokenCacheTTLSec        int
 	DEKCacheTTLSec          int
@@ -230,6 +240,9 @@ func LoadConfig() (*Config, error) {
 	c.App.Environment = requireEnv("ENVIRONMENT", &errs)
 	c.App.ServiceVersion = getEnvDefault("SERVICE_VERSION", "unknown")
 	c.App.Port = getEnvInt("PORT", 8080, &errs)
+	c.App.WebhookPort = getEnvInt("WEBHOOK_PORT", 8081, &errs)
+	c.App.HealthPort = getEnvInt("HEALTH_PORT", 8082, &errs)
+	c.App.WebhookTLSMode = getEnvDefault("WEBHOOK_TLS_MODE", WebhookTLSModeApp)
 	c.App.MtlsStrictMode = getEnvBool("MTLS_STRICT_MODE", true, &errs)
 	c.App.AllowNoAuth = getEnvBool("ALLOW_NO_AUTH", false, &errs)
 
@@ -331,6 +344,8 @@ func LoadConfig() (*Config, error) {
 	c.Security.TLSCertFile = requireEnv("TLS_CERT_FILE", &errs)
 	c.Security.TLSKeyFile = requireEnv("TLS_KEY_FILE", &errs)
 	c.Security.TLSCAFile = requireEnv("TLS_CA_FILE", &errs)
+	c.Security.WebhookTLSCertFile = getEnvDefault("WEBHOOK_TLS_CERT_FILE", "")
+	c.Security.WebhookTLSKeyFile = getEnvDefault("WEBHOOK_TLS_KEY_FILE", "")
 	c.Security.CertRefreshIntervalSec = getEnvInt("TLS_CERT_REFRESH_INTERVAL_SECONDS", 3600, &errs)
 	c.Security.TokenCacheTTLSec = getEnvInt("TOKEN_CACHE_TTL_SECONDS", 60, &errs)
 	c.Security.DEKCacheTTLSec = getEnvInt("DEK_CACHE_TTL_SECONDS", 3600, &errs)
@@ -380,6 +395,29 @@ func Validate(c *Config) error {
 	validOTLPProtocols := map[string]bool{"http/protobuf": true, "grpc": true}
 	if c.Observability.OTLPEndpoint != "" && !validOTLPProtocols[c.Observability.OTLPProtocol] {
 		errs = append(errs, `OTLP_PROTOCOL must be "http/protobuf" or "grpc"`)
+	}
+
+	ports := map[string]int{"PORT": c.App.Port, "WEBHOOK_PORT": c.App.WebhookPort, "HEALTH_PORT": c.App.HealthPort}
+	seen := make(map[int]bool, len(ports))
+	for _, p := range ports {
+		if p < 1 || p > 65535 {
+			errs = append(errs, "PORT, WEBHOOK_PORT and HEALTH_PORT must each be between 1 and 65535")
+			break
+		}
+		seen[p] = true
+	}
+	if len(seen) != len(ports) {
+		errs = append(errs, "PORT, WEBHOOK_PORT and HEALTH_PORT must be distinct")
+	}
+
+	switch c.App.WebhookTLSMode {
+	case WebhookTLSModeApp:
+		if c.Security.WebhookTLSCertFile == "" || c.Security.WebhookTLSKeyFile == "" {
+			errs = append(errs, "WEBHOOK_TLS_CERT_FILE and WEBHOOK_TLS_KEY_FILE are required when WEBHOOK_TLS_MODE=app")
+		}
+	case WebhookTLSModeLB:
+	default:
+		errs = append(errs, "WEBHOOK_TLS_MODE must be 'app' or 'lb'")
 	}
 
 	if len(c.Redis.Addrs) > 1 {

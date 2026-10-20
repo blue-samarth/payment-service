@@ -106,3 +106,20 @@ func TestRateLimit_PrefersForwardedFor(t *testing.T) {
 		t.Errorf("expected client IP from X-Forwarded-For, got %q", lim.gotIP)
 	}
 }
+
+func TestRateLimit_WebhookKeysArePerIP(t *testing.T) {
+	lim := &fakeLimiter{allow: true}
+	h := RateLimitWithKeys(lim, RateLimitConfig{Capacity: 10, RefillPerSec: 5}, noopLog{}, WebhookKeys)(okHandler())
+
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/gateway/stripe", nil)
+	req.RemoteAddr = "203.0.113.5:4444"
+	req.Header.Set("X-User-ID", "someone")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	if lim.gotIP != "203.0.113.5" || lim.gotMerchant != "webhook:203.0.113.5" {
+		t.Errorf("webhook buckets must be keyed on the caller IP, got ip=%q merchant=%q", lim.gotIP, lim.gotMerchant)
+	}
+	if user, _, _ := WebhookKeys(req); user != "webhook:203.0.113.5" {
+		t.Errorf("the client-supplied X-User-ID must not key webhook buckets, got %q", user)
+	}
+}

@@ -482,3 +482,61 @@ func TestManager_Reload_ExpiredKeepsLastGoodAndCountsMetric(t *testing.T) {
 		t.Error("a failing background reload must increment the reload-failure metric for alerting")
 	}
 }
+
+// The webhook listener runs a Manager with no CA file: gateways present no
+// client certificate, so the handshake must complete without one.
+func TestManager_NoCA_AdmitsClientWithoutCert(t *testing.T) {
+	ca := newCA(t)
+	serverCert, serverKey := ca.issue(t, "localhost", x509.ExtKeyUsageServerAuth)
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "server.crt")
+	keyFile := filepath.Join(dir, "server.key")
+	writeFile(t, certFile, serverCert)
+	writeFile(t, keyFile, serverKey)
+
+	mgr, err := NewManager(Config{Name: "webhook", CertFile: certFile, KeyFile: keyFile}, noopLogger{}, noopMetrics{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.clientAuthType(); got != tls.NoClientCert {
+		t.Fatalf("a manager without a CA must not request client certificates, got auth type %d", got)
+	}
+
+	clientCfg := &tls.Config{ServerName: "localhost", RootCAs: poolOf(ca.certPEM)}
+	if serverErr, clientErr := handshake(t, mgr.TLSConfig(), clientCfg); serverErr != nil || clientErr != nil {
+		t.Fatalf("a client without a certificate must complete the handshake, got serverErr=%v clientErr=%v", serverErr, clientErr)
+	}
+}
+
+type gaugeRecorder struct {
+	mu   sync.Mutex
+	tags map[string]map[string]string
+}
+
+func (g *gaugeRecorder) Increment(string, map[string]string)          {}
+func (g *gaugeRecorder) Histogram(string, float64, map[string]string) {}
+func (g *gaugeRecorder) Gauge(name string, _ float64, tags map[string]string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.tags[name] = tags
+}
+
+// Two managers run side by side (merchant and webhook); without a listener
+// tag their expiry gauges would overwrite each other.
+func TestManager_NameTagsExpiryGauge(t *testing.T) {
+	ca := newCA(t)
+	serverCert, serverKey := ca.issue(t, "localhost", x509.ExtKeyUsageServerAuth)
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "server.crt")
+	keyFile := filepath.Join(dir, "server.key")
+	writeFile(t, certFile, serverCert)
+	writeFile(t, keyFile, serverKey)
+
+	rec := &gaugeRecorder{tags: map[string]map[string]string{}}
+	if _, err := NewManager(Config{Name: "webhook", CertFile: certFile, KeyFile: keyFile}, noopLogger{}, rec); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.tags[ports.MetricTLSCertExpirySeconds]["listener"]; got != "webhook" {
+		t.Errorf("expiry gauge must carry listener=webhook, got tags %v", rec.tags[ports.MetricTLSCertExpirySeconds])
+	}
+}

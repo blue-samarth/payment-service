@@ -21,12 +21,14 @@ import (
 	"samarth/payment-service/internal/api/handlers"
 	"samarth/payment-service/internal/api/middleware"
 	"samarth/payment-service/internal/app/cancel"
+	"samarth/payment-service/internal/app/gatewaystatus"
 	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/app/payment"
 	"samarth/payment-service/internal/app/refund"
 	approuting "samarth/payment-service/internal/app/routing"
 	"samarth/payment-service/internal/app/webhook"
 	"samarth/payment-service/internal/bootstrap"
+	"samarth/payment-service/internal/ports"
 )
 
 func main() {
@@ -157,14 +159,16 @@ func run() error {
 		return fmt.Errorf("no auth tokens configured: set SERVICE_TOKENS or OPS_TOKENS, or set ALLOW_NO_AUTH=true to explicitly run without authentication")
 	}
 
-	handler := api.NewRouter(api.Deps{
+	deps := api.Deps{
 		Payment: handlers.NewPaymentHandler(paymentSvc),
 		Refund:  handlers.NewRefundHandler(refundSvc),
 		Cancel:  handlers.NewCancelHandler(cancelSvc),
 		Webhook: handlers.NewWebhookHandler(webhookSvc, registry, webhookSecrets, configStore, logger),
 		Health: handlers.NewHealthHandler(
-			handlers.Check{Name: "database", Pinger: db},
-			handlers.Check{Name: "redis", Pinger: redisClient},
+			db,
+			redisClient,
+			gatewaystatus.NewService(registry, configStore, router, cbStore, logger),
+			logger,
 		),
 		Logger:  logger,
 		Auth:    authProvider,
@@ -173,68 +177,123 @@ func run() error {
 			Capacity:     getEnvInt64("RATE_LIMIT_CAPACITY", 100),
 			RefillPerSec: getEnvFloat("RATE_LIMIT_REFILL_PER_SEC", 50),
 		},
-	})
-
-	srv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.App.Port),
-		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	var tlsMgr *security.Manager
+	refreshCtx, cancelRefresh := context.WithCancel(context.Background())
+	defer cancelRefresh()
+	refreshInterval := time.Duration(cfg.Security.CertRefreshIntervalSec) * time.Second
+
+	merchantTransport := "plain"
+	var merchantTLS *security.Manager
 	if cfg.Security.TLSCertFile != "" {
+		merchantTransport = "mtls"
 		if !cfg.App.MtlsStrictMode {
+			merchantTransport = "mtls_optional"
 			logger.Warn("mtls.optional_mode", map[string]any{
 				"warning": "MTLS_STRICT_MODE=false: client certificates are requested but not enforced",
 			})
 		}
-		tlsMgr, err = security.NewManager(security.Config{
+		merchantTLS, err = security.NewManager(security.Config{
+			Name:            "merchant",
 			CertFile:        cfg.Security.TLSCertFile,
 			KeyFile:         cfg.Security.TLSKeyFile,
 			CAFile:          cfg.Security.TLSCAFile,
 			OptionalMTLS:    !cfg.App.MtlsStrictMode,
-			RefreshInterval: time.Duration(cfg.Security.CertRefreshIntervalSec) * time.Second,
+			RefreshInterval: refreshInterval,
 		}, logger, metrics)
 		if err != nil {
-			return fmt.Errorf("configure mTLS: %w", err)
+			return fmt.Errorf("configure merchant mTLS: %w", err)
 		}
-		srv.TLSConfig = tlsMgr.TLSConfig()
-
-		refreshCtx, cancelRefresh := context.WithCancel(context.Background())
-		defer cancelRefresh()
-		tlsMgr.StartRefresh(refreshCtx)
+		merchantTLS.StartRefresh(refreshCtx)
 	}
 
-	serverErr := make(chan error, 1)
-	go func() {
-		logger.Info("http.server_starting", map[string]any{
-			"port": cfg.App.Port,
-			"tls":  tlsMgr != nil,
-			"mtls": tlsMgr != nil && cfg.App.MtlsStrictMode,
+	webhookTransport := "plain_lb_terminated"
+	var webhookTLS *security.Manager
+	if cfg.App.WebhookTLSMode == config.WebhookTLSModeApp {
+		webhookTransport = "tls"
+		webhookTLS, err = security.NewManager(security.Config{
+			Name:            "webhook",
+			CertFile:        cfg.Security.WebhookTLSCertFile,
+			KeyFile:         cfg.Security.WebhookTLSKeyFile,
+			RefreshInterval: refreshInterval,
+		}, logger, metrics)
+		if err != nil {
+			return fmt.Errorf("configure webhook TLS: %w", err)
+		}
+		webhookTLS.StartRefresh(refreshCtx)
+	} else {
+		logger.Warn("webhook.tls_terminated_upstream", map[string]any{
+			"warning": "WEBHOOK_TLS_MODE=lb: the webhook listener serves plain HTTP and relies on the load balancer to terminate TLS",
 		})
-		var serveErr error
-		if tlsMgr != nil {
-			serveErr = srv.ListenAndServeTLS("", "")
-		} else {
-			serveErr = srv.ListenAndServe()
+	}
+
+	return serve(logger, []listener{
+		{name: "merchant", port: cfg.App.Port, handler: api.NewMerchantRouter(deps), tls: merchantTLS, transport: merchantTransport},
+		{name: "webhook", port: cfg.App.WebhookPort, handler: api.NewWebhookRouter(deps), tls: webhookTLS, transport: webhookTransport},
+		{name: "health", port: cfg.App.HealthPort, handler: api.NewHealthRouter(deps), transport: "plain"},
+	})
+}
+
+type listener struct {
+	name      string
+	port      int
+	handler   http.Handler
+	tls       *security.Manager
+	transport string
+}
+
+func serve(logger ports.Logger, listeners []listener) error {
+	servers := make([]*http.Server, len(listeners))
+	serverErr := make(chan error, len(listeners))
+
+	for i, l := range listeners {
+		srv := &http.Server{
+			Addr:              fmt.Sprintf(":%d", l.port),
+			Handler:           l.handler,
+			ReadHeaderTimeout: 10 * time.Second,
 		}
-		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			serverErr <- serveErr
+		if l.tls != nil {
+			srv.TLSConfig = l.tls.TLSConfig()
 		}
-	}()
+		servers[i] = srv
+
+		go func() {
+			logger.Info("http.server_starting", map[string]any{
+				"listener":  l.name,
+				"port":      l.port,
+				"transport": l.transport,
+			})
+			var err error
+			if l.tls != nil {
+				err = srv.ListenAndServeTLS("", "")
+			} else {
+				err = srv.ListenAndServe()
+			}
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				serverErr <- fmt.Errorf("%s listener: %w", l.name, err)
+			}
+		}()
+	}
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stop)
 
+	var runErr error
 	select {
-	case err := <-serverErr:
-		return fmt.Errorf("http server: %w", err)
+	case runErr = <-serverErr:
 	case <-stop:
-		logger.Info("http.server_stopping", nil)
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutdownCtx)
 	}
+
+	logger.Info("http.server_stopping", nil)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	for _, srv := range servers {
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+	}
+	return runErr
 }
 
 type circuitBreakerAdapter struct {
