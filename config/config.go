@@ -386,8 +386,8 @@ func Validate(c *Config) error {
 		errs = append(errs, "REDIS_ADDRS must be a single primary endpoint: multiple addresses switch the client to cluster mode, which supports only database 0 and cannot keep REDIS_RATE_LIMIT_DB and REDIS_CACHE_DB apart")
 	}
 	for _, addr := range c.Redis.Addrs {
-		if _, _, err := net.SplitHostPort(addr); err != nil {
-			errs = append(errs, "REDIS_ADDRS must be in host:port form")
+		if !validHostPort(addr) {
+			errs = append(errs, "REDIS_ADDRS must be in host:port form, with a non-empty host and a port between 1 and 65535")
 			break
 		}
 	}
@@ -442,6 +442,15 @@ func Validate(c *Config) error {
 		return errors.New("config validation failed:\n  - " + strings.Join(errs, "\n  - "))
 	}
 	return nil
+}
+
+func validHostPort(addr string) bool {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host == "" {
+		return false
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	return err == nil && n > 0
 }
 
 func quoteDSNValue(v string) string {

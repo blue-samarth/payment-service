@@ -119,12 +119,38 @@ func TestValidate_RejectsMultipleRedisAddrs(t *testing.T) {
 	}
 }
 
-func TestValidate_RedisAddrMustIncludePort(t *testing.T) {
-	c := validatableConfig()
-	c.Redis.Addrs = []string{"redis.internal"}
-	err := Validate(c)
-	if err == nil || !strings.Contains(err.Error(), "host:port") {
-		t.Fatalf("expected an address without a port to be rejected, got: %v", err)
+func TestValidate_RedisAddrForm(t *testing.T) {
+	// net.SplitHostPort accepts an empty host or port without error, so each
+	// component is checked on its own.
+	rejected := map[string]string{
+		"no port":          "redis.internal",
+		"empty port":       "redis.internal:",
+		"empty host":       ":6379",
+		"non-numeric port": "redis.internal:abc",
+		"signed port":      "redis.internal:+6379",
+		"port zero":        "redis.internal:0",
+		"port too large":   "redis.internal:65536",
+	}
+	for name, addr := range rejected {
+		t.Run(name, func(t *testing.T) {
+			c := validatableConfig()
+			c.Redis.Addrs = []string{addr}
+			err := Validate(c)
+			if err == nil || !strings.Contains(err.Error(), "host:port") {
+				t.Fatalf("expected %q to be rejected, got: %v", addr, err)
+			}
+		})
+	}
+
+	accepted := []string{"redis.internal:6379", "10.0.0.5:6379", "[::1]:6379", "redis.internal:65535"}
+	for _, addr := range accepted {
+		t.Run("valid "+addr, func(t *testing.T) {
+			c := validatableConfig()
+			c.Redis.Addrs = []string{addr}
+			if err := Validate(c); err != nil {
+				t.Fatalf("expected %q to be accepted, got: %v", addr, err)
+			}
+		})
 	}
 }
 
