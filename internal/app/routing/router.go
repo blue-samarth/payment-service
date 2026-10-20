@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"samarth/payment-service/internal/app/payment"
+	"samarth/payment-service/internal/domain/gateway"
 	domainrouting "samarth/payment-service/internal/domain/routing"
 	"samarth/payment-service/internal/ports"
 )
@@ -75,23 +76,11 @@ func (r *Router) Route(ctx context.Context, in payment.RouteInput) (*domainrouti
 		}
 		calculatedFee := fee.CalculateFee(in.Amount, cfg.Metrics.Volume7d)
 
-		cbState, cbCooldown := r.liveBreakerState(ctx, cfg.GatewayID, cfg.CircuitBreaker)
+		cbState, cbCooldown, _ := r.liveBreakerState(ctx, cfg.GatewayID, cfg.CircuitBreaker)
 
-		candidates = append(candidates, domainrouting.Candidate{
-			GatewayID:           cfg.GatewayID,
-			IsActive:            cfg.IsActive,
-			MinAmountPaise:      cfg.MinAmount,
-			MaxAmountPaise:      cfg.MaxAmount,
-			SupportedCurrencies: cfg.SupportedCurrencies,
-			CooldownUntil:       cbCooldown,
-			CircuitBreakerState: cbState,
-			DiscrepancyRate24h:  cfg.Metrics.DiscrepancyRate24h,
-			P99LatencyMs:        cfg.Metrics.P99LatencyMs,
-			Volume7dPaise:       cfg.Metrics.Volume7d,
-			FXEfficiencyRatio:   cfg.Metrics.FXEfficiencyRatio,
-			CalculatedFeePaise:  calculatedFee,
-			Priority:            cfg.Priority,
-		})
+		candidate := gatewayCandidate(cfg, cbState, cbCooldown)
+		candidate.CalculatedFeePaise = calculatedFee
+		candidates = append(candidates, candidate)
 
 		if calculatedFee > maxFee {
 			maxFee = calculatedFee
@@ -139,18 +128,50 @@ func (r *Router) applyActiveIntents(ctx context.Context, candidates []domainrout
 	}
 }
 
-func (r *Router) liveBreakerState(ctx context.Context, gatewayID string, fallback ports.CircuitBreakerState) (string, time.Time) {
+type Availability struct {
+	BreakerState  string
+	CooldownUntil time.Time
+	Reason        string
+}
+
+func (r *Router) Availability(ctx context.Context, cfg *ports.GatewayConfig) (Availability, error) {
+	state, cooldown, err := r.liveBreakerState(ctx, cfg.GatewayID, cfg.CircuitBreaker)
+	return Availability{
+		BreakerState:  state,
+		CooldownUntil: cooldown,
+		Reason:        domainrouting.UnavailableReason(gatewayCandidate(cfg, state, cooldown)),
+	}, err
+}
+
+func gatewayCandidate(cfg *ports.GatewayConfig, breakerState string, cooldownUntil time.Time) domainrouting.Candidate {
+	return domainrouting.Candidate{
+		GatewayID:           cfg.GatewayID,
+		IsActive:            cfg.IsActive,
+		MinAmountPaise:      cfg.MinAmount,
+		MaxAmountPaise:      cfg.MaxAmount,
+		SupportedCurrencies: cfg.SupportedCurrencies,
+		CooldownUntil:       cooldownUntil,
+		CircuitBreakerState: breakerState,
+		DiscrepancyRate24h:  cfg.Metrics.DiscrepancyRate24h,
+		P99LatencyMs:        cfg.Metrics.P99LatencyMs,
+		Volume7dPaise:       cfg.Metrics.Volume7d,
+		FXEfficiencyRatio:   cfg.Metrics.FXEfficiencyRatio,
+		Priority:            cfg.Priority,
+	}
+}
+
+func (r *Router) liveBreakerState(ctx context.Context, gatewayID string, fallback ports.CircuitBreakerState) (string, time.Time, error) {
 	if r.breaker == nil {
-		return fallback.State, fallback.CooldownUntil
+		return fallback.State, fallback.CooldownUntil, nil
 	}
 	state, cooldown, err := r.breaker.BreakerState(ctx, gatewayID)
 	if err != nil {
-		return fallback.State, fallback.CooldownUntil
+		return fallback.State, fallback.CooldownUntil, err
 	}
-	if state == "OPEN" && !cooldown.IsZero() && !time.Now().UTC().Before(cooldown) {
-		return "HALF_OPEN", time.Time{}
+	if effective := gateway.EffectiveState(gateway.CircuitState(state), cooldown, time.Now().UTC()); effective != gateway.CircuitState(state) {
+		return string(effective), time.Time{}, nil
 	}
-	return state, cooldown
+	return state, cooldown, nil
 }
 
 func excludeGateways(configs []*ports.GatewayConfig, exclude []string) []*ports.GatewayConfig {

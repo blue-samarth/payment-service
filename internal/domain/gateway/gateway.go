@@ -60,6 +60,13 @@ func (cb *CircuitBreaker) IsRoutable() bool {
 func (cb *CircuitBreaker) ShouldTransitionToHalfOpen() bool {
 	return cb.State == StateOpen && time.Now().UTC().After(cb.CooldownUntil)
 }
+
+func EffectiveState(state CircuitState, cooldownUntil, now time.Time) CircuitState {
+	if state == StateOpen && !cooldownUntil.IsZero() && !now.Before(cooldownUntil) {
+		return StateHalfOpen
+	}
+	return state
+}
 func (d *DiscrepancyMetrics) IsResolved() bool {
 	return d.DaysSinceDiscrepancy >= 1 && d.EffectiveRate() < 0.001
 }

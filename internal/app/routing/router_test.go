@@ -272,3 +272,48 @@ func (s stateByGateway) BreakerState(_ context.Context, gatewayID string) (strin
 	}
 	return "CLOSED", time.Time{}, nil
 }
+
+// Availability backs /health-gateways. It must never disagree with Route: a
+// gateway reported available has to be one Route would actually select.
+func TestAvailability_AgreesWithRoute(t *testing.T) {
+	now := time.Now().UTC()
+	cases := []struct {
+		name        string
+		active      bool
+		discrepancy float64
+		breaker     fakeBreakerState
+		wantState   string
+		wantReason  string
+		wantErr     bool
+	}{
+		{"closed", true, 0.01, fakeBreakerState{state: "CLOSED"}, "CLOSED", "", false},
+		{"open within cooldown", true, 0.01, fakeBreakerState{state: "OPEN", cooldown: now.Add(time.Hour)}, "OPEN", "circuit_breaker_cooldown", false},
+		{"open past cooldown probes half-open", true, 0.01, fakeBreakerState{state: "OPEN", cooldown: now.Add(-time.Hour)}, "HALF_OPEN", "", false},
+		{"open without cooldown", true, 0.01, fakeBreakerState{state: "OPEN"}, "OPEN", "circuit_breaker_open", false},
+		{"breaker store down falls back to config", true, 0.01, fakeBreakerState{err: errors.New("redis down")}, "CLOSED", "", true},
+		{"inactive", false, 0.01, fakeBreakerState{state: "CLOSED"}, "CLOSED", "inactive", false},
+		{"discrepancy too high", true, 0.30, fakeBreakerState{state: "CLOSED"}, "CLOSED", "discrepancy_rate_exceeded_0.30", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := gatewayConfig("g1", 0)
+			cfg.IsActive = tc.active
+			cfg.Metrics.DiscrepancyRate24h = tc.discrepancy
+			r := NewRouter(&fakeConfig{gateways: []*ports.GatewayConfig{cfg}, weights: equalWeights()})
+			r.SetBreakerState(tc.breaker)
+
+			avail, err := r.Availability(context.Background(), cfg)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("breaker error = %v, want error %v", err, tc.wantErr)
+			}
+			if avail.BreakerState != tc.wantState || avail.Reason != tc.wantReason {
+				t.Fatalf("got state=%q reason=%q, want state=%q reason=%q", avail.BreakerState, avail.Reason, tc.wantState, tc.wantReason)
+			}
+
+			_, routeErr := r.Route(context.Background(), validInput())
+			if routable := routeErr == nil; routable != (avail.Reason == "") {
+				t.Errorf("Availability (reason %q) and Route (err %v) disagree", avail.Reason, routeErr)
+			}
+		})
+	}
+}
