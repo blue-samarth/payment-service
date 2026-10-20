@@ -88,6 +88,35 @@ func TestWebhook_ValidEventProcesses(t *testing.T) {
 	}
 }
 
+func TestWebhook_OversizedBodyIs413(t *testing.T) {
+	proc := &fakeProcessor{}
+	h := newHandler(proc, fakeParser{event: okEvent()}, "shh", nil)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/gateway/stripe", strings.NewReader(strings.Repeat("x", maxWebhookBodyBytes+1)))
+	req.SetPathValue("gateway_id", "stripe")
+	rec := httptest.NewRecorder()
+	h.Handle(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge || !strings.Contains(rec.Body.String(), "body_too_large") {
+		t.Fatalf("an oversized body must be refused with 413, not truncated into a signature failure, got %d %s", rec.Code, rec.Body.String())
+	}
+	if proc.calls != 0 {
+		t.Error("an oversized body must not be processed")
+	}
+}
+
+func TestWebhook_BodyAtTheLimitIsAccepted(t *testing.T) {
+	proc := &fakeProcessor{outcome: appwebhook.Outcome{Resolved: true}}
+	h := newHandler(proc, fakeParser{event: okEvent()}, "shh", nil)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/gateway/stripe", strings.NewReader(strings.Repeat("x", maxWebhookBodyBytes)))
+	req.SetPathValue("gateway_id", "stripe")
+	rec := httptest.NewRecorder()
+	h.Handle(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a body of exactly 1 MiB must be accepted, got %d", rec.Code)
+	}
+}
+
 func TestWebhook_InvalidSignature401(t *testing.T) {
 	proc := &fakeProcessor{}
 	h := newHandler(proc, fakeParser{err: ports.ErrWebhookSignature}, "shh", nil)

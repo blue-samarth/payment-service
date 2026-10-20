@@ -28,6 +28,8 @@ type cachedResponse struct {
 	GatewayReferenceID string `json:"gateway_reference_id"`
 }
 
+const reinitiateWindow = 23 * time.Hour
+
 type outcome struct {
 	terminal      bool
 	newStatus     transaction.Status
@@ -68,6 +70,7 @@ func (s *Service) ProcessPayment(ctx context.Context, transactionID uuid.UUID) (
 		now := time.Now().UTC()
 		txn.ProcessingStartedAt = &now
 		txn.ProcessingTimeout = &timeout
+		txn.ActualGateway = txn.GatewayID
 		return s.repo.UpdateStatus(ctx, txn)
 	})
 	if err != nil {
@@ -77,10 +80,11 @@ func (s *Service) ProcessPayment(ctx context.Context, transactionID uuid.UUID) (
 		return s.repo.GetByID(ctx, txn.ID)
 	}
 
-	s.enterIntent(ctx, txn.GatewayID, txn.ID, timeout)
+	work := context.WithoutCancel(ctx)
+	s.enterIntent(work, txn.GatewayID, txn.ID, timeout)
 
-	resp, result := s.attemptGateways(ctx, adapter, txn)
-	return s.finalize(ctx, txn, resp, result)
+	resp, result := s.attemptGateways(work, adapter, txn)
+	return s.finalize(work, txn, resp, result)
 }
 
 func (s *Service) RecoverExpiredLease(ctx context.Context, transactionID uuid.UUID) (*transaction.Transaction, error) {
@@ -102,8 +106,26 @@ func (s *Service) RecoverExpiredLease(ctx context.Context, transactionID uuid.UU
 	}
 	txn.GatewayID = gateway
 
-	resp, gwErr := s.checkStatus(ctx, adapter, txn)
+	var resp *ports.GatewayPaymentResponse
+	var gwErr *ports.GatewayError
+	if txn.GatewayReferenceID == "" {
+		if txn.ProcessingStartedAt == nil || time.Since(*txn.ProcessingStartedAt) > reinitiateWindow {
+			s.log.Error(ports.LogEventTransactionLeaseExpired, map[string]any{
+				ports.FieldErrorCode:     "recovery_requires_manual_review",
+				ports.FieldTraceID:       "",
+				ports.FieldTransactionID: txn.ID.String(),
+				ports.FieldGatewayID:     gateway,
+			}, errors.New("no gateway reference and the idempotent replay window has passed"))
+			return txn, nil
+		}
+		resp, gwErr = s.callGateway(ctx, adapter, txn)
+	} else {
+		resp, gwErr = s.checkStatus(ctx, adapter, txn)
+	}
 	result := resolveOutcome(resp, gwErr)
+	if txn.GatewayReferenceID == "" && gwErr != nil && !isDecline(gwErr) {
+		result = outcome{terminal: false}
+	}
 	s.recordBreaker(ctx, gateway, gwErr)
 
 	if !result.terminal {
@@ -256,12 +278,30 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 
 		prevGateway := txn.GatewayID
 		txn.GatewayID = next
+		txn.ActualGateway = next
+		if err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
+			return s.repo.UpdateStatus(ctx, txn)
+		}); err != nil {
+			s.log.Warn(ports.LogEventGatewayFallback, map[string]any{
+				ports.FieldTransactionID: txn.ID.String(),
+				ports.FieldGatewayID:     next,
+				"error":                  err.Error(),
+				"stage":                  "persist_fallback",
+			})
+			txn.GatewayID = prevGateway
+			txn.ActualGateway = prevGateway
+			return resp, result
+		}
 		adapter = nextAdapter
 		if txn.ProcessingTimeout != nil {
 			s.exitIntent(ctx, prevGateway, txn.ID)
 			s.enterIntent(ctx, next, txn.ID, *txn.ProcessingTimeout)
 		}
 	}
+}
+
+func isDecline(gwErr *ports.GatewayError) bool {
+	return gwErr.Category == ports.ErrorCategoryHardDecline || gwErr.Category == ports.ErrorCategorySoftDecline
 }
 
 func shouldFallback(gwErr *ports.GatewayError) bool {

@@ -92,6 +92,8 @@ const (
 	WebhookTLSModeLB  = "lb"
 )
 
+const MinTokenLength = 32
+
 type AppConfig struct {
 	Environment    string
 	ServiceVersion string
@@ -265,7 +267,7 @@ func LoadConfig() (*Config, error) {
 	c.App.ShutdownTimeout = getEnvDuration("SHUTDOWN_TIMEOUT", 15*time.Second, &errs)
 
 	c.Auth.ServiceTokens = parseServiceTokens(os.Getenv("SERVICE_TOKENS"), &errs)
-	c.Auth.OpsTokens = splitList(os.Getenv("OPS_TOKENS"))
+	c.Auth.OpsTokens = parseOpsTokens(os.Getenv("OPS_TOKENS"), &errs)
 	c.Auth.WebhookSecrets = parseWebhookSecrets(os.Getenv("WEBHOOK_SECRETS"), &errs)
 
 	c.Startup.ConnectMaxAttempts = getEnvInt("STARTUP_CONNECT_MAX_ATTEMPTS", 5, &errs)
@@ -409,6 +411,14 @@ func Validate(c *Config) error {
 	validEnvs := map[string]bool{"prod": true, "staging": true, "dev": true}
 	if !validEnvs[c.App.Environment] {
 		errs = append(errs, "ENVIRONMENT must be one of: prod, staging, dev")
+	}
+	if c.App.Environment == "prod" {
+		if c.App.AllowNoAuth {
+			errs = append(errs, "ALLOW_NO_AUTH=true is not allowed when ENVIRONMENT=prod")
+		}
+		if !c.App.MtlsStrictMode {
+			errs = append(errs, "MTLS_STRICT_MODE=false is not allowed when ENVIRONMENT=prod")
+		}
 	}
 
 	validLogLevels := map[string]bool{
@@ -554,16 +564,39 @@ func parseServiceTokens(raw string, errs *[]string) map[string]string {
 			*errs = append(*errs, fmt.Sprintf("SERVICE_TOKENS entry %d must be token=merchantID", i+1))
 			continue
 		}
-		token, merchant := entry[:sep], entry[sep+1:]
-		if _, err := uuid.Parse(merchant); err != nil {
+		token := entry[:sep]
+		merchant, err := uuid.Parse(entry[sep+1:])
+		if err != nil {
 			*errs = append(*errs, fmt.Sprintf("SERVICE_TOKENS entry %d: merchant ID must be a UUID", i+1))
+			continue
+		}
+		if len(token) < MinTokenLength {
+			*errs = append(*errs, fmt.Sprintf("SERVICE_TOKENS entry %d: token must be at least %d characters", i+1, MinTokenLength))
 			continue
 		}
 		if _, dup := out[token]; dup {
 			*errs = append(*errs, fmt.Sprintf("SERVICE_TOKENS entry %d repeats an earlier token", i+1))
 			continue
 		}
-		out[token] = merchant
+		out[token] = merchant.String()
+	}
+	return out
+}
+
+func parseOpsTokens(raw string, errs *[]string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for i, token := range splitList(raw) {
+		if len(token) < MinTokenLength {
+			*errs = append(*errs, fmt.Sprintf("OPS_TOKENS entry %d: token must be at least %d characters", i+1, MinTokenLength))
+			continue
+		}
+		if seen[token] {
+			*errs = append(*errs, fmt.Sprintf("OPS_TOKENS entry %d repeats an earlier token", i+1))
+			continue
+		}
+		seen[token] = true
+		out = append(out, token)
 	}
 	return out
 }

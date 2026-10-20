@@ -118,6 +118,41 @@ func TestRateLimit_IgnoresForwardedForFromUntrustedPeer(t *testing.T) {
 	}
 }
 
+func TestRateLimit_IPv6SharesOneBucketPer64(t *testing.T) {
+	for name, keys := range map[string]RateLimitKeys{
+		"merchant": RequestKeys(nil),
+		"webhook":  WebhookKeys(nil),
+	} {
+		t.Run(name, func(t *testing.T) {
+			lim := &fakeLimiter{allow: true}
+			h := RateLimit(lim, testCfg, noopLog{}, keys)(okHandler())
+
+			for _, remote := range []string{"[2001:db8:1:2::1]:1", "[2001:db8:1:2:ffff:ffff:ffff:ffff]:1"} {
+				req := httptest.NewRequest(http.MethodPost, "/", nil)
+				req.RemoteAddr = remote
+				h.ServeHTTP(httptest.NewRecorder(), req)
+				if lim.gotIP != "2001:db8:1:2::/64" {
+					t.Fatalf("addresses in one /64 must share a bucket, got %q", lim.gotIP)
+				}
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/", nil)
+			req.RemoteAddr = "[2001:db8:1:3::1]:1"
+			h.ServeHTTP(httptest.NewRecorder(), req)
+			if lim.gotIP != "2001:db8:1:3::/64" {
+				t.Fatalf("a different /64 gets its own bucket, got %q", lim.gotIP)
+			}
+
+			req = httptest.NewRequest(http.MethodPost, "/", nil)
+			req.RemoteAddr = "203.0.113.5:1"
+			h.ServeHTTP(httptest.NewRecorder(), req)
+			if lim.gotIP != "203.0.113.5" {
+				t.Fatalf("IPv4 stays keyed per address, got %q", lim.gotIP)
+			}
+		})
+	}
+}
+
 func TestRateLimit_WebhookKeysArePerIP(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
 	keys := WebhookKeys(nil)

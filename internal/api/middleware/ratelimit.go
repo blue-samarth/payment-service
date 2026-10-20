@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"time"
 
@@ -23,19 +24,29 @@ type RateLimitConfig struct {
 	RefillPerSec float64
 }
 
+const ipv6BucketPrefix = 64
+
 type RateLimitKeys func(r *http.Request) (userID, merchantID, ip string)
 
 func RequestKeys(clientIP *ClientIP) RateLimitKeys {
 	return func(r *http.Request) (string, string, string) {
-		return r.Header.Get("X-User-ID"), merchantBucketID(r.Context()), clientIP.From(r)
+		return r.Header.Get("X-User-ID"), merchantBucketID(r.Context()), bucketIP(clientIP.From(r))
 	}
 }
 
 func WebhookKeys(clientIP *ClientIP) RateLimitKeys {
 	return func(r *http.Request) (string, string, string) {
-		ip := clientIP.From(r)
+		ip := bucketIP(clientIP.From(r))
 		return "webhook:" + ip, "webhook:" + ip, ip
 	}
+}
+
+func bucketIP(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || !addr.Is6() || addr.Is4In6() {
+		return ip
+	}
+	return netip.PrefixFrom(addr, ipv6BucketPrefix).Masked().String()
 }
 
 func RateLimit(limiter Limiter, cfg RateLimitConfig, log ports.Logger, keys RateLimitKeys) func(http.Handler) http.Handler {

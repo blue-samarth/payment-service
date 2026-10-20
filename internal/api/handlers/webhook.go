@@ -12,6 +12,8 @@ import (
 	"samarth/payment-service/internal/ports"
 )
 
+const maxWebhookBodyBytes = 1 << 20
+
 type WebhookProcessor interface {
 	Process(ctx context.Context, gatewayID string, ev appwebhook.Event, rawPayload []byte) (appwebhook.Outcome, error)
 }
@@ -40,8 +42,13 @@ func NewWebhookHandler(processor WebhookProcessor, parsers WebhookParserResolver
 func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	gatewayID := r.PathValue("gateway_id")
 
-	rawBody, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	rawBody, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxWebhookBodyBytes))
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "body_too_large", "webhook body exceeds 1 MiB")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid_body", "could not read webhook body")
 		return
 	}

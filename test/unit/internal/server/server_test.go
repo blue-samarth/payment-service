@@ -323,6 +323,37 @@ func TestRun_HealthListenerStopsLast(t *testing.T) {
 	}
 }
 
+func TestRun_HealthKeepsItsOwnDeadlineWhenOthersUseTheBudget(t *testing.T) {
+	merchantStarted, healthStarted := make(chan struct{}, 1), make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+	r := start(t, []server.Listener{
+		{Name: "merchant", Addr: "127.0.0.1:0", Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			merchantStarted <- struct{}{}
+			<-release
+		})},
+		{Name: "health", Addr: "127.0.0.1:0", Handler: slow(600*time.Millisecond, healthStarted), DrainLast: true},
+	}, server.Options{ShutdownTimeout: 200 * time.Millisecond})
+
+	go func() { _, _ = get(r.url("merchant", "/")) }()
+	<-merchantStarted
+	healthCode := make(chan int, 1)
+	go func() {
+		code, _ := get(r.url("health", "/"))
+		healthCode <- code
+	}()
+	<-healthStarted
+
+	r.cancel()
+	err := r.wait(t, 3*time.Second)
+	if err == nil || !strings.Contains(err.Error(), "merchant listener") || strings.Contains(err.Error(), "health listener") {
+		t.Fatalf("only the hung merchant listener should be force-closed, got: %v", err)
+	}
+	if code := <-healthCode; code != http.StatusOK {
+		t.Fatalf("an in-flight probe must finish even after the others used the whole budget, got %d", code)
+	}
+}
+
 func TestRun_ServeErrorStopsTheOthers(t *testing.T) {
 	r := start(t, []server.Listener{
 		{Name: "merchant", Addr: "127.0.0.1:0", Handler: http.HandlerFunc(ok), TLS: &tls.Config{}},

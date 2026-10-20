@@ -115,7 +115,9 @@ func (h *HealthHandler) Overall(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case remaining <= 0:
 			components[key] = statusExpired
-			status, code = statusUnhealthy, http.StatusServiceUnavailable
+			if status == statusHealthy {
+				status = statusDegraded
+			}
 		case remaining < certExpiringWindow:
 			components[key] = statusExpiring
 		default:

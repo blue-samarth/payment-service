@@ -13,6 +13,8 @@ import (
 	"samarth/payment-service/internal/ports"
 )
 
+const drainLastTimeout = 5 * time.Second
+
 type Timeouts struct {
 	ReadHeader time.Duration
 	Read       time.Duration
@@ -90,11 +92,13 @@ func Run(ctx context.Context, listeners []Listener, opts Options) error {
 		opts.OnDraining()
 	}
 	if runErr == nil && opts.DrainDelay > 0 {
-		time.Sleep(opts.DrainDelay)
+		timer := time.NewTimer(opts.DrainDelay)
+		select {
+		case <-timer.C:
+		case runErr = <-serveErr:
+			timer.Stop()
+		}
 	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), opts.ShutdownTimeout)
-	defer cancel()
 
 	var first, last []running
 	for _, r := range bound {
@@ -104,8 +108,14 @@ func Run(ctx context.Context, listeners []Listener, opts Options) error {
 			first = append(first, r)
 		}
 	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), opts.ShutdownTimeout)
+	defer cancel()
 	runErr = errors.Join(runErr, shutdownAll(shutdownCtx, first, opts.Logger))
-	runErr = errors.Join(runErr, shutdownAll(shutdownCtx, last, opts.Logger))
+
+	lastCtx, cancelLast := context.WithTimeout(context.Background(), drainLastTimeout)
+	defer cancelLast()
+	runErr = errors.Join(runErr, shutdownAll(lastCtx, last, opts.Logger))
 
 	wg.Wait()
 	close(serveErr)

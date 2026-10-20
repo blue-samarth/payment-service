@@ -545,6 +545,51 @@ func TestManager_NameTagsExpiryGauge(t *testing.T) {
 	}
 }
 
+func webhookManager(t *testing.T, ca *certAuthority, minVersion uint16) (*Manager, error) {
+	t.Helper()
+	serverCert, serverKey := ca.issue(t, "localhost", x509.ExtKeyUsageServerAuth)
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "server.crt")
+	keyFile := filepath.Join(dir, "server.key")
+	writeFile(t, certFile, serverCert)
+	writeFile(t, keyFile, serverKey)
+	return NewManager(Config{Name: "webhook", CertFile: certFile, KeyFile: keyFile, MinVersion: minVersion}, noopLogger{}, noopMetrics{})
+}
+
+func TestManager_TLS12FloorAdmitsTLS12WithAEADOnly(t *testing.T) {
+	ca := newCA(t)
+	mgr, err := webhookManager(t, ca, tls.VersionTLS12)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tls12 := &tls.Config{ServerName: "localhost", RootCAs: poolOf(ca.certPEM), MaxVersion: tls.VersionTLS12}
+	if serverErr, clientErr := handshake(t, mgr.TLSConfig(), tls12); serverErr != nil || clientErr != nil {
+		t.Fatalf("a TLS 1.2 gateway sender must be admitted, got serverErr=%v clientErr=%v", serverErr, clientErr)
+	}
+
+	cbcOnly := &tls.Config{
+		ServerName:   "localhost",
+		RootCAs:      poolOf(ca.certPEM),
+		MaxVersion:   tls.VersionTLS12,
+		CipherSuites: []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA},
+	}
+	if serverErr, _ := handshake(t, mgr.TLSConfig(), cbcOnly); serverErr == nil {
+		t.Fatal("a TLS 1.2 client offering only CBC suites must be refused")
+	}
+
+	tls11 := &tls.Config{ServerName: "localhost", RootCAs: poolOf(ca.certPEM), MinVersion: tls.VersionTLS10, MaxVersion: tls.VersionTLS11}
+	if serverErr, _ := handshake(t, mgr.TLSConfig(), tls11); serverErr == nil {
+		t.Fatal("TLS 1.1 must be refused")
+	}
+}
+
+func TestManager_RejectsUnsupportedMinVersion(t *testing.T) {
+	if _, err := webhookManager(t, newCA(t), tls.VersionTLS11); err == nil {
+		t.Fatal("a minimum below TLS 1.2 must be rejected")
+	}
+}
+
 func TestManager_ExposesNameAndNotAfter(t *testing.T) {
 	ca := newCA(t)
 	notAfter := time.Now().Add(48 * time.Hour).Truncate(time.Second)

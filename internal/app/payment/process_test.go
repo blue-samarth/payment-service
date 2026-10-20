@@ -495,6 +495,185 @@ func TestRecoverExpiredLease_NetworkErrorStaysProcessing(t *testing.T) {
 	}
 }
 
+func TestProcessPayment_RecordsGatewayBeforeCallingIt(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	svc := processService(repo, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter})
+
+	if _, err := svc.ProcessPayment(context.Background(), txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	first := repo.snapshots[0]
+	if first.Status != transaction.StatusProcessing || first.ActualGateway != "stripe" {
+		t.Fatalf("the PROCESSING write must name the gateway about to be called, got status=%s gateway=%q", first.Status, first.ActualGateway)
+	}
+}
+
+func TestProcessPayment_FallbackRecordsNextGatewayBeforeCallingIt(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	first := &fakeAdapter{err: &ports.GatewayError{Category: ports.ErrorCategorySoftDecline, Code: "soft_decline"}}
+	var updatesBeforeSecondCall int
+	second := &fakeAdapter{
+		resp:       &ports.GatewayPaymentResponse{GatewayReferenceID: "pay_fb", Status: ports.GatewayPaymentStatusSucceeded},
+		onInitiate: func() { updatesBeforeSecondCall = repo.updates },
+	}
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": first, "razorpay": second}}
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
+	svc.SetMaxGatewayAttempts(2)
+
+	if _, err := svc.ProcessPayment(context.Background(), txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if updatesBeforeSecondCall != 2 || repo.snapshots[1].ActualGateway != "razorpay" {
+		t.Fatalf("the switch to razorpay must be persisted before razorpay is called, updates=%d snapshots=%+v", updatesBeforeSecondCall, repo.snapshots)
+	}
+}
+
+func TestProcessPayment_FallbackNotCalledWhenSwitchCannotBePersisted(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	first := &fakeAdapter{err: &ports.GatewayError{Category: ports.ErrorCategorySoftDecline, Code: "soft_decline"}}
+	second := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pay_fb", Status: ports.GatewayPaymentStatusSucceeded}}
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": first, "razorpay": second}}
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{failAt: 2}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
+	svc.SetMaxGatewayAttempts(2)
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.initiated) != 0 {
+		t.Fatal("a gateway whose selection is not recorded must never be charged: recovery would query the wrong gateway")
+	}
+	if got.ActualGateway != "stripe" || got.Status != transaction.StatusFailed {
+		t.Errorf("expected the soft decline on stripe to stand, got gateway=%q status=%s", got.ActualGateway, got.Status)
+	}
+}
+
+func TestProcessPayment_CallerCancellationDoesNotAbortGatewayCall(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	svc := processService(repo, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter})
+
+	got, err := svc.ProcessPayment(ctx, txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.ctxErrs[0] != nil {
+		t.Fatalf("the gateway call must not inherit the request's cancellation, got %v", adapter.ctxErrs[0])
+	}
+	if got.Status != transaction.StatusSucceeded || got.GatewayReferenceID != "pi_1" {
+		t.Errorf("a client that disconnects mid-charge must not prevent the result being recorded, got %s %q", got.Status, got.GatewayReferenceID)
+	}
+}
+
+func TestRecoverExpiredLease_NoReferenceReplaysTheOriginalRequest(t *testing.T) {
+	txn := processingExpiredTxn()
+	txn.GatewayReferenceID = ""
+	recent := time.Now().UTC().Add(-time.Hour)
+	txn.ProcessingStartedAt = &recent
+	repo := seedRepo(txn)
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_replayed", Status: ports.GatewayPaymentStatusSucceeded}}
+	svc := recoverService(repo, &fakeRegistry{adapter: adapter}, &fakeOutbox{})
+
+	got, err := svc.RecoverExpiredLease(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.statusChecks != 0 {
+		t.Fatal("a status check by an empty reference returns an error that would finalize a possibly-charged payment as FAILED")
+	}
+	if len(adapter.initiated) != 1 {
+		t.Fatalf("expected one idempotent replay, got %d", len(adapter.initiated))
+	}
+	req := adapter.initiated[0]
+	if req.TransactionID != txn.ID || req.AttemptNumber != 1 || req.Amount != txn.Amount || req.IdempotencyKey != txn.GatewayIdempotencyKey {
+		t.Errorf("the replay must be the original request so the gateway derives the same idempotency key, got %+v", req)
+	}
+	if got.Status != transaction.StatusSucceeded || got.GatewayReferenceID != "pi_replayed" {
+		t.Errorf("expected the replayed result recorded, got %s %q", got.Status, got.GatewayReferenceID)
+	}
+}
+
+func TestRecoverExpiredLease_ReplayErrorsOtherThanDeclinesStayProcessing(t *testing.T) {
+	cases := map[string]struct {
+		err      *ports.GatewayError
+		terminal bool
+	}{
+		"original still in flight": {&ports.GatewayError{Category: ports.ErrorCategoryIdempotencyConflict, Code: "idempotency_key_in_use"}, false},
+		"gateway 5xx":              {&ports.GatewayError{Category: ports.ErrorCategoryGatewayError, Code: "api_error"}, false},
+		"replayed hard decline":    {&ports.GatewayError{Category: ports.ErrorCategoryHardDecline, Code: "card_declined"}, true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			txn := processingExpiredTxn()
+			txn.GatewayReferenceID = ""
+			recent := time.Now().UTC().Add(-time.Hour)
+			txn.ProcessingStartedAt = &recent
+			repo := seedRepo(txn)
+			svc := recoverService(repo, &fakeRegistry{adapter: &fakeAdapter{err: tc.err}}, &fakeOutbox{})
+
+			got, err := svc.RecoverExpiredLease(context.Background(), txn.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.terminal {
+				if got.Status != transaction.StatusFailed {
+					t.Fatalf("a decline replayed by the gateway is a real outcome, got %s", got.Status)
+				}
+				return
+			}
+			if got.Status != transaction.StatusProcessing || repo.updates != 0 {
+				t.Fatalf("a replay error says nothing about whether the first call charged, so the txn must stay PROCESSING, got %s updates=%d", got.Status, repo.updates)
+			}
+		})
+	}
+}
+
+func TestRecoverExpiredLease_NoReferenceOutsideReplayWindowIsLeftForReview(t *testing.T) {
+	txn := processingExpiredTxn()
+	txn.GatewayReferenceID = ""
+	old := time.Now().UTC().Add(-48 * time.Hour)
+	txn.ProcessingStartedAt = &old
+	repo := seedRepo(txn)
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{Status: ports.GatewayPaymentStatusSucceeded}}
+	svc := recoverService(repo, &fakeRegistry{adapter: adapter}, &fakeOutbox{})
+
+	got, err := svc.RecoverExpiredLease(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(adapter.initiated) != 0 || adapter.statusChecks != 0 {
+		t.Fatal("past the gateway's idempotency window a replay could charge again, so nothing may be sent")
+	}
+	if got.Status != transaction.StatusProcessing || repo.updates != 0 {
+		t.Errorf("expected the transaction left PROCESSING for manual review, got %s updates=%d", got.Status, repo.updates)
+	}
+}
+
+func TestRecoverExpiredLease_UsesTheGatewayLastCalled(t *testing.T) {
+	txn := processingExpiredTxn()
+	txn.ActualGateway = "razorpay"
+	stripe := &fakeAdapter{}
+	razorpay := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_stuck", Status: ports.GatewayPaymentStatusSucceeded}}
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": stripe, "razorpay": razorpay}}
+	svc := NewService(seedRepo(txn), &fakeOutbox{}, &fakeRouter{}, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
+
+	if _, err := svc.RecoverExpiredLease(context.Background(), txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if razorpay.statusChecks != 1 || stripe.statusChecks != 0 {
+		t.Errorf("recovery must query the gateway recorded as last called, stripe=%d razorpay=%d", stripe.statusChecks, razorpay.statusChecks)
+	}
+}
+
 func TestRecoverExpiredLease_LeaseNotExpiredIsNoop(t *testing.T) {
 	txn := processingExpiredTxn()
 	future := time.Now().UTC().Add(time.Hour)

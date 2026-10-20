@@ -194,6 +194,7 @@ func run() error {
 			CertFile:        cfg.Security.WebhookTLSCertFile,
 			KeyFile:         cfg.Security.WebhookTLSKeyFile,
 			RefreshInterval: refreshInterval,
+			MinVersion:      tls.VersionTLS12,
 		}, logger, metrics)
 		if err != nil {
 			return fmt.Errorf("configure webhook TLS: %w", err)
@@ -234,6 +235,7 @@ func run() error {
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	context.AfterFunc(sigCtx, stop)
 
 	return server.Run(sigCtx, []server.Listener{
 		{

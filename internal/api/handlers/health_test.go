@@ -155,7 +155,7 @@ func TestOverall_Certificates(t *testing.T) {
 	}{
 		{"valid", now.Add(90 * 24 * time.Hour), http.StatusOK, "healthy", "healthy"},
 		{"inside the renewal window", now.Add(48 * time.Hour), http.StatusOK, "healthy", "expiring"},
-		{"expired while running", now.Add(-time.Minute), http.StatusServiceUnavailable, "unhealthy", "expired"},
+		{"expired while running is reported but does not fail readiness", now.Add(-time.Minute), http.StatusOK, "degraded", "expired"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -174,6 +174,17 @@ func TestOverall_Certificates(t *testing.T) {
 				t.Errorf("unexpected certificate components: %v", components)
 			}
 		})
+	}
+}
+
+func TestOverall_ExpiredCertificateDoesNotMaskDatabaseFailure(t *testing.T) {
+	h := NewHealthHandler(&fakePinger{err: errors.New("down")}, &fakePinger{}, nil, noopLog{},
+		fakeCert{name: "merchant", notAfter: time.Now().Add(-time.Minute)},
+	)
+	h.SetReady()
+
+	if code, body := serveHealth(t, h.Overall); code != http.StatusServiceUnavailable || body["status"] != "unhealthy" {
+		t.Fatalf("a database outage must still fail readiness, got %d %v", code, body)
 	}
 }
 

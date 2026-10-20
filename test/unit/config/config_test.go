@@ -297,23 +297,52 @@ func TestLoadConfig_AppModeWithoutWebhookCertFails(t *testing.T) {
 const merchantA = "0b7c3a52-6a3e-4c1f-9d2e-6f1a2b3c4d5e"
 const merchantB = "5f0d9e7a-1b2c-4d3e-8f4a-9b0c1d2e3f4a"
 
+var (
+	svcToken1   = "svc-1-" + strings.Repeat("a", 32)
+	svcToken2   = "svc-2-" + strings.Repeat("b", 32)
+	paddedToken = strings.Repeat("c", 32) + "==="
+	opsToken1   = "ops-1-" + strings.Repeat("d", 32)
+	opsToken2   = "ops-2-" + strings.Repeat("e", 32)
+)
+
 func TestLoadConfig_ServiceTokens(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("SERVICE_TOKENS", " svc-1="+merchantA+", c3ZjLTI===="+merchantB+" ")
-	t.Setenv("OPS_TOKENS", "ops-1, ,ops-2")
+	t.Setenv("SERVICE_TOKENS", " "+svcToken1+"="+merchantA+", "+paddedToken+"="+merchantB+" ")
+	t.Setenv("OPS_TOKENS", opsToken1+", ,"+opsToken2)
 
 	c, err := LoadConfig()
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if got := c.Auth.ServiceTokens["svc-1"]; got != merchantA {
+	if got := c.Auth.ServiceTokens[svcToken1]; got != merchantA {
 		t.Errorf("svc-1 merchant = %q, want %q", got, merchantA)
 	}
-	if got := c.Auth.ServiceTokens["c3ZjLTI==="]; got != merchantB {
+	if got := c.Auth.ServiceTokens[paddedToken]; got != merchantB {
 		t.Errorf("a token containing '=' must split on the last '=', got map %v", c.Auth.ServiceTokens)
 	}
-	if len(c.Auth.OpsTokens) != 2 || c.Auth.OpsTokens[0] != "ops-1" || c.Auth.OpsTokens[1] != "ops-2" {
-		t.Errorf("ops tokens = %v, want [ops-1 ops-2]", c.Auth.OpsTokens)
+	if len(c.Auth.OpsTokens) != 2 || c.Auth.OpsTokens[0] != opsToken1 || c.Auth.OpsTokens[1] != opsToken2 {
+		t.Errorf("ops tokens = %v", c.Auth.OpsTokens)
+	}
+}
+
+func TestLoadConfig_ServiceTokenMerchantIsNormalised(t *testing.T) {
+	for _, form := range []string{
+		strings.ToUpper(merchantA),
+		"{" + merchantA + "}",
+		"urn:uuid:" + merchantA,
+	} {
+		t.Run(form, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("SERVICE_TOKENS", svcToken1+"="+form)
+
+			c, err := LoadConfig()
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if got := c.Auth.ServiceTokens[svcToken1]; got != merchantA {
+				t.Errorf("merchant must be stored in canonical form so one merchant has one bucket, got %q", got)
+			}
+		})
 	}
 }
 
@@ -322,12 +351,13 @@ func TestLoadConfig_RejectsMalformedServiceTokens(t *testing.T) {
 		raw  string
 		want string
 	}{
-		"empty merchant":     {"svc-1=", "entry 1 must be token=merchantID"},
+		"empty merchant":     {svcToken1 + "=", "entry 1 must be token=merchantID"},
 		"empty token":        {"=" + merchantA, "entry 1 must be token=merchantID"},
-		"no separator":       {"svc-1", "entry 1 must be token=merchantID"},
-		"merchant not uuid":  {"svc-1=merchant-9", "entry 1: merchant ID must be a UUID"},
-		"duplicate token":    {"svc-1=" + merchantA + ",svc-1=" + merchantB, "entry 2 repeats an earlier token"},
-		"second entry wrong": {"svc-1=" + merchantA + ",svc-2=", "entry 2 must be token=merchantID"},
+		"no separator":       {svcToken1, "entry 1 must be token=merchantID"},
+		"merchant not uuid":  {svcToken1 + "=merchant-9", "entry 1: merchant ID must be a UUID"},
+		"short token":        {"svc-1=" + merchantA, "entry 1: token must be at least 32 characters"},
+		"duplicate token":    {svcToken1 + "=" + merchantA + "," + svcToken1 + "=" + merchantB, "entry 2 repeats an earlier token"},
+		"second entry wrong": {svcToken1 + "=" + merchantA + "," + svcToken2 + "=", "entry 2 must be token=merchantID"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -338,11 +368,72 @@ func TestLoadConfig_RejectsMalformedServiceTokens(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "SERVICE_TOKENS "+tc.want) {
 				t.Fatalf("want error containing %q, got: %v", tc.want, err)
 			}
-			if strings.Contains(err.Error(), "svc-1") {
+			if strings.Contains(err.Error(), "svc-1") || strings.Contains(err.Error(), "svc-2") {
 				t.Fatalf("the error must not echo token values, got: %v", err)
 			}
 		})
 	}
+}
+
+func TestLoadConfig_RejectsMalformedOpsTokens(t *testing.T) {
+	cases := map[string]struct {
+		raw  string
+		want string
+	}{
+		"short token":     {"ops-1", "OPS_TOKENS entry 1: token must be at least 32 characters"},
+		"duplicate token": {opsToken1 + "," + opsToken1, "OPS_TOKENS entry 2 repeats an earlier token"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("OPS_TOKENS", tc.raw)
+
+			_, err := LoadConfig()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error containing %q, got: %v", tc.want, err)
+			}
+			if strings.Contains(err.Error(), "ops-1") {
+				t.Fatalf("the error must not echo token values, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidate_ProductionGuardrails(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(*Config)
+		want   string
+	}{
+		"unauthenticated": {func(c *Config) { c.App.AllowNoAuth = true }, "ALLOW_NO_AUTH=true is not allowed when ENVIRONMENT=prod"},
+		"optional mTLS":   {func(c *Config) { c.App.MtlsStrictMode = false }, "MTLS_STRICT_MODE=false is not allowed when ENVIRONMENT=prod"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := validatableConfig()
+			c.App.Environment = "prod"
+			c.App.MtlsStrictMode = true
+			tc.mutate(c)
+			if err := Validate(c); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want %q, got: %v", tc.want, err)
+			}
+
+			c.App.Environment = "staging"
+			if err := Validate(c); err != nil {
+				t.Fatalf("outside prod the toggle stays available, got: %v", err)
+			}
+		})
+	}
+
+	t.Run("lb webhook TLS and plaintext Redis stay allowed in prod", func(t *testing.T) {
+		c := validatableConfig()
+		c.App.Environment = "prod"
+		c.App.MtlsStrictMode = true
+		c.App.WebhookTLSMode = WebhookTLSModeLB
+		c.Redis.TLSEnabled = false
+		if err := Validate(c); err != nil {
+			t.Fatalf("TLS at the load balancer is a valid production setup, got: %v", err)
+		}
+	})
 }
 
 func TestLoadConfig_WebhookSecrets(t *testing.T) {
