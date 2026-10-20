@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 
 	goredis "github.com/redis/go-redis/v9"
@@ -17,15 +18,22 @@ type Client struct {
 func New(cfg config.RedisConfig) (*Client, error) {
 	base := &goredis.UniversalOptions{
 		Addrs:        cfg.Addrs,
+		Username:     cfg.Username,
+		Password:     cfg.Password,
 		DialTimeout:  cfg.DialTimeout,
 		ReadTimeout:  cfg.ReadTimeout,
 		WriteTimeout: cfg.WriteTimeout,
 	}
+	if cfg.TLSEnabled {
+		base.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
 
 	rl := *base
 	rl.DB = cfg.RateLimitDB
+	rl.TLSConfig = base.TLSConfig.Clone()
 	ca := *base
 	ca.DB = cfg.CacheDB
+	ca.TLSConfig = base.TLSConfig.Clone()
 
 	return &Client{
 		RateLimit: goredis.NewUniversalClient(&rl),

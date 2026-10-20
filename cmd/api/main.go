@@ -107,6 +107,11 @@ func run() error {
 	webhookSvc := webhook.NewService(txnRepo, webhookRepo, outboxWriter, transactor, logger, metrics)
 	webhookSecrets := webhook.NewStaticSecretProvider(parseKeyValues(os.Getenv("WEBHOOK_SECRETS")))
 
+	if !cfg.Redis.TLSEnabled {
+		logger.Warn("redis.tls_disabled", map[string]any{
+			"warning": "REDIS_TLS_ENABLED=false: Redis traffic, including credentials, is sent in plaintext",
+		})
+	}
 	redisClient, err := redis.New(cfg.Redis)
 	if err != nil {
 		return fmt.Errorf("connect redis: %w", err)

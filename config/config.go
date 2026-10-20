@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -83,7 +84,6 @@ func getEnvDuration(key string, def time.Duration, errs *[]string) time.Duration
 	return d
 }
 
-// Config structs with fields for all configuration values, grouped by category.
 type AppConfig struct {
 	Environment    string
 	ServiceVersion string
@@ -116,6 +116,9 @@ type RedisConfig struct {
 	Addrs               []string
 	RateLimitDB         int
 	CacheDB             int
+	TLSEnabled          bool
+	Username            string
+	Password            string
 	DialTimeout         time.Duration
 	ReadTimeout         time.Duration
 	WriteTimeout        time.Duration
@@ -267,6 +270,9 @@ func LoadConfig() (*Config, error) {
 	}
 	c.Redis.RateLimitDB = getEnvInt("REDIS_RATE_LIMIT_DB", 0, &errs)
 	c.Redis.CacheDB = getEnvInt("REDIS_CACHE_DB", 1, &errs)
+	c.Redis.TLSEnabled = getEnvBool("REDIS_TLS_ENABLED", true, &errs)
+	c.Redis.Username = getEnvDefault("REDIS_USERNAME", "")
+	c.Redis.Password = getEnvDefault("REDIS_PASSWORD", "")
 	c.Redis.DialTimeout = getEnvDuration("REDIS_DIAL_TIMEOUT", 5*time.Second, &errs)
 	c.Redis.ReadTimeout = getEnvDuration("REDIS_READ_TIMEOUT", 3*time.Second, &errs)
 	c.Redis.WriteTimeout = getEnvDuration("REDIS_WRITE_TIMEOUT", 3*time.Second, &errs)
@@ -374,6 +380,19 @@ func Validate(c *Config) error {
 	validOTLPProtocols := map[string]bool{"http/protobuf": true, "grpc": true}
 	if c.Observability.OTLPEndpoint != "" && !validOTLPProtocols[c.Observability.OTLPProtocol] {
 		errs = append(errs, `OTLP_PROTOCOL must be "http/protobuf" or "grpc"`)
+	}
+
+	if len(c.Redis.Addrs) > 1 {
+		errs = append(errs, "REDIS_ADDRS must be a single primary endpoint: multiple addresses switch the client to cluster mode, which supports only database 0 and cannot keep REDIS_RATE_LIMIT_DB and REDIS_CACHE_DB apart")
+	}
+	for _, addr := range c.Redis.Addrs {
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			errs = append(errs, "REDIS_ADDRS must be in host:port form")
+			break
+		}
+	}
+	if c.Redis.RateLimitDB == c.Redis.CacheDB {
+		errs = append(errs, "REDIS_RATE_LIMIT_DB and REDIS_CACHE_DB must differ")
 	}
 
 	if c.Outbox.WALLagAlertThresholdMB >= c.Outbox.WALLagCriticalThresholdMB {
