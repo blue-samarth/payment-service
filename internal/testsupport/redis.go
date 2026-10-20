@@ -49,9 +49,13 @@ func setupRedis() (*redis.Client, error) {
 	return c, nil
 }
 
+func RedisAddr() string {
+	return getEnv("PAYMENT_TEST_REDIS_ADDR", "localhost:6379")
+}
+
 func redisConfigFromEnv() config.RedisConfig {
 	return config.RedisConfig{
-		Addrs:               []string{getEnv("PAYMENT_TEST_REDIS_ADDR", "localhost:6379")},
+		Addrs:               []string{RedisAddr()},
 		RateLimitDB:         0,
 		CacheDB:             1,
 		DialTimeout:         2 * time.Second,

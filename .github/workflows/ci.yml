@@ -26,8 +26,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  GO_VERSION: "1.26.6"
+  GO_VERSION: "1.26.9"
   TRIVY_SEVERITY: HIGH,CRITICAL
+  CAN_UPLOAD_SARIF: ${{ github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository }}
 
 jobs:
   lint:
@@ -212,6 +213,10 @@ jobs:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
     steps:
       - uses: actions/checkout@v5
         with:
@@ -225,13 +230,25 @@ jobs:
           gitleaks version
 
       - name: Scan full history
-        run: gitleaks detect --source . --redact --verbose --exit-code 1
+        run: |
+          gitleaks detect --source . --redact --verbose --exit-code 1 \
+            --report-format sarif --report-path gitleaks.sarif
+
+      - name: Upload gitleaks results to code scanning
+        if: ${{ !cancelled() && env.CAN_UPLOAD_SARIF == 'true' && hashFiles('gitleaks.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
 
   sast:
     name: SAST (gosec + govulncheck)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [lint, secret-scan, build, unit-test]
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -239,21 +256,46 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: gosec
+      - name: Install scanners
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
-          gosec -exclude-dir=test -exclude=G115,G304,G404,G407 -severity medium -confidence medium ./...
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: gosec
+        run: |
+          gosec -fmt sarif -out gosec.sarif -stdout -verbose text \
+            -exclude-dir=test -exclude=G115,G304,G404,G407 -severity medium -confidence medium ./...
+
+      - name: govulncheck report (SARIF)
+        if: ${{ !cancelled() }}
+        run: govulncheck -format sarif ./... > govulncheck.sarif
+
+      - name: Upload gosec results to code scanning
+        if: ${{ !cancelled() && env.CAN_UPLOAD_SARIF == 'true' && hashFiles('gosec.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: gosec.sarif
+          category: gosec
+
+      - name: Upload govulncheck results to code scanning
+        if: ${{ !cancelled() && env.CAN_UPLOAD_SARIF == 'true' && hashFiles('govulncheck.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: govulncheck.sarif
+          category: govulncheck
 
       - name: govulncheck
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@latest
-          govulncheck ./...
+        if: ${{ !cancelled() }}
+        run: govulncheck ./...
 
   trivy-scan:
     name: Trivy scans (deps, config, images)
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [integration-test, performance-test, sast]
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
     steps:
       - uses: actions/checkout@v5
 
@@ -342,6 +384,7 @@ jobs:
             .
 
       - name: Trivy config scan
+        if: ${{ !cancelled() }}
         run: |
           trivy config \
             --severity "$TRIVY_SEVERITY" \
@@ -349,6 +392,7 @@ jobs:
             .
 
       - name: Trivy image scans
+        if: ${{ !cancelled() }}
         run: |
           rc=0
           for svc in api jobs relay; do
@@ -361,6 +405,51 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+
+      - name: Trivy reports (SARIF)
+        if: ${{ !cancelled() }}
+        run: |
+          trivy fs \
+            --scanners vuln,secret,misconfig \
+            --severity "$TRIVY_SEVERITY" \
+            --ignore-unfixed \
+            --format sarif --output trivy-fs.sarif \
+            .
+          for svc in api jobs relay; do
+            trivy image \
+              --severity "$TRIVY_SEVERITY" \
+              --ignore-unfixed \
+              --format sarif --output "trivy-image-${svc}.sarif" \
+              "payment-service/${svc}:${{ github.sha }}" || true
+          done
+
+      - name: Upload Trivy filesystem results to code scanning
+        if: ${{ !cancelled() && env.CAN_UPLOAD_SARIF == 'true' && hashFiles('trivy-fs.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Upload Trivy api image results to code scanning
+        if: ${{ !cancelled() && env.CAN_UPLOAD_SARIF == 'true' && hashFiles('trivy-image-api.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-image-api.sarif
+          category: trivy-image-api
+
+      - name: Upload Trivy jobs image results to code scanning
+        if: ${{ !cancelled() && env.CAN_UPLOAD_SARIF == 'true' && hashFiles('trivy-image-jobs.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-image-jobs.sarif
+          category: trivy-image-jobs
+
+      - name: Upload Trivy relay image results to code scanning
+        if: ${{ !cancelled() && env.CAN_UPLOAD_SARIF == 'true' && hashFiles('trivy-image-relay.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-image-relay.sarif
+          category: trivy-image-relay
 
   ci-passed:
     name: CI passed
