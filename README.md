@@ -818,8 +818,9 @@ PERF_ROUNDS=2 go test -tags=performance ./test/performance/   # faster local che
 `master`** (what a merge produces), so the same checks gate a change before and after it
 lands.
 
-The pipeline runs in three stages rather than one flat fan-out, so a broken build stops
-the run before it spends time on the slow jobs.
+The tests run in two stages, so a broken build stops the run before it spends time on the
+slow jobs. The security scans run in their own lane from the start, independent of the
+tests, so a failing test never hides a security finding.
 
 ```mermaid
 flowchart TD
@@ -837,23 +838,61 @@ flowchart TD
         direction LR
         integration["Integration tests<br/>Postgres 18 · Redis 8<br/>fails on a silent skip"]
         perf["Performance budgets<br/>mean 1.25x · spike 2x<br/>allocations exact"]
-        sast["SAST<br/>gosec · govulncheck"]
     end
 
-    subgraph S3["Stage 3 - supply chain"]
+    subgraph SEC["Security - starts immediately"]
+        direction LR
+        sast["SAST<br/>gosec · govulncheck"]
         trivy["Trivy scans<br/>filesystem · config<br/>build + scan all 3 images<br/>assert nonroot"]
     end
 
+    codescan["Code scanning<br/>Security and quality tab"]
     gate["CI passed<br/>required status check"]
 
     trigger --> S1
+    trigger --> SEC
     S1 --> S2
-    S2 --> S3
-    S3 --> gate
+    S2 --> gate
+    SEC --> gate
+    secret -. SARIF .-> codescan
+    SEC -. SARIF .-> codescan
 ```
 
 Set **`ci-passed`** as the required status check in branch protection rather than listing
 each job, so adding a job later needs no rule change.
+
+### Security results in code scanning
+
+Every scanner uploads a SARIF report to GitHub code scanning through
+`github/codeql-action/upload-sarif`, so findings appear under the repository's **Security
+and quality** tab and as annotations on the pull request, not only in job logs. Each
+upload has its own category:
+
+| Category | Source |
+|---|---|
+| `gitleaks` | Secret scan over the full history |
+| `gosec` | Static analysis |
+| `govulncheck` | Go vulnerability database |
+| `trivy-fs` | Dependencies, secrets and misconfigurations in the repository |
+| `trivy-image-api`, `trivy-image-jobs`, `trivy-image-relay` | Each built image |
+
+How the uploads are wired:
+
+- **They run even when the scan fails** (`!cancelled()`), which is when the report matters
+  most. An upload is skipped only when its scanner wrote no report.
+- **govulncheck runs twice.** In SARIF mode it exits 0 even when it finds called
+  vulnerabilities, so the SARIF run produces the report and a second, text-mode run is the
+  gate. gosec and gitleaks gate and report in a single run.
+- **Trivy reports use the gate's severity filter** (`TRIVY_SEVERITY`), so the tab shows what
+  fails the build. Each Trivy gate runs even if an earlier one failed, so one failure does
+  not hide the others.
+- **Pull requests from forks skip the upload.** Their token cannot write security events;
+  `CAN_UPLOAD_SARIF` limits uploads to pushes and same-repository pull requests. The scans
+  still gate those runs.
+
+Only the scanning jobs get `security-events: write`; the workflow default stays
+`contents: read`. Alerts for `master` populate the tab once a run on `master` uploads;
+pull-request results show on the pull request.
 
 ### Documentation-only changes skip the pipeline
 
@@ -885,6 +924,10 @@ directive there is a *minimum*, not a build version, so building with it ships e
 standard-library CVE fixed since. Compiling the API image with the minimum produced 30
 HIGH/CRITICAL findings against 14 on the patched release, the difference being entirely
 standard library. Bump both together when a patch release lands.
+
+Vulnerability advisories are published continuously, so a pipeline can turn red with no
+code change: govulncheck and Trivy flag the new advisory on the next run. The fix is the
+patched Go release in both pins and/or the patched module versions in `go.mod`.
 
 ### Two jobs that do not trust a green run
 
