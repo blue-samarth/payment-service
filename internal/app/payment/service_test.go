@@ -18,6 +18,7 @@ type fakeRepo struct {
 	store     map[uuid.UUID]*transaction.Transaction
 	updates   int
 	snapshots []transaction.Transaction
+	reviewed  map[uuid.UUID]string
 	failOn    bool
 }
 
@@ -53,6 +54,17 @@ func (r *fakeRepo) UpdateStatus(ctx context.Context, t *transaction.Transaction)
 	return nil
 }
 
+func (r *fakeRepo) MarkReviewRequired(ctx context.Context, id uuid.UUID, reason string) (bool, error) {
+	if r.reviewed == nil {
+		r.reviewed = map[uuid.UUID]string{}
+	}
+	if _, done := r.reviewed[id]; done {
+		return false, nil
+	}
+	r.reviewed[id] = reason
+	return true, nil
+}
+
 type fakeLease struct {
 	acquired bool
 	cached   []byte
@@ -75,12 +87,17 @@ type fakeAdapter struct {
 	initiated    []ports.GatewayPaymentRequest
 	statusChecks int
 	ctxErrs      []error
+	hadDeadline  []bool
 	onInitiate   func()
+
+	notIdempotent bool
 }
 
 func (a *fakeAdapter) InitiatePayment(ctx context.Context, req ports.GatewayPaymentRequest) (*ports.GatewayPaymentResponse, error) {
 	a.initiated = append(a.initiated, req)
 	a.ctxErrs = append(a.ctxErrs, ctx.Err())
+	_, ok := ctx.Deadline()
+	a.hadDeadline = append(a.hadDeadline, ok)
 	if a.onInitiate != nil {
 		a.onInitiate()
 	}
@@ -96,7 +113,24 @@ func (a *fakeAdapter) Refund(ctx context.Context, req ports.GatewayRefundRequest
 func (a *fakeAdapter) Cancel(ctx context.Context, req ports.GatewayCancelRequest) (*ports.GatewayCancelResponse, error) {
 	return nil, nil
 }
-func (a *fakeAdapter) Capabilities() ports.GatewayCapabilities { return ports.GatewayCapabilities{} }
+func (a *fakeAdapter) Capabilities() ports.GatewayCapabilities {
+	return ports.GatewayCapabilities{IdempotencyCapable: !a.notIdempotent}
+}
+
+type countingMetrics struct {
+	noopMetrics
+	counts map[string]int
+	tags   map[string]map[string]string
+}
+
+func newCountingMetrics() *countingMetrics {
+	return &countingMetrics{counts: map[string]int{}, tags: map[string]map[string]string{}}
+}
+
+func (m *countingMetrics) Increment(name string, tags map[string]string) {
+	m.counts[name]++
+	m.tags[name] = tags
+}
 
 type fakeRegistry struct {
 	adapter ports.GatewayAdapter

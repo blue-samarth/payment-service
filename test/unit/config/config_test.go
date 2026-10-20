@@ -27,7 +27,7 @@ func validatableConfig() *Config {
 	c.Gateway.MaxAttempts = 3
 	c.Gateway.CircuitBreakerFailureThreshold = 5
 	c.App.ShutdownDrainDelay = 5 * time.Second
-	c.App.ShutdownTimeout = 15 * time.Second
+	c.App.ShutdownTimeout = 105 * time.Second
 	c.Jobs.IdempotencyProcessingTimeoutSec = 300
 	c.Redis.Addrs = []string{"localhost:6379"}
 	c.Redis.RateLimitDB = 0
@@ -545,6 +545,33 @@ func TestValidate_RuntimeLimits(t *testing.T) {
 	}
 }
 
+func TestValidate_ShutdownTimeoutCoversTheGatewayBudget(t *testing.T) {
+	c := validatableConfig()
+	c.App.ShutdownTimeout = 89 * time.Second
+	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "SHUTDOWN_TIMEOUT (1m29s) must be at least the gateway budget") {
+		t.Fatalf("a shutdown budget below the gateway budget must be rejected, got: %v", err)
+	}
+
+	c.App.ShutdownTimeout = 90 * time.Second
+	if err := Validate(c); err != nil {
+		t.Fatalf("a shutdown budget equal to the gateway budget is enough, got: %v", err)
+	}
+}
+
+func TestLoadConfig_ShutdownTimeoutDefaultFollowsTheGatewayBudget(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("GATEWAY_HTTP_TIMEOUT", "10s")
+	t.Setenv("GATEWAY_MAX_ATTEMPTS", "2")
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.App.ShutdownTimeout != 35*time.Second {
+		t.Errorf("default SHUTDOWN_TIMEOUT must be the gateway budget + 15s, got %s", c.App.ShutdownTimeout)
+	}
+}
+
 func TestLoadConfig_RuntimeDefaults(t *testing.T) {
 	setRequiredEnv(t)
 
@@ -558,7 +585,7 @@ func TestLoadConfig_RuntimeDefaults(t *testing.T) {
 	if c.Gateway.CircuitBreakerFailureThreshold != 5 {
 		t.Errorf("breaker threshold default = %d", c.Gateway.CircuitBreakerFailureThreshold)
 	}
-	if c.App.ShutdownDrainDelay != 5*time.Second || c.App.ShutdownTimeout != 15*time.Second {
+	if c.App.ShutdownDrainDelay != 5*time.Second || c.App.ShutdownTimeout != 105*time.Second {
 		t.Errorf("shutdown defaults = %v/%v", c.App.ShutdownDrainDelay, c.App.ShutdownTimeout)
 	}
 }

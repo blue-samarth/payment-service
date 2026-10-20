@@ -28,7 +28,13 @@ type cachedResponse struct {
 	GatewayReferenceID string `json:"gateway_reference_id"`
 }
 
-const reinitiateWindow = 23 * time.Hour
+const (
+	reinitiateWindow = 23 * time.Hour
+	leaseMargin      = 30 * time.Second
+
+	reviewReasonNotIdempotent      = "gateway_not_idempotent"
+	reviewReasonReplayWindowPassed = "replay_window_passed"
+)
 
 type outcome struct {
 	terminal      bool
@@ -50,8 +56,11 @@ func (s *Service) ProcessPayment(ctx context.Context, transactionID uuid.UUID) (
 		return nil, fmt.Errorf("payment: resolve adapter for %s: %w", txn.GatewayID, err)
 	}
 
-	ttlSec := txn.EstimatedTimeoutSeconds
-	timeout := time.Duration(ttlSec) * time.Second
+	timeout := time.Duration(txn.EstimatedTimeoutSeconds) * time.Second
+	if floor := s.gatewayBudget() + leaseMargin; timeout < floor {
+		timeout = floor
+	}
+	ttlSec := int(timeout / time.Second)
 
 	var acquired bool
 	err = s.tx.WithinTx(ctx, func(ctx context.Context) error {
@@ -81,10 +90,23 @@ func (s *Service) ProcessPayment(ctx context.Context, transactionID uuid.UUID) (
 	}
 
 	work := context.WithoutCancel(ctx)
+	if budget := s.gatewayBudget(); budget > 0 {
+		var cancel context.CancelFunc
+		work, cancel = context.WithTimeout(work, budget+leaseMargin)
+		defer cancel()
+	}
 	s.enterIntent(work, txn.GatewayID, txn.ID, timeout)
 
 	resp, result := s.attemptGateways(work, adapter, txn)
-	return s.finalize(work, txn, resp, result)
+	final, err := s.finalize(work, txn, resp, result)
+	if err == nil {
+		return final, nil
+	}
+	current, getErr := s.repo.GetByID(context.WithoutCancel(ctx), txn.ID)
+	if getErr == nil && current.Status != transaction.StatusProcessing {
+		return current, nil
+	}
+	return nil, err
 }
 
 func (s *Service) RecoverExpiredLease(ctx context.Context, transactionID uuid.UUID) (*transaction.Transaction, error) {
@@ -109,14 +131,11 @@ func (s *Service) RecoverExpiredLease(ctx context.Context, transactionID uuid.UU
 	var resp *ports.GatewayPaymentResponse
 	var gwErr *ports.GatewayError
 	if txn.GatewayReferenceID == "" {
-		if txn.ProcessingStartedAt == nil || time.Since(*txn.ProcessingStartedAt) > reinitiateWindow {
-			s.log.Error(ports.LogEventTransactionLeaseExpired, map[string]any{
-				ports.FieldErrorCode:     "recovery_requires_manual_review",
-				ports.FieldTraceID:       "",
-				ports.FieldTransactionID: txn.ID.String(),
-				ports.FieldGatewayID:     gateway,
-			}, errors.New("no gateway reference and the idempotent replay window has passed"))
-			return txn, nil
+		switch {
+		case !adapter.Capabilities().IdempotencyCapable:
+			return s.requireReview(ctx, txn, gateway, reviewReasonNotIdempotent)
+		case txn.ProcessingStartedAt == nil || time.Since(*txn.ProcessingStartedAt) > reinitiateWindow:
+			return s.requireReview(ctx, txn, gateway, reviewReasonReplayWindowPassed)
 		}
 		resp, gwErr = s.callGateway(ctx, adapter, txn)
 	} else {
@@ -143,6 +162,28 @@ func (s *Service) RecoverExpiredLease(ctx context.Context, transactionID uuid.UU
 		ports.FieldNewState:      string(result.newStatus),
 	})
 	return s.finalize(ctx, txn, resp, result)
+}
+
+func (s *Service) requireReview(ctx context.Context, txn *transaction.Transaction, gateway, reason string) (*transaction.Transaction, error) {
+	marked, err := s.repo.MarkReviewRequired(ctx, txn.ID, reason)
+	if err != nil {
+		return nil, fmt.Errorf("payment: mark %s for review: %w", txn.ID, err)
+	}
+	if !marked {
+		return txn, nil
+	}
+	s.metrics.Increment(ports.MetricTransactionReviewRequired, map[string]string{
+		"gateway_id": gateway,
+		"reason":     reason,
+	})
+	s.log.Error(ports.LogEventTransactionLeaseExpired, map[string]any{
+		ports.FieldErrorCode:     "recovery_requires_manual_review",
+		ports.FieldTraceID:       "",
+		ports.FieldTransactionID: txn.ID.String(),
+		ports.FieldGatewayID:     gateway,
+		"reason":                 reason,
+	}, errors.New("no gateway reference and no safe way to replay the request"))
+	return txn, nil
 }
 
 func (s *Service) checkStatus(ctx context.Context, adapter ports.GatewayAdapter, txn *transaction.Transaction) (*ports.GatewayPaymentResponse, *ports.GatewayError) {
@@ -265,17 +306,6 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 			return resp, result
 		}
 
-		s.log.Info(ports.LogEventGatewayFallback, map[string]any{
-			ports.FieldTransactionID: txn.ID.String(),
-			ports.FieldGatewayID:     txn.GatewayID,
-			"fallback_gateway":       next,
-			ports.FieldAttemptNumber: attempt + 1,
-		})
-		s.metrics.Increment(ports.MetricGatewayFallbackTriggered, map[string]string{
-			"from_gateway": txn.GatewayID,
-			"to_gateway":   next,
-		})
-
 		prevGateway := txn.GatewayID
 		txn.GatewayID = next
 		txn.ActualGateway = next
@@ -292,6 +322,16 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 			txn.ActualGateway = prevGateway
 			return resp, result
 		}
+		s.log.Info(ports.LogEventGatewayFallback, map[string]any{
+			ports.FieldTransactionID: txn.ID.String(),
+			ports.FieldGatewayID:     prevGateway,
+			"fallback_gateway":       next,
+			ports.FieldAttemptNumber: attempt + 1,
+		})
+		s.metrics.Increment(ports.MetricGatewayFallbackTriggered, map[string]string{
+			"from_gateway": prevGateway,
+			"to_gateway":   next,
+		})
 		adapter = nextAdapter
 		if txn.ProcessingTimeout != nil {
 			s.exitIntent(ctx, prevGateway, txn.ID)

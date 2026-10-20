@@ -131,6 +131,14 @@ func (r *TransactionRepository) SetCancelIntent(ctx context.Context, id uuid.UUI
 	return tag.RowsAffected() == 1, nil
 }
 
+func (r *TransactionRepository) MarkReviewRequired(ctx context.Context, id uuid.UUID, reason string) (bool, error) {
+	tag, err := queryer(ctx, r.db.pool).Exec(ctx, r.q.TransactionMarkReview, id, reason)
+	if err != nil {
+		return false, fmt.Errorf("transaction: mark review required %s: %w", id, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 func (r *TransactionRepository) ListExpiredLeaseIDs(ctx context.Context) ([]uuid.UUID, error) {
 	rows, err := queryer(ctx, r.db.pool).Query(ctx, r.q.TransactionListExpiredLeases)
 	if err != nil {

@@ -94,6 +94,8 @@ const (
 
 const MinTokenLength = 32
 
+const ShutdownTimeoutMargin = 15 * time.Second
+
 type AppConfig struct {
 	Environment    string
 	ServiceVersion string
@@ -215,6 +217,11 @@ type GatewayConfig struct {
 	MaxAttempts                    int
 	CircuitBreakerFailureThreshold int
 }
+
+func (g GatewayConfig) Budget() time.Duration {
+	return time.Duration(g.MaxAttempts) * g.HTTPTimeout
+}
+
 type JobsConfig struct {
 	LockRetryIntervalSec            int
 	LockTimeoutMinutes              int
@@ -264,7 +271,6 @@ func LoadConfig() (*Config, error) {
 	c.App.MtlsStrictMode = getEnvBool("MTLS_STRICT_MODE", true, &errs)
 	c.App.AllowNoAuth = getEnvBool("ALLOW_NO_AUTH", false, &errs)
 	c.App.ShutdownDrainDelay = getEnvDuration("SHUTDOWN_DRAIN_DELAY", 5*time.Second, &errs)
-	c.App.ShutdownTimeout = getEnvDuration("SHUTDOWN_TIMEOUT", 15*time.Second, &errs)
 
 	c.Auth.ServiceTokens = parseServiceTokens(os.Getenv("SERVICE_TOKENS"), &errs)
 	c.Auth.OpsTokens = parseOpsTokens(os.Getenv("OPS_TOKENS"), &errs)
@@ -358,6 +364,7 @@ func LoadConfig() (*Config, error) {
 	c.Gateway.HTTPTimeout = getEnvDuration("GATEWAY_HTTP_TIMEOUT", 30*time.Second, &errs)
 	c.Gateway.MaxAttempts = getEnvInt("GATEWAY_MAX_ATTEMPTS", 3, &errs)
 	c.Gateway.CircuitBreakerFailureThreshold = getEnvInt("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 5, &errs)
+	c.App.ShutdownTimeout = getEnvDuration("SHUTDOWN_TIMEOUT", c.Gateway.Budget()+ShutdownTimeoutMargin, &errs)
 
 	c.Reconciliation.RunIntervalHours = getEnvInt("RECONCILIATION_RUN_INTERVAL_HOURS", 6, &errs)
 	c.Reconciliation.ReportFetchTimeoutSeconds = getEnvInt("RECONCILIATION_REPORT_FETCH_TIMEOUT_SECONDS", 120, &errs)
@@ -494,7 +501,7 @@ func Validate(c *Config) error {
 	}
 
 	if c.Gateway.MaxAttempts > 0 && c.Gateway.HTTPTimeout > 0 {
-		gatewayBudget := time.Duration(c.Gateway.MaxAttempts) * c.Gateway.HTTPTimeout
+		gatewayBudget := c.Gateway.Budget()
 		idemTimeout := time.Duration(c.Jobs.IdempotencyProcessingTimeoutSec) * time.Second
 		if idemTimeout <= gatewayBudget {
 			errs = append(errs, fmt.Sprintf(
@@ -521,6 +528,12 @@ func Validate(c *Config) error {
 	}
 	if c.App.ShutdownTimeout <= 0 {
 		errs = append(errs, "SHUTDOWN_TIMEOUT must be greater than 0")
+	}
+	if budget := c.Gateway.Budget(); budget > 0 && c.App.ShutdownTimeout < budget {
+		errs = append(errs, fmt.Sprintf(
+			"SHUTDOWN_TIMEOUT (%s) must be at least the gateway budget GATEWAY_HTTP_TIMEOUT*GATEWAY_MAX_ATTEMPTS (%s), or a deploy can cut off a charge in flight",
+			c.App.ShutdownTimeout, budget,
+		))
 	}
 
 	if c.Routing.FXReconciliationTolerancePct < 0 || c.Routing.FXReconciliationTolerancePct > 100 {

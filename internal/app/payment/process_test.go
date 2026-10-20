@@ -539,12 +539,16 @@ func TestProcessPayment_FallbackNotCalledWhenSwitchCannotBePersisted(t *testing.
 	second := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pay_fb", Status: ports.GatewayPaymentStatusSucceeded}}
 	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": first, "razorpay": second}}
 	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
-	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{failAt: 2}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
+	metrics := newCountingMetrics()
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{failAt: 2}, &fakeLease{acquired: true}, reg, noopLogger{}, metrics)
 	svc.SetMaxGatewayAttempts(2)
 
 	got, err := svc.ProcessPayment(context.Background(), txn.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if metrics.counts[ports.MetricGatewayFallbackTriggered] != 0 {
+		t.Error("a fallback that never happened must not be counted")
 	}
 	if len(second.initiated) != 0 {
 		t.Fatal("a gateway whose selection is not recorded must never be charged: recovery would query the wrong gateway")
@@ -655,6 +659,94 @@ func TestRecoverExpiredLease_NoReferenceOutsideReplayWindowIsLeftForReview(t *te
 	}
 	if got.Status != transaction.StatusProcessing || repo.updates != 0 {
 		t.Errorf("expected the transaction left PROCESSING for manual review, got %s updates=%d", got.Status, repo.updates)
+	}
+	if repo.reviewed[txn.ID] != reviewReasonReplayWindowPassed {
+		t.Errorf("the transaction must be marked for review so the reaper stops re-listing it, got %q", repo.reviewed[txn.ID])
+	}
+}
+
+func TestRecoverExpiredLease_NonIdempotentGatewayIsNeverReplayed(t *testing.T) {
+	txn := processingExpiredTxn()
+	txn.GatewayReferenceID = ""
+	txn.ActualGateway = "razorpay"
+	recent := time.Now().UTC().Add(-time.Hour)
+	txn.ProcessingStartedAt = &recent
+	repo := seedRepo(txn)
+	razorpay := &fakeAdapter{notIdempotent: true, resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "order_2", Status: ports.GatewayPaymentStatusPending}}
+	metrics := newCountingMetrics()
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"razorpay": razorpay}}
+	svc := NewService(repo, &fakeOutbox{}, &fakeRouter{}, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, metrics)
+
+	got, err := svc.RecoverExpiredLease(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(razorpay.initiated) != 0 || razorpay.statusChecks != 0 {
+		t.Fatal("a gateway that does not dedupe by key would create a second order (or charge) on replay")
+	}
+	if got.Status != transaction.StatusProcessing || repo.reviewed[txn.ID] != reviewReasonNotIdempotent {
+		t.Fatalf("expected PROCESSING marked %q, got %s %q", reviewReasonNotIdempotent, got.Status, repo.reviewed[txn.ID])
+	}
+	if metrics.counts[ports.MetricTransactionReviewRequired] != 1 || metrics.tags[ports.MetricTransactionReviewRequired]["reason"] != reviewReasonNotIdempotent {
+		t.Errorf("a review must be counted for alerting, got %v %v", metrics.counts, metrics.tags)
+	}
+
+	if _, err := svc.RecoverExpiredLease(context.Background(), txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if metrics.counts[ports.MetricTransactionReviewRequired] != 1 {
+		t.Errorf("an already-marked transaction must not be counted again, got %d", metrics.counts[ports.MetricTransactionReviewRequired])
+	}
+}
+
+func TestProcessPayment_LeaseCoversTheGatewayBudget(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	svc := processService(repo, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter})
+	svc.SetMaxGatewayAttempts(3)
+	svc.SetGatewayHTTPTimeout(30 * time.Second)
+
+	if _, err := svc.ProcessPayment(context.Background(), txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	got := repo.snapshots[0].ProcessingTimeout
+	if got == nil || *got < 90*time.Second+leaseMargin {
+		t.Fatalf("a lease shorter than the gateway budget lets the reaper act while the handler is still calling the gateway, got %v", got)
+	}
+	if !adapter.hadDeadline[0] {
+		t.Error("the detached gateway call needs its own deadline as a backstop")
+	}
+}
+
+func TestProcessPayment_FinalizeLostToRecoveryReturnsTheRecoveredState(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	adapter.onInitiate = func() {
+		recovered := *repo.store[txn.ID]
+		recovered.Status = transaction.StatusSucceeded
+		repo.store[txn.ID] = &recovered
+	}
+	svc := NewService(repo, &fakeOutbox{}, &fakeRouter{}, &fakeConfig{}, &fakeTransactor{failAt: 2}, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter}, noopLogger{}, noopMetrics{})
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatalf("the payment was settled by recovery; the merchant must get that state, not an error: %v", err)
+	}
+	if got.Status != transaction.StatusSucceeded {
+		t.Errorf("expected the recovered SUCCEEDED state, got %s", got.Status)
+	}
+}
+
+func TestProcessPayment_FinalizeFailureStillProcessingIsAnError(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	svc := NewService(repo, &fakeOutbox{}, &fakeRouter{}, &fakeConfig{}, &fakeTransactor{failAt: 2}, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter}, noopLogger{}, noopMetrics{})
+
+	if _, err := svc.ProcessPayment(context.Background(), txn.ID); err == nil {
+		t.Fatal("a finalize failure with nobody else settling the payment must surface as an error")
 	}
 }
 

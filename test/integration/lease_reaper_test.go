@@ -19,6 +19,11 @@ import (
 
 func seedStuckTxn(t *testing.T, pg *testsupport.PG, gatewayID, reference string) *transaction.Transaction {
 	t.Helper()
+	return seedStuckTxnStartedAgo(t, pg, gatewayID, reference, time.Hour)
+}
+
+func seedStuckTxnStartedAgo(t *testing.T, pg *testsupport.PG, gatewayID, reference string, startedAgo time.Duration) *transaction.Transaction {
+	t.Helper()
 	repo := postgres.NewTransactionRepository(pg.DB, pg.Q)
 	tr := postgres.NewTransactor(pg.DB)
 
@@ -30,7 +35,7 @@ func seedStuckTxn(t *testing.T, pg *testsupport.PG, gatewayID, reference string)
 	txn.AttemptedGateway = gatewayID
 	txn.ActualGateway = gatewayID
 	txn.GatewayReferenceID = reference
-	past := time.Now().UTC().Add(-time.Hour)
+	past := time.Now().UTC().Add(-startedAgo)
 	d := time.Second
 	txn.ProcessingStartedAt = &past
 	txn.ProcessingTimeout = &d
@@ -79,6 +84,97 @@ func TestLeaseReaper_RecoversStuckTransactionViaStatusCheck(t *testing.T) {
 	_ = pg.DB.Pool().QueryRow(ctx, "SELECT count(*) FROM outbox_events WHERE aggregate_id=$1", stuck.ID).Scan(&events)
 	if events != 1 {
 		t.Errorf("expected one terminal outbox event from recovery, got %d", events)
+	}
+}
+
+func newReaper(pg *testsupport.PG, stripeURL string) *leaseexpiry.Reaper {
+	return leaseexpiry.New(
+		postgres.NewTransactionRepository(pg.DB, pg.Q),
+		buildService(pg, stripeURL),
+		postgres.NewIdempotencyRepository(pg.DB, pg.Q),
+		discardLogger(),
+		leaseexpiry.Config{IdempotencyProcessingTimeout: time.Minute},
+	)
+}
+
+func TestLeaseReaper_ReplaysInterruptedChargeWithTheSameIdempotencyKey(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "transactions", "processing_lease", "outbox_events")
+	testsupport.SeedStripeCardGateway(t, pg)
+	ctx := context.Background()
+
+	var gotMethod, gotPath, gotKey string
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		gotMethod, gotPath, gotKey = r.Method, r.URL.Path, r.Header.Get("Idempotency-Key")
+		_, _ = w.Write([]byte(`{"id":"pi_replayed","status":"succeeded","amount":150000,"currency":"inr"}`))
+	}))
+	defer srv.Close()
+
+	stuck := seedStuckTxn(t, pg, "stripe", "")
+	if err := newReaper(pg, srv.URL).RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if calls != 1 || gotMethod != http.MethodPost || gotPath != "/v1/payment_intents" || gotKey == "" {
+		t.Fatalf("expected one idempotent create replay, got calls=%d %s %s key=%q", calls, gotMethod, gotPath, gotKey)
+	}
+	persisted, err := postgres.NewTransactionRepository(pg.DB, pg.Q).GetByID(ctx, stuck.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != transaction.StatusSucceeded || persisted.GatewayReferenceID != "pi_replayed" {
+		t.Errorf("expected the replayed result recorded, got %s %q", persisted.Status, persisted.GatewayReferenceID)
+	}
+}
+
+func TestLeaseReaper_MarksUnrecoverableChargeForReviewAndStopsListingIt(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "transactions", "processing_lease", "outbox_events")
+	testsupport.SeedStripeCardGateway(t, pg)
+	ctx := context.Background()
+
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++ }))
+	defer srv.Close()
+
+	stuck := seedStuckTxnStartedAgo(t, pg, "stripe", "", 48*time.Hour)
+	repo := postgres.NewTransactionRepository(pg.DB, pg.Q)
+	if err := newReaper(pg, srv.URL).RunOnce(ctx); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	if calls != 0 {
+		t.Fatal("past the idempotency window nothing may be sent to the gateway")
+	}
+	var reason *string
+	var markedAt *time.Time
+	if err := pg.DB.Pool().QueryRow(ctx, "SELECT review_reason, review_required_at FROM transactions WHERE id=$1", stuck.ID).Scan(&reason, &markedAt); err != nil {
+		t.Fatal(err)
+	}
+	if reason == nil || *reason != "replay_window_passed" || markedAt == nil {
+		t.Fatalf("expected the row marked for review, got reason=%v at=%v", reason, markedAt)
+	}
+	persisted, err := repo.GetByID(ctx, stuck.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != transaction.StatusProcessing {
+		t.Errorf("the outcome is unknown, so the status must stay PROCESSING, got %s", persisted.Status)
+	}
+
+	ids, err := repo.ListExpiredLeaseIDs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids {
+		if id == stuck.ID {
+			t.Fatal("a transaction marked for review must not be re-listed every tick")
+		}
+	}
+	if marked, err := repo.MarkReviewRequired(ctx, stuck.ID, "again"); err != nil || marked {
+		t.Fatalf("marking is once only, got marked=%v err=%v", marked, err)
 	}
 }
 

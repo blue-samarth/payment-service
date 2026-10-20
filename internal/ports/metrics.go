@@ -13,6 +13,8 @@ const (
 	MetricTransactionCancelled = "transaction.cancelled"
 	MetricTransactionLatencyMs = "transaction.latency_ms"
 
+	MetricTransactionReviewRequired = "transaction.review_required"
+
 	MetricGatewayRequestLatencyMs   = "gateway.request_latency_ms"
 	MetricGatewayDiscrepancyRate    = "gateway.discrepancy_rate"
 	MetricGatewayCircuitBreakerOpen = "gateway.circuit_breaker_open"

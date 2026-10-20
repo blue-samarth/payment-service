@@ -69,4 +69,14 @@ SELECT id FROM transactions
 WHERE status = 'PROCESSING'
   AND processing_started_at IS NOT NULL
   AND processing_timeout IS NOT NULL
+  AND review_required_at IS NULL
   AND NOW() > processing_started_at + processing_timeout;
+
+-- name: TransactionMarkReviewRequired
+UPDATE transactions
+SET review_required_at = NOW(),
+    review_reason      = $2,
+    updated_at         = NOW()
+WHERE id = $1
+  AND status = 'PROCESSING'
+  AND review_required_at IS NULL;

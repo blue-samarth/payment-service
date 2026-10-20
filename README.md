@@ -592,8 +592,8 @@ flowchart TD
     Recover --> LoadTxn[Load txn, check still PROCESSING<br/>and lease actually expired]
     LoadTxn --> HasRef{Gateway reference<br/>recorded?}
     HasRef -->|Yes| CheckStatus[adapter.CheckStatus at gateway]
-    HasRef -->|No, within 23h| Replay[Replay InitiatePayment<br/>same request, same idempotency key]
-    HasRef -->|No, older| Manual[Log for manual review<br/>stays PROCESSING]
+    HasRef -->|No, idempotent gateway,<br/>within 23h| Replay[Replay InitiatePayment<br/>same request, same idempotency key]
+    HasRef -->|No, otherwise| Manual[Mark review_required_at<br/>count + log, stays PROCESSING,<br/>no longer listed]
     CheckStatus --> Outcome{Gateway status}
     Replay --> Outcome
     Manual --> NextTxn
@@ -612,9 +612,11 @@ flowchart TD
 ```
 
 - **Status check when the reference is known**: `RecoverExpiredLease` calls `CheckStatus`, a read-only query by the gateway reference, so it only finds out what already happened and records it.
-- **Idempotent replay when it is not**: the reference is saved only when the gateway answers. If the process died mid-call (deploy, crash, OOM), there is nothing to look up. A status check by an empty reference returns a request error, which used to finalize the payment as `FAILED` even if the card had been charged. The reaper now re-sends the original `InitiatePayment` request instead. Adapters derive their idempotency key from the transaction ID and attempt number, so the request carries the same key: Stripe returns the stored result of the first call rather than charging again, PayU makes no network call to initiate, and Razorpay only creates an order, which charges nothing. Stripe keeps idempotency keys for 24 hours, so a transaction stuck longer than 23 hours with no reference is logged as `recovery_requires_manual_review` and never replayed. After a replay only a definite status or a replayed decline is final; any other error, such as an idempotency conflict while the original call is still in flight, leaves the transaction `PROCESSING` for the next sweep.
+- **Idempotent replay when it is not**: the reference is saved only when the gateway answers. If the process died mid-call (deploy, crash, OOM), there is nothing to look up. A status check by an empty reference returns a request error, which used to finalize the payment as `FAILED` even if the card had been charged. The reaper now re-sends the original `InitiatePayment` request instead, **only to gateways whose adapter declares `IdempotencyCapable`**. Adapters derive their idempotency key from the transaction ID and attempt number, so the request carries the same key: Stripe returns the stored result of the first call rather than charging again, and PayU's initiate is a local, deterministic transaction ID. Razorpay declares itself not idempotent (its key is only an order `receipt` label, not enforced as unique), so a replay would create a second order; it is never replayed. After a replay only a definite status or a replayed decline is final; any other error, such as an idempotency conflict while the original call is still in flight, leaves the transaction `PROCESSING` for the next sweep. A replayed soft decline is final too: the live path would have fallen back to another gateway with the customer present, but opening a new charge from a background job hours later is a policy decision, not recovery, so the payment is `FAILED` with reason `soft_decline` and the merchant can retry.
+- **Manual review is a recorded state, not a log line**: with no reference and a non-idempotent gateway, or past 23 hours (Stripe keeps idempotency keys for 24), nothing is sent. The row is marked with `review_required_at` and `review_reason` (`gateway_not_idempotent` or `replay_window_passed`), counted once in `transaction.review_required` (tagged with gateway and reason, for alerting), logged as `recovery_requires_manual_review`, and dropped from the expired-lease listing so the reaper stops re-processing it. The status stays `PROCESSING`, which is true: the outcome is unknown until someone checks the gateway dashboard.
+- **The lease covers the gateway budget**: a transaction's processing timeout is the configured gateway/method timeout or the gateway budget (`GATEWAY_HTTP_TIMEOUT × GATEWAY_MAX_ATTEMPTS`) + 30s, whichever is longer, so the reaper never acts while the live handler can still be calling the gateway. If the reaper settles a payment anyway and the handler's own `finalize` then fails, the handler reloads the row and returns the settled state instead of an error.
 - **The gateway is recorded before it is called**: the `PROCESSING` write sets `actual_gateway`, and a fallback saves the switch to the next gateway before calling it (and skips the fallback if that write fails), so recovery always queries the gateway that may have charged.
-- **A client disconnect does not abort a charge**: the gateway calls and `finalize` run on a context detached from the request (`context.WithoutCancel`), so a merchant that drops the connection mid-request no longer cuts off a gateway call that may already have charged.
+- **A client disconnect does not abort a charge**: the gateway calls and `finalize` run on a context detached from the request (`context.WithoutCancel`), so a merchant that drops the connection mid-request no longer cuts off a gateway call that may already have charged. The detached work has its own deadline (gateway budget + 30s) as a backstop to the per-call HTTP timeouts.
 - **One failure doesn't abort the batch**: each transaction ID is recovered independently; a single recovery error is logged and the loop continues to the rest (`TestReaper_PerItemFailureDoesNotAbortSweep`).
 - **Piggy-backed idempotency-key hygiene**: the same run also sweeps `idempotency_keys` rows — `PROCESSING` rows older than `IdempotencyProcessingTimeout` (default 5 minutes, meaning a crashed request that never called `Complete`/rolled back cleanly) are cleared so retries aren't blocked forever, and `COMPLETED` rows past their TTL are purged to bound table growth.
 
@@ -638,7 +640,7 @@ Responsibilities, all guarded by a single Postgres advisory lock (`AcquireLock`/
 
 - **Local in-memory fallback**: if Redis is unavailable for `failureThreshold` (3) consecutive calls, the limiter flips to a local, per-process token bucket sized at `capacity × FallbackMultiplier` (default 0.5 — deliberately more conservative than the Redis-backed limit), backed by an LRU (`container/list`) capped at `LocalMaxBuckets` to bound memory. A background health check restores the Redis-backed path once it recovers.
 - **Merchant bucket key comes from the authenticated principal**, never a client-supplied header — `merchantBucketID` reads from request context (set by the auth middleware), so a spoofed `X-Merchant-ID` header can't be used to attribute load to (or rate-limit) a different merchant.
-- **The IP bucket key is the TCP peer by default.** `X-Forwarded-For` is honoured only when the peer is inside `TRUSTED_PROXY_CIDRS` (empty by default). Even then the header is walked right to left and the first hop outside the trusted ranges is used, so entries a caller prepends are never chosen. Behind the planned layer-4 NLB, which adds no such header, leave `TRUSTED_PROXY_CIDRS` empty and enable client IP preservation on the target group. Behind an L7 load balancer (including `WEBHOOK_TLS_MODE=lb` on an ALB), list its CIDRs, or every caller shares the load balancer's bucket.
+- **The IP bucket key is the TCP peer by default.** `X-Forwarded-For` is honoured only when the peer is inside `TRUSTED_PROXY_CIDRS` (empty by default). Even then the header is walked right to left and the first hop outside the trusted ranges is used, so entries a caller prepends are never chosen. With TCP passthrough on the planned NLB (TLS terminated in the process), leave `TRUSTED_PROXY_CIDRS` empty and enable client IP preservation on the target group. When the load balancer terminates TLS (`WEBHOOK_TLS_MODE=lb`), it opens its own connection to the pod, so the TCP peer of every request is the load balancer. Use one that sets `X-Forwarded-For` (an ALB) and list its subnets in `TRUSTED_PROXY_CIDRS`, or every caller shares one bucket. An NLB TLS listener adds no such header, so it cannot carry the client address this way. `cmd/api` logs `rate_limit.proxy_untrusted` at startup for `lb` mode with an empty list.
 - **IPv6 callers are bucketed per /64**, the smallest block normally assigned to one site, so rotating addresses inside it does not give a fresh bucket. IPv4 stays per address.
 - Rejections return `429` with a computed `Retry-After` header (minimum 1 second).
 - `RATE_LIMIT_CAPACITY` and `RATE_LIMIT_REFILL_PER_SEC` are validated at startup; a malformed value fails `LoadConfig` instead of silently using the default.
@@ -664,7 +666,7 @@ Tokens are stored hashed (SHA-256) in memory. Authentication runs only on the me
 |---|---|---|---|
 | Merchant API | `PORT` (8080) | mTLS, strict by default | payments, refunds, cancel |
 | Webhooks | `WEBHOOK_PORT` (8081) | server TLS, no client certificate | `POST /webhooks/gateway/{gateway_id}` |
-| Health | `HEALTH_PORT` (8082) | plain HTTP, never exposed through the load balancer | health endpoints (§20) |
+| Health | `HEALTH_PORT` (8082) | plain HTTP, never exposed through the load balancer; binds all interfaces because the kubelet probes the pod IP, so restrict it with a NetworkPolicy | health endpoints (§20) |
 
 The split exists because a TLS handshake happens before any HTTP routing: with one strict
 mTLS listener, Stripe, Razorpay, PayU and the kubelet's probes (none of which hold a
@@ -683,14 +685,14 @@ certificate from our CA) were refused before any path-based exemption could appl
 
 - **Shutdown on `SIGTERM`/`SIGINT`**, or when any listener fails:
   1. Readiness flips to `draining` (`503`) while every listener keeps serving for `SHUTDOWN_DRAIN_DELAY` (default 5s), so the load balancer deregisters the instance before connections are refused. Liveness stays `200`.
-  2. The merchant and webhook servers shut down **concurrently** within `SHUTDOWN_TIMEOUT` (default 15s). A server still busy at the deadline is force-closed, and the error names it.
+  2. The merchant and webhook servers shut down **concurrently** within `SHUTDOWN_TIMEOUT` (default: gateway budget + 15s, 105s with the defaults; validated to be at least the budget). `Shutdown` returns as soon as the servers are idle, so the long deadline only matters when a charge is actually in flight. A server still busy at the deadline is force-closed, and the error names it.
   3. The health server stops last, under its own 5s deadline, so probes get an answer throughout even if the others used the whole budget.
 
   A listener failing during the drain delay ends the delay early. A second `SIGTERM`/`SIGINT` restores the default signal handling and kills the process immediately.
 
-  Keep `SHUTDOWN_DRAIN_DELAY + SHUTDOWN_TIMEOUT + 5s` below the pod's `terminationGracePeriodSeconds` (30s by default; the defaults add up to 25s).
+  Set the pod's `terminationGracePeriodSeconds` above `SHUTDOWN_DRAIN_DELAY + SHUTDOWN_TIMEOUT + 5s` (115s with the defaults; the Kubernetes default of 30s is too short).
 
-  A payment whose gateway call outlives `SHUTDOWN_TIMEOUT` is cut off with the process. That is safe: the transaction is already `PROCESSING` with the gateway recorded, and the lease-expiry reaper resolves it (§13).
+  A charge is only cut off if the process is killed before `SHUTDOWN_TIMEOUT` (a crash, an OOM kill, or a grace period set too short). The transaction is then already `PROCESSING` with the gateway recorded, and the lease-expiry reaper resolves it or marks it for review (§13).
 
 `internal/adapters/security.Manager` wraps Go's `crypto/tls` with **hot certificate rotation**:
 
@@ -758,7 +760,7 @@ All configuration is via environment variables, loaded and validated in `config/
 
 | Area | Key variables | Notes |
 |---|---|---|
-| App | `ENVIRONMENT` (prod/staging/dev), `PORT`, `WEBHOOK_PORT`, `HEALTH_PORT`, `WEBHOOK_TLS_MODE` (`app`\|`lb`), `MTLS_STRICT_MODE`, `SHUTDOWN_DRAIN_DELAY` (5s), `SHUTDOWN_TIMEOUT` (15s) | The three ports must be distinct. With `ENVIRONMENT=prod`, `MTLS_STRICT_MODE=false` and `ALLOW_NO_AUTH=true` fail startup; `REDIS_TLS_ENABLED=false` and `WEBHOOK_TLS_MODE=lb` stay allowed (the first logs a warning) |
+| App | `ENVIRONMENT` (prod/staging/dev), `PORT`, `WEBHOOK_PORT`, `HEALTH_PORT`, `WEBHOOK_TLS_MODE` (`app`\|`lb`), `MTLS_STRICT_MODE`, `SHUTDOWN_DRAIN_DELAY` (5s), `SHUTDOWN_TIMEOUT` (gateway budget + 15s) | The three ports must be distinct. `SHUTDOWN_TIMEOUT` must be at least the gateway budget. With `ENVIRONMENT=prod`, `MTLS_STRICT_MODE=false` and `ALLOW_NO_AUTH=true` fail startup; `REDIS_TLS_ENABLED=false` and `WEBHOOK_TLS_MODE=lb` stay allowed (the first logs a warning) |
 | Database | `DATABASE_PRIMARY_HOST`, `DATABASE_REPLICA_HOST`, `DATABASE_NAME/USER/PASSWORD`, `DATABASE_SSL_MODE` | Pool sizing via `DATABASE_MAX_OPEN_CONNS` etc. |
 | Redis | `REDIS_ADDRS` (single primary endpoint), `REDIS_TLS_ENABLED`, `REDIS_USERNAME`, `REDIS_PASSWORD`, separate DBs for rate-limit vs. cache | Cluster mode is unsupported: it has only database 0 |
 | Outbox | `OUTBOX_RELAY_MODE` (`cdc`\|`polling`), `OUTBOX_RELAY_BATCH_SIZE`, `OUTBOX_RELAY_MAX_ATTEMPTS`, WAL-lag alert thresholds | Shard count fixed at 64 by schema |
@@ -785,7 +787,10 @@ Deployments that ran the single-listener build must change the following togethe
 | `SERVICE_TOKENS` | Any `token=merchant`, bad entries skipped | Merchant must be a UUID; bad entries fail startup | Fix entries before rolling out. A non-UUID merchant could never have stored a transaction (`merchant_id` is `UUID`). |
 | Numeric env vars | `RATE_LIMIT_*`, `CIRCUIT_BREAKER_FAILURE_THRESHOLD` fell back to defaults silently | Malformed values fail startup | Check these values. |
 | Client IP for rate limits | First `X-Forwarded-For` entry | TCP peer unless it is in `TRUSTED_PROXY_CIDRS` | Behind an L7 proxy that sets the header, list its CIDRs. Behind the NLB, enable client IP preservation. |
-| Pod termination | 15s shared shutdown | `SHUTDOWN_DRAIN_DELAY` + `SHUTDOWN_TIMEOUT` + 5s for health (25s by default) | Keep `terminationGracePeriodSeconds` above the sum. |
+| Pod termination | 15s shared shutdown | `SHUTDOWN_DRAIN_DELAY` + `SHUTDOWN_TIMEOUT` + 5s for health; `SHUTDOWN_TIMEOUT` defaults to the gateway budget + 15s (115s total by default) | Set `terminationGracePeriodSeconds` above the sum (e.g. 120). An explicit `SHUTDOWN_TIMEOUT` below the gateway budget fails startup. |
+| Database migration | — | `000007` adds `review_required_at` and `review_reason` to `transactions` | Run migrations before rolling out; the reaper's listing query reads the new column. |
+| Stuck charges needing review | Logged only, re-listed every tick | Marked in the row and counted in `transaction.review_required` | Alert on that counter; resolve marked rows from the gateway dashboard. |
+| `WEBHOOK_TLS_MODE=lb` rate limiting | Silent | Startup warning `rate_limit.proxy_untrusted` when `TRUSTED_PROXY_CIDRS` is empty | Use an LB that sets `X-Forwarded-For` and list its subnets. |
 | Token strength | Any length | Service and ops tokens at least 32 characters | Rotate short tokens before rolling out. |
 | Production guardrails | `ALLOW_NO_AUTH=true` and `MTLS_STRICT_MODE=false` accepted everywhere | Both fail startup when `ENVIRONMENT=prod` | Remove them from production manifests. |
 | Webhook TLS | TLS 1.3 only | TLS 1.2 (AEAD suites) and 1.3 | None. Before switching dashboard URLs, send a test webhook from each gateway's sandbox to the new port. |

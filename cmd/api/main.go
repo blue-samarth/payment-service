@@ -136,6 +136,7 @@ func run() error {
 	})
 	router.SetBreakerState(breakerStateAdapter{store: cbStore})
 	paymentSvc.SetMaxGatewayAttempts(cfg.Gateway.MaxAttempts)
+	paymentSvc.SetGatewayHTTPTimeout(cfg.Gateway.HTTPTimeout)
 
 	intentStore := redis.NewIntentStore(redisClient)
 	router.SetActiveIntents(intentStore)
@@ -158,32 +159,27 @@ func run() error {
 	defer cancelRefresh()
 	refreshInterval := time.Duration(cfg.Security.CertRefreshIntervalSec) * time.Second
 
-	var certs []handlers.CertificateChecker
-	merchantTransport := "plain"
-	var merchantTLS *tls.Config
-	if cfg.Security.TLSCertFile != "" {
-		merchantTransport = "mtls"
-		if !cfg.App.MtlsStrictMode {
-			merchantTransport = "mtls_optional"
-			logger.Warn("mtls.optional_mode", map[string]any{
-				"warning": "MTLS_STRICT_MODE=false: client certificates are requested but not enforced",
-			})
-		}
-		mgr, err := security.NewManager(security.Config{
-			Name:            "merchant",
-			CertFile:        cfg.Security.TLSCertFile,
-			KeyFile:         cfg.Security.TLSKeyFile,
-			CAFile:          cfg.Security.TLSCAFile,
-			OptionalMTLS:    !cfg.App.MtlsStrictMode,
-			RefreshInterval: refreshInterval,
-		}, logger, metrics)
-		if err != nil {
-			return fmt.Errorf("configure merchant mTLS: %w", err)
-		}
-		mgr.StartRefresh(refreshCtx)
-		merchantTLS = mgr.TLSConfig()
-		certs = append(certs, mgr)
+	merchantTransport := "mtls"
+	if !cfg.App.MtlsStrictMode {
+		merchantTransport = "mtls_optional"
+		logger.Warn("mtls.optional_mode", map[string]any{
+			"warning": "MTLS_STRICT_MODE=false: client certificates are requested but not enforced",
+		})
 	}
+	merchantMgr, err := security.NewManager(security.Config{
+		Name:            "merchant",
+		CertFile:        cfg.Security.TLSCertFile,
+		KeyFile:         cfg.Security.TLSKeyFile,
+		CAFile:          cfg.Security.TLSCAFile,
+		OptionalMTLS:    !cfg.App.MtlsStrictMode,
+		RefreshInterval: refreshInterval,
+	}, logger, metrics)
+	if err != nil {
+		return fmt.Errorf("configure merchant mTLS: %w", err)
+	}
+	merchantMgr.StartRefresh(refreshCtx)
+	merchantTLS := merchantMgr.TLSConfig()
+	certs := []handlers.CertificateChecker{merchantMgr}
 
 	webhookTransport := "plain_lb_terminated"
 	var webhookTLS *tls.Config
@@ -206,6 +202,11 @@ func run() error {
 		logger.Warn("webhook.tls_terminated_upstream", map[string]any{
 			"warning": "WEBHOOK_TLS_MODE=lb: the webhook listener serves plain HTTP and relies on the load balancer to terminate TLS",
 		})
+		if len(cfg.RateLimit.TrustedProxies) == 0 {
+			logger.Warn("rate_limit.proxy_untrusted", map[string]any{
+				"warning": "WEBHOOK_TLS_MODE=lb with empty TRUSTED_PROXY_CIDRS: the load balancer terminating TLS is the TCP peer of every request, so all callers share its rate-limit bucket. Set TRUSTED_PROXY_CIDRS to the load balancer's subnets and use one that sets X-Forwarded-For",
+			})
+		}
 	}
 
 	health := handlers.NewHealthHandler(
