@@ -31,6 +31,27 @@ func TestParseWebhook_Valid(t *testing.T) {
 	}
 }
 
+func TestParseWebhook_CarriesTransactionIDFromNotes(t *testing.T) {
+	const id = "0b7c3a52-6a3e-4c1f-9d2e-6f1a2b3c4d5e"
+	cases := map[string]string{
+		"order.paid carries the order's notes": `{"event":"order.paid","payload":{"payment":{"entity":{"id":"pay_1","order_id":"order_1","status":"captured"}},"order":{"entity":{"notes":{"transaction_id":"` + id + `"}}}}}`,
+		"payment notes as a fallback":          `{"event":"payment.captured","payload":{"payment":{"entity":{"id":"pay_1","order_id":"order_1","status":"captured","notes":{"transaction_id":"` + id + `"}}}}}`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			a := New(Config{})
+			body := []byte(raw)
+			ev, err := a.ParseWebhook(body, map[string]string{"X-Razorpay-Signature": rzpSig("whsec", body)}, "whsec")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ev.TransactionID != id {
+				t.Errorf("got %q", ev.TransactionID)
+			}
+		})
+	}
+}
+
 func TestParseWebhook_BadSignature(t *testing.T) {
 	a := New(Config{})
 	body := []byte(`{"payload":{"payment":{"entity":{"order_id":"order_1","status":"captured"}}}}`)

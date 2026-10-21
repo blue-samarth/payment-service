@@ -82,6 +82,8 @@ type Transaction struct {
 	ProcessingTimeout       *time.Duration
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
+	ReviewRequiredAt        *time.Time
+	ReviewReason            string
 }
 
 const (

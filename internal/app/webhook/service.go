@@ -14,6 +14,7 @@ import (
 type Event struct {
 	EventID            string
 	GatewayReferenceID string
+	TransactionID      string
 	Status             string
 }
 
@@ -26,6 +27,7 @@ type Outcome struct {
 
 type TransactionRepo interface {
 	GetByGatewayReference(ctx context.Context, gatewayID, reference string) (*transaction.Transaction, error)
+	FindByID(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error)
 	UpdateStatus(ctx context.Context, t *transaction.Transaction) error
 }
 
@@ -75,7 +77,7 @@ func (s *Service) Process(ctx context.Context, gatewayID string, ev Event, rawPa
 			return nil
 		}
 
-		txn, err := s.txns.GetByGatewayReference(ctx, gatewayID, ev.GatewayReferenceID)
+		txn, referenceRecovered, err := s.findTransaction(ctx, gatewayID, ev)
 		if err != nil {
 			return fmt.Errorf("lookup transaction: %w", err)
 		}
@@ -90,6 +92,11 @@ func (s *Service) Process(ctx context.Context, gatewayID string, ev Event, rawPa
 
 		newStatus, terminal := mapWebhookStatus(ev.Status)
 		if !terminal || txn.Status != transaction.StatusProcessing {
+			if referenceRecovered && txn.Status == transaction.StatusProcessing {
+				if err := s.txns.UpdateStatus(ctx, txn); err != nil {
+					return err
+				}
+			}
 			outcome.Status = txn.Status
 			return nil
 		}
@@ -133,6 +140,37 @@ func (s *Service) Process(ctx context.Context, gatewayID string, ev Event, rawPa
 		})
 	}
 	return outcome, nil
+}
+
+func (s *Service) findTransaction(ctx context.Context, gatewayID string, ev Event) (*transaction.Transaction, bool, error) {
+	txn, err := s.txns.GetByGatewayReference(ctx, gatewayID, ev.GatewayReferenceID)
+	if err != nil || txn != nil {
+		return txn, false, err
+	}
+	if ev.TransactionID == "" || ev.GatewayReferenceID == "" {
+		return nil, false, nil
+	}
+	id, err := uuid.Parse(ev.TransactionID)
+	if err != nil {
+		return nil, false, nil
+	}
+	txn, err = s.txns.FindByID(ctx, id)
+	if err != nil || txn == nil {
+		return nil, false, err
+	}
+	gateway := txn.ActualGateway
+	if gateway == "" {
+		gateway = txn.GatewayID
+	}
+	if gateway != gatewayID || txn.GatewayReferenceID != "" {
+		return nil, false, nil
+	}
+	txn.GatewayReferenceID = ev.GatewayReferenceID
+	s.log.Info(ports.LogEventWebhookReferenceRecovered, map[string]any{
+		ports.FieldTransactionID: txn.ID.String(),
+		ports.FieldGatewayID:     gatewayID,
+	})
+	return txn, true, nil
 }
 
 func (s *Service) buildEvent(txn *transaction.Transaction, status transaction.Status, gatewayID string) (ports.OutboxEvent, error) {

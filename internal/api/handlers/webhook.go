@@ -89,6 +89,7 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	outcome, err := h.processor.Process(r.Context(), gatewayID, appwebhook.Event{
 		EventID:            ev.EventID,
 		GatewayReferenceID: ev.GatewayReferenceID,
+		TransactionID:      ev.TransactionID,
 		Status:             normalizeStatus(ev.Status),
 	}, rawBody)
 	if err != nil {

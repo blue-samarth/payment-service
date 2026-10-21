@@ -11,9 +11,10 @@ SELECT
     description, customer_id, customer_email,
     cancel_intent, cancel_requested_by, cancel_requested_at, cancel_requested_via,
     processing_started_at, EXTRACT(EPOCH FROM processing_timeout)::double precision,
-    created_at, updated_at
+    created_at, updated_at, review_required_at, review_reason
 FROM transactions
-WHERE gateway_id = $1 AND gateway_reference_id = $2;
+WHERE gateway_reference_id = $2
+  AND COALESCE(NULLIF(actual_gateway, ''), gateway_id) = $1;
 
 -- name: RawMetadataInsert
 INSERT INTO transaction_raw_metadata (transaction_id, gateway_id, payload)
