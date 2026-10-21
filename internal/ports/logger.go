@@ -33,7 +33,6 @@ const (
 	LogEventOutboxDeadLetter     = "outbox.dead_letter"
 	LogEventOutboxReplay         = "outbox.replay"
 	LogEventRelayStarted         = "relay.started"
-	LogEventRelayConsumerStale   = "relay.consumer_stale"
 
 	LogEventRefundInitiated         = "refund.initiated"
 	LogEventRefundSucceeded         = "refund.succeeded"
@@ -58,8 +57,9 @@ const (
 	LogEventReconciliationMismatch = "reconciliation.mismatch_detected"
 	LogEventAutoResolution         = "reconciliation.auto_resolution"
 
-	LogEventConfigReload  = "config.hot_reload"
-	LogEventConfigInvalid = "config.invalid_rejected"
+	LogEventConfigReload     = "config.hot_reload"
+	LogEventConfigInvalid    = "config.invalid_rejected"
+	LogEventConfigDeprecated = "config.deprecated"
 
 	LogEventTLSCertReloaded     = "tls.cert_reloaded"
 	LogEventTLSCertReloadFailed = "tls.cert_reload_failed"
@@ -101,7 +101,6 @@ const (
 	FieldNewState       = "new_state"
 	FieldActor          = "actor"
 	FieldDurationMs     = "duration_ms"
-	FieldRelayMode      = "relay_mode"
 	FieldPartitionName  = "partition_name"
 	FieldMismatchType   = "mismatch_type"
 )

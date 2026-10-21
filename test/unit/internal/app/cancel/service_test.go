@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
 )
@@ -77,6 +78,46 @@ func TestCancel_AlreadyRequested(t *testing.T) {
 	}
 	if store.setCalls != 0 {
 		t.Error("should not re-set intent when already requested")
+	}
+}
+
+type completedKey struct{ response []byte }
+
+func (c completedKey) Reserve(context.Context, string, string) (bool, error) { return false, nil }
+func (c completedKey) Lookup(_ context.Context, _ string) (bool, string, string, []byte, error) {
+	return true, idempotency.RequestHash(cancelTxnID.String(), string(transaction.ActorMerchant), string(transaction.CancelViaAPI)), "COMPLETED", c.response, nil
+}
+func (c completedKey) Complete(context.Context, string, []byte) error { return nil }
+
+type passThroughTx struct{}
+
+func (passThroughTx) WithinTx(ctx context.Context, fn func(context.Context) error) error {
+	return fn(ctx)
+}
+
+var cancelTxnID = uuid.New()
+
+func TestCancel_ReplayReportsCurrentStatusNotTheSnapshot(t *testing.T) {
+	settled := txnWith(transaction.StatusSucceeded, true)
+	settled.ID = cancelTxnID
+	store := &fakeStore{txn: settled}
+	s := NewService(store, noopLogger{}, noopMetrics{})
+	s.SetIdempotency(idempotency.NewGuard(completedKey{response: []byte(`{"outcome":"CANCEL_REQUESTED","status":"PROCESSING"}`)}, passThroughTx{}))
+
+	res, err := s.Cancel(context.Background(), CancelInput{
+		TransactionID: cancelTxnID, By: transaction.ActorMerchant, Via: transaction.CancelViaAPI, IdempotencyKey: "k1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Verdict != idempotency.Replayed || res.Outcome != OutcomeRequested {
+		t.Fatalf("expected a replay of the original outcome, got %+v", res)
+	}
+	if res.Status != transaction.StatusSucceeded {
+		t.Errorf("a replay after the payment settled must report the current status, not the stored PROCESSING, got %s", res.Status)
+	}
+	if store.setCalls != 0 {
+		t.Error("a replay must not set the cancel intent again")
 	}
 }
 

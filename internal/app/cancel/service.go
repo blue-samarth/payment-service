@@ -92,7 +92,11 @@ func (s *Service) Cancel(ctx context.Context, in CancelInput) (Result, error) {
 		if err := json.Unmarshal(res.Response, &stored); err != nil {
 			return Result{}, fmt.Errorf("cancel: decode idempotent response: %w", err)
 		}
-		return Result{Verdict: res.Verdict, Outcome: Outcome(stored.Outcome), Status: transaction.Status(stored.Status)}, nil
+		current, err := s.txns.GetByID(ctx, in.TransactionID)
+		if err != nil {
+			return Result{}, fmt.Errorf("cancel: reload transaction %s: %w", in.TransactionID, err)
+		}
+		return Result{Verdict: res.Verdict, Outcome: Outcome(stored.Outcome), Status: current.Status}, nil
 	default:
 		return Result{Verdict: res.Verdict}, nil
 	}

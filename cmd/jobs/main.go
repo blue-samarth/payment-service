@@ -38,6 +38,7 @@ func run() error {
 	}
 
 	logger := observability.NewSlogLogger(bootstrap.ParseLogLevel(cfg.Observability.LogLevel))
+	bootstrap.LogDeprecations(logger, cfg.Deprecations)
 
 	ctx := context.Background()
 	if cfg.Jobs.RunTimeoutMinutes > 0 {

@@ -20,7 +20,7 @@ type IntentStore struct {
 }
 
 func NewIntentStore(c *Client) *IntentStore {
-	return &IntentStore{client: c.Cache}
+	return &IntentStore{client: c.State}
 }
 
 func intentsKey(gatewayID string) string { return "gateway:intents:" + gatewayID }

@@ -18,7 +18,7 @@ func TestNew_TLSClientDoesNotDowngradeToPlaintext(t *testing.T) {
 	cfg := config.RedisConfig{
 		Addrs:        []string{testsupport.RedisAddr()},
 		RateLimitDB:  0,
-		CacheDB:      1,
+		StateDB:      1,
 		DialTimeout:  time.Second,
 		ReadTimeout:  time.Second,
 		WriteTimeout: time.Second,
