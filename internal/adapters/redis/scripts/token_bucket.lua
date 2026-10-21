@@ -2,6 +2,7 @@ local capacity  = tonumber(ARGV[1])
 local rate      = tonumber(ARGV[2])
 local now_ms    = tonumber(ARGV[3])
 local requested = tonumber(ARGV[4])
+local need      = math.max(requested, 1)
 
 local ttl
 if rate <= 0 then
@@ -28,13 +29,13 @@ for i = 1, n do
 
   refilled[i] = tokens
 
-  if tokens < requested then
+  if tokens < need then
     allowed = 0
     local wait
     if rate <= 0 then
       wait = ttl * 1000
     else
-      wait = math.ceil((requested - tokens) / rate * 1000)
+      wait = math.ceil((need - tokens) / rate * 1000)
     end
     if wait > max_wait then max_wait = wait end
   end

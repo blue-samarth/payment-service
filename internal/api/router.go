@@ -19,6 +19,7 @@ type Deps struct {
 	Auth          middleware.TokenProvider
 	Limiter       middleware.Limiter
 	RateLimit     middleware.RateLimitConfig
+	AuthFailures  middleware.RateLimitConfig
 	ClientIP      *middleware.ClientIP
 	ResponseCache middleware.ResponseCacheStore
 }
@@ -38,7 +39,16 @@ func NewMerchantRouter(deps Deps) http.Handler {
 		middleware.Recover(deps.Logger),
 	}
 	if deps.Auth != nil {
-		chain = append(chain, middleware.Authenticate(deps.Auth, deps.Logger))
+		var throttle *middleware.AuthThrottle
+		if deps.Limiter != nil && deps.AuthFailures.Capacity > 0 {
+			throttle = &middleware.AuthThrottle{
+				Limiter:      deps.Limiter,
+				ClientIP:     deps.ClientIP,
+				Capacity:     deps.AuthFailures.Capacity,
+				RefillPerSec: deps.AuthFailures.RefillPerSec,
+			}
+		}
+		chain = append(chain, middleware.Authenticate(deps.Auth, deps.Logger, throttle))
 	}
 	if deps.Limiter != nil {
 		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.RateLimit, deps.Logger, middleware.RequestKeys(deps.ClientIP)))

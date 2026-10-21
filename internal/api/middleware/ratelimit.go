@@ -5,10 +5,26 @@ import (
 	"net/http"
 	"net/netip"
 	"strconv"
+	"strings"
 	"time"
 
 	"samarth/payment-service/internal/ports"
 )
+
+const (
+	NamespaceUser        = "user"
+	NamespaceMerchant    = "merchant"
+	NamespaceIP          = "ip"
+	NamespaceWebhookIP   = "webhook_ip"
+	NamespaceAuthFailure = "auth_failure"
+)
+
+const unauthenticatedScope = "unauthenticated"
+
+type Bucket struct {
+	Namespace string
+	ID        string
+}
 
 type RateDecision struct {
 	Allowed    bool
@@ -16,7 +32,7 @@ type RateDecision struct {
 }
 
 type Limiter interface {
-	Allow(ctx context.Context, userID, merchantID, ip string, capacity int64, ratePerSec float64) RateDecision
+	Take(ctx context.Context, buckets []Bucket, capacity int64, ratePerSec float64, cost int64) RateDecision
 }
 
 type RateLimitConfig struct {
@@ -26,18 +42,36 @@ type RateLimitConfig struct {
 
 const ipv6BucketPrefix = 64
 
-type RateLimitKeys func(r *http.Request) (userID, merchantID, ip string)
+type RateLimitKeys func(r *http.Request) []Bucket
 
 func RequestKeys(clientIP *ClientIP) RateLimitKeys {
-	return func(r *http.Request) (string, string, string) {
-		return r.Header.Get("X-User-ID"), merchantBucketID(r.Context()), bucketIP(clientIP.From(r))
+	return func(r *http.Request) []Bucket {
+		var buckets []Bucket
+		merchant := merchantBucketID(r.Context())
+		if merchant != "" {
+			buckets = append(buckets, Bucket{Namespace: NamespaceMerchant, ID: merchant})
+		}
+		if user := strings.TrimSpace(r.Header.Get("X-User-ID")); user != "" {
+			scope := merchant
+			if scope == "" {
+				scope = unauthenticatedScope
+			}
+			buckets = append(buckets, Bucket{Namespace: NamespaceUser, ID: scope + "\x00" + user})
+		}
+		if ip := bucketIP(clientIP.From(r)); ip != "" {
+			buckets = append(buckets, Bucket{Namespace: NamespaceIP, ID: ip})
+		}
+		return buckets
 	}
 }
 
 func WebhookKeys(clientIP *ClientIP) RateLimitKeys {
-	return func(r *http.Request) (string, string, string) {
+	return func(r *http.Request) []Bucket {
 		ip := bucketIP(clientIP.From(r))
-		return "webhook:" + ip, "webhook:" + ip, ip
+		if ip == "" {
+			return nil
+		}
+		return []Bucket{{Namespace: NamespaceWebhookIP, ID: ip}}
 	}
 }
 
@@ -52,28 +86,41 @@ func bucketIP(ip string) string {
 func RateLimit(limiter Limiter, cfg RateLimitConfig, log ports.Logger, keys RateLimitKeys) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			userID, merchantID, ip := keys(r)
+			buckets := keys(r)
 
-			decision := limiter.Allow(r.Context(), userID, merchantID, ip, cfg.Capacity, cfg.RefillPerSec)
+			decision := limiter.Take(r.Context(), buckets, cfg.Capacity, cfg.RefillPerSec, 1)
 			if !decision.Allowed {
-				retrySec := int(decision.RetryAfter.Seconds())
-				if retrySec < 1 {
-					retrySec = 1
-				}
-				w.Header().Set("Retry-After", strconv.Itoa(retrySec))
 				log.Warn(ports.LogEventRateLimitRejected, map[string]any{
-					"ip":   ip,
-					"path": r.URL.Path,
+					"remote_addr": r.RemoteAddr,
+					"path":        r.URL.Path,
+					"buckets":     namespaces(buckets),
 				})
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusTooManyRequests)
-				_, _ = w.Write([]byte(`{"error":{"code":"rate_limited","message":"too many requests"}}`))
+				writeRateLimited(w, decision)
 				return
 			}
 
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func writeRateLimited(w http.ResponseWriter, decision RateDecision) {
+	retrySec := int(decision.RetryAfter.Seconds())
+	if retrySec < 1 {
+		retrySec = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retrySec))
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_, _ = w.Write([]byte(`{"error":{"code":"rate_limited","message":"too many requests"}}`))
+}
+
+func namespaces(buckets []Bucket) []string {
+	out := make([]string, len(buckets))
+	for i, b := range buckets {
+		out[i] = b.Namespace
+	}
+	return out
 }
 
 func merchantBucketID(ctx context.Context) string {

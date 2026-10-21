@@ -230,6 +230,10 @@ func run() error {
 			Capacity:     cfg.RateLimit.Capacity,
 			RefillPerSec: cfg.RateLimit.RefillPerSec,
 		},
+		AuthFailures: middleware.RateLimitConfig{
+			Capacity:     cfg.RateLimit.AuthFailureCapacity,
+			RefillPerSec: cfg.RateLimit.AuthFailureRefillPerSec,
+		},
 		ClientIP: middleware.NewClientIP(cfg.RateLimit.TrustedProxies),
 	}
 
@@ -311,7 +315,11 @@ func (a breakerStateAdapter) BreakerState(ctx context.Context, gatewayID string)
 	return string(cb.State), cb.CooldownUntil, nil
 }
 
-func (a limiterAdapter) Allow(ctx context.Context, userID, merchantID, ip string, capacity int64, ratePerSec float64) middleware.RateDecision {
-	res := a.rl.Allow(ctx, userID, merchantID, ip, capacity, ratePerSec)
+func (a limiterAdapter) Take(ctx context.Context, buckets []middleware.Bucket, capacity int64, ratePerSec float64, cost int64) middleware.RateDecision {
+	keys := make([]redis.Bucket, len(buckets))
+	for i, b := range buckets {
+		keys[i] = redis.Bucket{Namespace: b.Namespace, ID: b.ID}
+	}
+	res := a.rl.Take(ctx, keys, capacity, ratePerSec, cost)
 	return middleware.RateDecision{Allowed: res.Allowed, RetryAfter: res.RetryAfter}
 }

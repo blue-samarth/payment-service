@@ -69,14 +69,59 @@ func TestRateLimiter_LocalBucketPicksUpNewLimits(t *testing.T) {
 	}
 	ctx := context.Background()
 
-	r.Allow(ctx, "u", "m", "ip", 10, 5) // creates buckets with capacity 10
-	r.Allow(ctx, "u", "m", "ip", 2, 1)  // reconfigure to capacity 2
+	user := Bucket{Namespace: "user", ID: "u"}
+	r.Take(ctx, []Bucket{user, {Namespace: "ip", ID: "ip"}}, 10, 5, 1) // creates buckets with capacity 10
+	r.Take(ctx, []Bucket{user, {Namespace: "ip", ID: "ip"}}, 2, 1, 1)  // reconfigure to capacity 2
 
-	entry, ok := r.localBuckets.Load("u")
+	entry, ok := r.localBuckets.Load(user.localKey())
 	if !ok {
 		t.Fatal("expected a local bucket for the user dimension")
 	}
 	if got := entry.(*lruBucketEntry).bucket.capacity; got != 2 {
 		t.Errorf("local bucket should adopt the new capacity (2), got %v", got)
+	}
+}
+
+func localLimiter() *RateLimiter {
+	return &RateLimiter{
+		available: false,
+		lruOrder:  list.New(),
+		cfg:       config.RateLimitConfig{FallbackMultiplier: 1, LocalMaxBuckets: 100},
+	}
+}
+
+func TestRateLimiter_LocalFallbackKeepsNamespacesApart(t *testing.T) {
+	r := localLimiter()
+	ctx := context.Background()
+
+	if !r.Take(ctx, []Bucket{{Namespace: "user", ID: "1.2.3.4"}}, 1, 0.0001, 1).Allowed {
+		t.Fatal("first request must pass")
+	}
+	if !r.Take(ctx, []Bucket{{Namespace: "ip", ID: "1.2.3.4"}}, 1, 0.0001, 1).Allowed {
+		t.Fatal("a user id equal to an IP must not drain that IP's bucket during Redis fallback")
+	}
+}
+
+func TestRateLimiter_ZeroCostChecksWithoutConsuming(t *testing.T) {
+	r := localLimiter()
+	ctx := context.Background()
+	b := []Bucket{{Namespace: "auth_failure", ID: "1.2.3.4"}}
+
+	for range 5 {
+		if !r.Take(ctx, b, 1, 0.0001, 0).Allowed {
+			t.Fatal("a zero-cost check must not consume the token it checks for")
+		}
+	}
+	if !r.Take(ctx, b, 1, 0.0001, 1).Allowed {
+		t.Fatal("the single token must still be there")
+	}
+	if res := r.Take(ctx, b, 1, 0.0001, 0); res.Allowed || res.RetryAfter <= 0 {
+		t.Fatalf("an empty bucket must fail the check with a retry hint, got %+v", res)
+	}
+}
+
+func TestRateLimiter_NoBucketsIsAllowed(t *testing.T) {
+	if !localLimiter().Take(context.Background(), nil, 1, 1, 1).Allowed {
+		t.Fatal("a request with no dimensions to limit is allowed")
 	}
 }

@@ -176,12 +176,14 @@ type OutboxConfig struct {
 	WorkerCount                 int
 }
 type RateLimitConfig struct {
-	Capacity            int64
-	RefillPerSec        float64
-	TrustedProxies      []netip.Prefix
-	FallbackMultiplier  float64
-	LocalMaxBuckets     int
-	HealthCheckInterval time.Duration
+	Capacity                int64
+	RefillPerSec            float64
+	AuthFailureCapacity     int64
+	AuthFailureRefillPerSec float64
+	TrustedProxies          []netip.Prefix
+	FallbackMultiplier      float64
+	LocalMaxBuckets         int
+	HealthCheckInterval     time.Duration
 }
 type RoutingConfig struct {
 	SnapshotTTLSeconds           int
@@ -355,6 +357,8 @@ func LoadConfig() (*Config, error) {
 	c.RateLimit.HealthCheckInterval = time.Duration(healthCheckMs) * time.Millisecond
 	c.RateLimit.Capacity = getEnvInt64("RATE_LIMIT_CAPACITY", 100, &errs)
 	c.RateLimit.RefillPerSec = getEnvFloat64("RATE_LIMIT_REFILL_PER_SEC", 50, &errs)
+	c.RateLimit.AuthFailureCapacity = getEnvInt64("AUTH_FAILURE_LIMIT_CAPACITY", 10, &errs)
+	c.RateLimit.AuthFailureRefillPerSec = getEnvFloat64("AUTH_FAILURE_REFILL_PER_SEC", 0.1, &errs)
 	c.RateLimit.TrustedProxies = parseTrustedProxies(os.Getenv("TRUSTED_PROXY_CIDRS"), &errs)
 
 	c.Routing.SnapshotTTLSeconds = getEnvInt("ROUTING_SNAPSHOT_TTL_SECONDS", 30, &errs)
@@ -519,6 +523,12 @@ func Validate(c *Config) error {
 	}
 	if c.RateLimit.RefillPerSec <= 0 {
 		errs = append(errs, "RATE_LIMIT_REFILL_PER_SEC must be greater than 0")
+	}
+	if c.RateLimit.AuthFailureCapacity < 0 {
+		errs = append(errs, "AUTH_FAILURE_LIMIT_CAPACITY must not be negative (0 disables auth-failure throttling)")
+	}
+	if c.RateLimit.AuthFailureCapacity > 0 && c.RateLimit.AuthFailureRefillPerSec <= 0 {
+		errs = append(errs, "AUTH_FAILURE_REFILL_PER_SEC must be greater than 0")
 	}
 	if c.Gateway.CircuitBreakerFailureThreshold < 1 {
 		errs = append(errs, "CIRCUIT_BREAKER_FAILURE_THRESHOLD must be at least 1")

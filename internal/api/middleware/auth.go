@@ -39,11 +39,43 @@ func MerchantIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-func Authenticate(provider TokenProvider, log ports.Logger) func(http.Handler) http.Handler {
+type AuthThrottle struct {
+	Limiter      Limiter
+	ClientIP     *ClientIP
+	Capacity     int64
+	RefillPerSec float64
+}
+
+func (t *AuthThrottle) bucket(r *http.Request) []Bucket {
+	return []Bucket{{Namespace: NamespaceAuthFailure, ID: bucketIP(t.ClientIP.From(r))}}
+}
+
+func (t *AuthThrottle) check(r *http.Request) RateDecision {
+	if t == nil {
+		return RateDecision{Allowed: true}
+	}
+	return t.Limiter.Take(r.Context(), t.bucket(r), t.Capacity, t.RefillPerSec, 0)
+}
+
+func (t *AuthThrottle) recordFailure(r *http.Request) {
+	if t == nil {
+		return
+	}
+	t.Limiter.Take(r.Context(), t.bucket(r), t.Capacity, t.RefillPerSec, 1)
+}
+
+func Authenticate(provider TokenProvider, log ports.Logger, throttle *AuthThrottle) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if decision := throttle.check(r); !decision.Allowed {
+				log.Warn(ports.LogEventAuthThrottled, map[string]any{"path": r.URL.Path, "remote_addr": r.RemoteAddr})
+				writeRateLimited(w, decision)
+				return
+			}
+
 			principal, ok := authenticate(r, provider)
 			if !ok {
+				throttle.recordFailure(r)
 				log.Warn("auth.rejected", map[string]any{"path": r.URL.Path})
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)

@@ -71,6 +71,7 @@ func setRequiredEnv(t *testing.T) {
 		"PORT", "WEBHOOK_PORT", "HEALTH_PORT", "WEBHOOK_TLS_MODE",
 		"SERVICE_TOKENS", "OPS_TOKENS", "WEBHOOK_SECRETS", "TRUSTED_PROXY_CIDRS",
 		"RATE_LIMIT_CAPACITY", "RATE_LIMIT_REFILL_PER_SEC", "CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+		"AUTH_FAILURE_LIMIT_CAPACITY", "AUTH_FAILURE_REFILL_PER_SEC",
 		"SHUTDOWN_DRAIN_DELAY", "SHUTDOWN_TIMEOUT",
 	} {
 		t.Setenv(k, "")
@@ -569,6 +570,49 @@ func TestLoadConfig_ShutdownTimeoutDefaultFollowsTheGatewayBudget(t *testing.T) 
 	}
 	if c.App.ShutdownTimeout != 35*time.Second {
 		t.Errorf("default SHUTDOWN_TIMEOUT must be the gateway budget + 15s, got %s", c.App.ShutdownTimeout)
+	}
+}
+
+func TestLoadConfig_AuthFailureLimit(t *testing.T) {
+	setRequiredEnv(t)
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.RateLimit.AuthFailureCapacity != 10 || c.RateLimit.AuthFailureRefillPerSec != 0.1 {
+		t.Errorf("defaults = %d/%v, want 10/0.1", c.RateLimit.AuthFailureCapacity, c.RateLimit.AuthFailureRefillPerSec)
+	}
+
+	t.Setenv("AUTH_FAILURE_LIMIT_CAPACITY", "0")
+	t.Setenv("AUTH_FAILURE_REFILL_PER_SEC", "0")
+	if _, err := LoadConfig(); err != nil {
+		t.Fatalf("capacity 0 disables the throttle, so its refill rate is irrelevant, got: %v", err)
+	}
+
+	for key, raw := range map[string]string{"AUTH_FAILURE_LIMIT_CAPACITY": "ten", "AUTH_FAILURE_REFILL_PER_SEC": "fast"} {
+		t.Run(key, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(key, raw)
+			if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("an unparseable %s must fail startup, got: %v", key, err)
+			}
+		})
+	}
+}
+
+func TestValidate_AuthFailureLimit(t *testing.T) {
+	c := validatableConfig()
+	c.RateLimit.AuthFailureCapacity = -1
+	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "AUTH_FAILURE_LIMIT_CAPACITY") {
+		t.Fatalf("a negative capacity must be rejected, got: %v", err)
+	}
+
+	c = validatableConfig()
+	c.RateLimit.AuthFailureCapacity = 10
+	c.RateLimit.AuthFailureRefillPerSec = 0
+	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "AUTH_FAILURE_REFILL_PER_SEC") {
+		t.Fatalf("an enabled throttle needs a positive refill, got: %v", err)
 	}
 }
 

@@ -20,7 +20,7 @@ func TestAuth_ValidServiceToken(t *testing.T) {
 	provider := NewStaticTokenProvider(map[string]string{"svc-secret": "merchant-9"}, nil)
 	var p Principal
 	var merchant string
-	h := Authenticate(provider, noopLog{})(authedHandler(&p, &merchant))
+	h := Authenticate(provider, noopLog{}, nil)(authedHandler(&p, &merchant))
 
 	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
 	req.Header.Set("X-Service-Token", "svc-secret")
@@ -43,7 +43,7 @@ func TestAuth_ValidOpsToken(t *testing.T) {
 	provider := NewStaticTokenProvider(nil, []string{"ops-secret"})
 	var p Principal
 	var merchant string
-	h := Authenticate(provider, noopLog{})(authedHandler(&p, &merchant))
+	h := Authenticate(provider, noopLog{}, nil)(authedHandler(&p, &merchant))
 
 	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
 	req.Header.Set("X-Ops-Token", "ops-secret")
@@ -57,7 +57,7 @@ func TestAuth_ValidOpsToken(t *testing.T) {
 
 func TestAuth_InvalidToken401(t *testing.T) {
 	provider := NewStaticTokenProvider(map[string]string{"svc-secret": "merchant-1"}, nil)
-	h := Authenticate(provider, noopLog{})(okHandler())
+	h := Authenticate(provider, noopLog{}, nil)(okHandler())
 
 	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
 	req.Header.Set("X-Service-Token", "wrong")
@@ -71,7 +71,7 @@ func TestAuth_InvalidToken401(t *testing.T) {
 
 func TestAuth_MissingToken401(t *testing.T) {
 	provider := NewStaticTokenProvider(map[string]string{"svc-secret": "merchant-1"}, nil)
-	h := Authenticate(provider, noopLog{})(okHandler())
+	h := Authenticate(provider, noopLog{}, nil)(okHandler())
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/payments", nil))
@@ -82,7 +82,7 @@ func TestAuth_MissingToken401(t *testing.T) {
 
 func TestAuth_NoPathIsExempt(t *testing.T) {
 	provider := NewStaticTokenProvider(map[string]string{"svc-secret": "merchant-1"}, nil)
-	h := Authenticate(provider, noopLog{})(okHandler())
+	h := Authenticate(provider, noopLog{}, nil)(okHandler())
 
 	// Health and webhooks are served on their own listeners, so the auth layer
 	// has no path-based bypass: every request it sees needs a token.
@@ -97,7 +97,7 @@ func TestAuth_NoPathIsExempt(t *testing.T) {
 
 func TestAuth_OpsTokenNotValidAsService(t *testing.T) {
 	provider := NewStaticTokenProvider(map[string]string{"svc-secret": "merchant-1"}, []string{"ops-secret"})
-	h := Authenticate(provider, noopLog{})(okHandler())
+	h := Authenticate(provider, noopLog{}, nil)(okHandler())
 
 	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
 	req.Header.Set("X-Service-Token", "ops-secret") // ops token in the service header
