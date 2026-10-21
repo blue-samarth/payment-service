@@ -58,9 +58,8 @@ func NewWorker(outbox OutboxReader, publisher Publisher, log ports.Logger, metri
 }
 
 func (w *Worker) Run(ctx context.Context) error {
-	w.log.Info(ports.LogEventRelayModeSwitch, map[string]any{
-		ports.FieldRelayMode: "polling",
-		"shard_count":        len(w.cfg.Shards),
+	w.log.Info(ports.LogEventRelayStarted, map[string]any{
+		"shard_count": len(w.cfg.Shards),
 	})
 
 	for {

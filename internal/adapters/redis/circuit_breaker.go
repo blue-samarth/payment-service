@@ -16,7 +16,7 @@ type CircuitBreakerStore struct {
 }
 
 func NewCircuitBreakerStore(c *Client) *CircuitBreakerStore {
-	return &CircuitBreakerStore{client: c.Cache}
+	return &CircuitBreakerStore{client: c.State}
 }
 
 type cbRecord struct {

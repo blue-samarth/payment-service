@@ -14,8 +14,6 @@ func validatableConfig() *Config {
 	c := &Config{}
 	c.App.Environment = "dev"
 	c.Observability.LogLevel = "info"
-	c.Outbox.WALLagAlertThresholdMB = 2000
-	c.Outbox.WALLagCriticalThresholdMB = 5000
 	c.Outbox.PollIntervalSec = 10
 	c.Outbox.ClaimTTLSec = 60
 	c.Outbox.WorkerCount = 1
@@ -37,7 +35,7 @@ func validatableConfig() *Config {
 	c.Jobs.IdempotencyProcessingTimeoutSec = 300
 	c.Redis.Addrs = []string{"localhost:6379"}
 	c.Redis.RateLimitDB = 0
-	c.Redis.CacheDB = 1
+	c.Redis.StateDB = 1
 	c.App.Port = 8080
 	c.App.WebhookPort = 8081
 	c.App.HealthPort = 8082
@@ -73,13 +71,14 @@ func setRequiredEnv(t *testing.T) {
 		t.Setenv(k, v)
 	}
 	for _, k := range []string{
-		"REDIS_TLS_ENABLED", "REDIS_USERNAME", "REDIS_PASSWORD", "REDIS_RATE_LIMIT_DB", "REDIS_CACHE_DB",
+		"REDIS_TLS_ENABLED", "REDIS_USERNAME", "REDIS_PASSWORD", "REDIS_RATE_LIMIT_DB", "REDIS_STATE_DB", "REDIS_CACHE_DB",
 		"PORT", "WEBHOOK_PORT", "HEALTH_PORT", "WEBHOOK_TLS_MODE",
 		"SERVICE_TOKENS", "OPS_TOKENS", "WEBHOOK_SECRETS", "TRUSTED_PROXY_CIDRS",
 		"RATE_LIMIT_CAPACITY", "RATE_LIMIT_REFILL_PER_SEC", "CIRCUIT_BREAKER_FAILURE_THRESHOLD",
 		"AUTH_FAILURE_LIMIT_CAPACITY", "AUTH_FAILURE_REFILL_PER_SEC",
 		"RATE_LIMIT_USER_CAPACITY", "RATE_LIMIT_USER_REFILL_PER_SEC",
 		"RATE_LIMIT_IP_CAPACITY", "RATE_LIMIT_IP_REFILL_PER_SEC",
+		"OUTBOX_RELAY_MODE",
 		"RATE_LIMIT_WEBHOOK_CAPACITY", "RATE_LIMIT_WEBHOOK_REFILL_PER_SEC",
 		"SHUTDOWN_DRAIN_DELAY", "SHUTDOWN_TIMEOUT",
 	} {
@@ -185,10 +184,55 @@ func TestValidate_RedisAddrForm(t *testing.T) {
 
 func TestValidate_RedisDatabasesMustDiffer(t *testing.T) {
 	c := validatableConfig()
-	c.Redis.CacheDB = c.Redis.RateLimitDB
+	c.Redis.StateDB = c.Redis.RateLimitDB
 	err := Validate(c)
-	if err == nil || !strings.Contains(err.Error(), "must differ") {
+	if err == nil || !strings.Contains(err.Error(), "REDIS_RATE_LIMIT_DB and REDIS_STATE_DB must differ") {
 		t.Fatalf("expected identical Redis databases to be rejected, got: %v", err)
+	}
+}
+
+func TestLoadConfig_RedisStateDB(t *testing.T) {
+	cases := map[string]struct {
+		env         map[string]string
+		wantDB      int
+		deprecation string
+	}{
+		"default":                              {nil, 1, ""},
+		"new name":                             {map[string]string{"REDIS_STATE_DB": "3"}, 3, ""},
+		"old name still works":                 {map[string]string{"REDIS_CACHE_DB": "4"}, 4, "REDIS_CACHE_DB is deprecated"},
+		"new name wins over old, values shown": {map[string]string{"REDIS_STATE_DB": "3", "REDIS_CACHE_DB": "4"}, 3, "REDIS_CACHE_DB=4 is ignored because REDIS_STATE_DB=3 is set, and they differ"},
+		"both names, same value":               {map[string]string{"REDIS_STATE_DB": "3", "REDIS_CACHE_DB": "3"}, 3, "REDIS_CACHE_DB=3 is ignored because REDIS_STATE_DB is set to the same database"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			setRequiredEnv(t)
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+
+			c, err := LoadConfig()
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			if c.Redis.StateDB != tc.wantDB {
+				t.Errorf("StateDB = %d, want %d", c.Redis.StateDB, tc.wantDB)
+			}
+			got := strings.Join(c.Deprecations, "; ")
+			if tc.deprecation == "" && got != "" {
+				t.Errorf("no deprecation expected, got %q", got)
+			}
+			if tc.deprecation != "" && !strings.Contains(got, tc.deprecation) {
+				t.Errorf("want a deprecation containing %q, got %q", tc.deprecation, got)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_InvalidLegacyRedisCacheDBFails(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("REDIS_CACHE_DB", "two")
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "REDIS_CACHE_DB") {
+		t.Fatalf("a malformed legacy value must still fail instead of defaulting, got: %v", err)
 	}
 }
 
@@ -686,6 +730,44 @@ func TestValidate_AuthFailureLimit(t *testing.T) {
 	c.RateLimit.AuthFailureRefillPerSec = 0
 	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "AUTH_FAILURE_REFILL_PER_SEC") {
 		t.Fatalf("an enabled throttle needs a positive refill, got: %v", err)
+	}
+}
+
+func TestLoadConfig_RelayModeIsNoLongerASetting(t *testing.T) {
+	setRequiredEnv(t)
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unset is fine, got: %v", err)
+	}
+	if len(c.Deprecations) != 0 {
+		t.Errorf("unset produces no warning, got %v", c.Deprecations)
+	}
+
+	t.Setenv("OUTBOX_RELAY_MODE", "polling")
+	c, err = LoadConfig()
+	if err != nil {
+		t.Fatalf("polling is what the relay does, so it is accepted, got: %v", err)
+	}
+	if got := strings.Join(c.Deprecations, "; "); !strings.Contains(got, "OUTBOX_RELAY_MODE is no longer a setting and is ignored") {
+		t.Errorf("a leftover polling value must warn so operators remove it, got %q", got)
+	}
+
+	for _, mode := range []string{"cdc", "kafka"} {
+		t.Setenv("OUTBOX_RELAY_MODE", mode)
+		if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "OUTBOX_RELAY_MODE is no longer a setting") {
+			t.Fatalf("OUTBOX_RELAY_MODE=%s must fail with the migration message instead of silently polling, got: %v", mode, err)
+		}
+	}
+}
+
+func TestLoadConfig_LeftoverCDCVariablesAreIgnored(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("OUTBOX_RELAY_WAL_LAG_ALERT_THRESHOLD_MB", "9000")
+	t.Setenv("OUTBOX_RELAY_WAL_LAG_CRITICAL_THRESHOLD_MB", "100")
+	t.Setenv("OUTBOX_RELAY_SLOT_SIZE_ALERT_MB", "not-a-number")
+
+	if _, err := LoadConfig(); err != nil {
+		t.Fatalf("settings for a relay mode that does not exist must not be read or validated, got: %v", err)
 	}
 }
 

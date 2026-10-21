@@ -31,8 +31,8 @@ func FlushRedis(t *testing.T, c *redis.Client) {
 	if err := c.RateLimit.FlushDB(ctx).Err(); err != nil {
 		t.Fatalf("testsupport: flush rate-limit db: %v", err)
 	}
-	if err := c.Cache.FlushDB(ctx).Err(); err != nil {
-		t.Fatalf("testsupport: flush cache db: %v", err)
+	if err := c.State.FlushDB(ctx).Err(); err != nil {
+		t.Fatalf("testsupport: flush state db: %v", err)
 	}
 }
 
@@ -57,7 +57,7 @@ func redisConfigFromEnv() config.RedisConfig {
 	return config.RedisConfig{
 		Addrs:               []string{RedisAddr()},
 		RateLimitDB:         0,
-		CacheDB:             1,
+		StateDB:             1,
 		DialTimeout:         2 * time.Second,
 		ReadTimeout:         2 * time.Second,
 		WriteTimeout:        2 * time.Second,

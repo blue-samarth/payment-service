@@ -32,8 +32,7 @@ const (
 	LogEventOutboxPublishFailure = "outbox.publish_failure"
 	LogEventOutboxDeadLetter     = "outbox.dead_letter"
 	LogEventOutboxReplay         = "outbox.replay"
-	LogEventRelayModeSwitch      = "relay.mode_switch"
-	LogEventRelayConsumerStale   = "relay.consumer_stale"
+	LogEventRelayStarted         = "relay.started"
 
 	LogEventRefundInitiated         = "refund.initiated"
 	LogEventRefundSucceeded         = "refund.succeeded"
@@ -58,8 +57,9 @@ const (
 	LogEventReconciliationMismatch = "reconciliation.mismatch_detected"
 	LogEventAutoResolution         = "reconciliation.auto_resolution"
 
-	LogEventConfigReload  = "config.hot_reload"
-	LogEventConfigInvalid = "config.invalid_rejected"
+	LogEventConfigReload     = "config.hot_reload"
+	LogEventConfigInvalid    = "config.invalid_rejected"
+	LogEventConfigDeprecated = "config.deprecated"
 
 	LogEventTLSCertReloaded     = "tls.cert_reloaded"
 	LogEventTLSCertReloadFailed = "tls.cert_reload_failed"
@@ -82,7 +82,7 @@ const (
 	LogEventPartitionCreated           = "partition.created"
 	LogEventPartitionDetached          = "partition.detached"
 	LogEventPartitionDropped           = "partition.dropped"
-	LogEventPartitionManagementSkipped = "partition.management_skipped_wal_lag"
+	LogEventPartitionManagementSkipped = "partition.management_skipped"
 )
 
 const (
@@ -101,8 +101,6 @@ const (
 	FieldNewState       = "new_state"
 	FieldActor          = "actor"
 	FieldDurationMs     = "duration_ms"
-	FieldRelayMode      = "relay_mode"
-	FieldWALLagMB       = "wal_lag_mb"
 	FieldPartitionName  = "partition_name"
 	FieldMismatchType   = "mismatch_type"
 )

@@ -34,7 +34,7 @@ func TestNew_TLSEnabledConfiguresBothClients(t *testing.T) {
 	c := newClient(t, config.RedisConfig{
 		Addrs:       []string{"redis.internal:6379"},
 		RateLimitDB: 0,
-		CacheDB:     1,
+		StateDB:     1,
 		TLSEnabled:  true,
 		Username:    "payment-service",
 		Password:    "test-password",
@@ -45,7 +45,7 @@ func TestNew_TLSEnabledConfiguresBothClients(t *testing.T) {
 		db     int
 	}{
 		"rate_limit": {c.RateLimit, 0},
-		"cache":      {c.Cache, 1},
+		"state":      {c.State, 1},
 	}
 	for name, tc := range clients {
 		opts := singleNodeOptions(t, tc.client)
@@ -68,19 +68,19 @@ func TestNew_TLSEnabledConfiguresBothClients(t *testing.T) {
 }
 
 func TestNew_ClientsDoNotShareTLSConfig(t *testing.T) {
-	c := newClient(t, config.RedisConfig{Addrs: []string{"redis.internal:6379"}, CacheDB: 1, TLSEnabled: true})
+	c := newClient(t, config.RedisConfig{Addrs: []string{"redis.internal:6379"}, StateDB: 1, TLSEnabled: true})
 
 	rl := singleNodeOptions(t, c.RateLimit).TLSConfig
-	ca := singleNodeOptions(t, c.Cache).TLSConfig
-	if rl == ca {
+	st := singleNodeOptions(t, c.State).TLSConfig
+	if rl == st {
 		t.Error("each client should own its TLS config so one cannot mutate the other's")
 	}
 }
 
 func TestNew_TLSDisabledIsPlaintext(t *testing.T) {
-	c := newClient(t, config.RedisConfig{Addrs: []string{"localhost:6379"}, CacheDB: 1})
+	c := newClient(t, config.RedisConfig{Addrs: []string{"localhost:6379"}, StateDB: 1})
 
-	for name, client := range map[string]goredis.UniversalClient{"rate_limit": c.RateLimit, "cache": c.Cache} {
+	for name, client := range map[string]goredis.UniversalClient{"rate_limit": c.RateLimit, "state": c.State} {
 		if singleNodeOptions(t, client).TLSConfig != nil {
 			t.Errorf("%s: TLS disabled but the client has a TLS config", name)
 		}

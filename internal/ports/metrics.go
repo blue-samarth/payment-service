@@ -36,8 +36,6 @@ const (
 	MetricOutboxPublishLatencyMs = "outbox.publish_latency_ms"
 	MetricOutboxPublishFailure   = "outbox.publish_failure_total"
 	MetricOutboxDeadLetter       = "outbox.dead_letter_total"
-	MetricOutboxRelayCDCLagMB    = "outbox_relay_cdc_lag_mb"
-	MetricOutboxConsumerHealthy  = "outbox_relay_consumer_healthy"
 
 	MetricPartitionCount                = "outbox.partition_count"
 	MetricPartitionAgeDays              = "outbox.partition_age_days"

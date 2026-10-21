@@ -32,6 +32,7 @@ func run() error {
 	}
 
 	logger := observability.NewSlogLogger(bootstrap.ParseLogLevel(cfg.Observability.LogLevel))
+	bootstrap.LogDeprecations(logger, cfg.Deprecations)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

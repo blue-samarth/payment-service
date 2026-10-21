@@ -9,21 +9,20 @@ import (
 )
 
 type Deps struct {
-	Payment       *handlers.PaymentHandler
-	Refund        *handlers.RefundHandler
-	Cancel        *handlers.CancelHandler
-	Review        *handlers.ReviewHandler
-	Webhook       *handlers.WebhookHandler
-	Health        *handlers.HealthHandler
-	Logger        ports.Logger
-	Metrics       ports.MetricRecorder
-	Auth          middleware.TokenProvider
-	Limiter       middleware.Limiter
-	RateLimits    middleware.Limits
-	WebhookLimit  middleware.Limit
-	AuthFailures  middleware.Limit
-	ClientIP      *middleware.ClientIP
-	ResponseCache middleware.ResponseCacheStore
+	Payment      *handlers.PaymentHandler
+	Refund       *handlers.RefundHandler
+	Cancel       *handlers.CancelHandler
+	Review       *handlers.ReviewHandler
+	Webhook      *handlers.WebhookHandler
+	Health       *handlers.HealthHandler
+	Logger       ports.Logger
+	Metrics      ports.MetricRecorder
+	Auth         middleware.TokenProvider
+	Limiter      middleware.Limiter
+	RateLimits   middleware.Limits
+	WebhookLimit middleware.Limit
+	AuthFailures middleware.Limit
+	ClientIP     *middleware.ClientIP
 }
 
 func NewMerchantRouter(deps Deps) http.Handler {
@@ -53,9 +52,6 @@ func NewMerchantRouter(deps Deps) http.Handler {
 	}
 	if deps.Limiter != nil {
 		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.Logger, deps.Metrics, middleware.RequestKeys(deps.ClientIP, deps.RateLimits)))
-	}
-	if deps.ResponseCache != nil {
-		chain = append(chain, middleware.ResponseCache(deps.ResponseCache, deps.Logger))
 	}
 	return middleware.Chain(mux, chain...)
 }

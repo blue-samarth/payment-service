@@ -138,7 +138,7 @@ type DatabaseConfig struct {
 type RedisConfig struct {
 	Addrs               []string
 	RateLimitDB         int
-	CacheDB             int
+	StateDB             int
 	TLSEnabled          bool
 	Username            string
 	Password            string
@@ -159,21 +159,15 @@ type AWSConfig struct {
 	SecretsManagerCacheTTL time.Duration
 }
 type OutboxConfig struct {
-	RelayMode                   string
-	ShardCount                  int
-	WALLagAlertThresholdMB      int64
-	WALLagCriticalThresholdMB   int64
-	SlotSizeAlertMB             int64
-	ConsumerHeartbeatTimeoutSec int
-	ReconnectIntervalSec        int
-	PollIntervalSec             int
-	MaxAttempts                 int
-	BatchSize                   int
-	ClaimTTLSec                 int
-	Publisher                   string
-	SNSAggregateVersionAttr     bool
-	WorkerIndex                 int
-	WorkerCount                 int
+	ShardCount              int
+	PollIntervalSec         int
+	MaxAttempts             int
+	BatchSize               int
+	ClaimTTLSec             int
+	Publisher               string
+	SNSAggregateVersionAttr bool
+	WorkerIndex             int
+	WorkerCount             int
 }
 type RateLimitConfig struct {
 	Capacity                int64
@@ -263,6 +257,8 @@ type Config struct {
 	Security       SecurityConfig
 	Jobs           JobsConfig
 	DataRetention  DataRetentionConfig
+
+	Deprecations []string
 }
 
 // LoadConfig reads configuration from environment variables, applies defaults, and validates required fields.
@@ -320,7 +316,20 @@ func LoadConfig() (*Config, error) {
 		}
 	}
 	c.Redis.RateLimitDB = getEnvInt("REDIS_RATE_LIMIT_DB", 0, &errs)
-	c.Redis.CacheDB = getEnvInt("REDIS_CACHE_DB", 1, &errs)
+	c.Redis.StateDB = getEnvInt("REDIS_STATE_DB", 1, &errs)
+	switch legacy := os.Getenv("REDIS_CACHE_DB"); {
+	case legacy == "":
+	case os.Getenv("REDIS_STATE_DB") == "":
+		c.Redis.StateDB = getEnvInt("REDIS_CACHE_DB", 1, &errs)
+		c.Deprecations = append(c.Deprecations, "REDIS_CACHE_DB is deprecated and will be removed in the next release: rename it to REDIS_STATE_DB (the database holds circuit-breaker and intent state, not a cache)")
+	case legacy == os.Getenv("REDIS_STATE_DB"):
+		c.Deprecations = append(c.Deprecations, fmt.Sprintf("REDIS_CACHE_DB=%s is ignored because REDIS_STATE_DB is set to the same database: remove REDIS_CACHE_DB", legacy))
+	default:
+		c.Deprecations = append(c.Deprecations, fmt.Sprintf(
+			"REDIS_CACHE_DB=%s is ignored because REDIS_STATE_DB=%s is set, and they differ: circuit-breaker and intent state is now read from database %s. If the live state is in database %s, set REDIS_STATE_DB=%s; then remove REDIS_CACHE_DB",
+			legacy, os.Getenv("REDIS_STATE_DB"), os.Getenv("REDIS_STATE_DB"), legacy, legacy,
+		))
+	}
 	c.Redis.TLSEnabled = getEnvBool("REDIS_TLS_ENABLED", true, &errs)
 	c.Redis.Username = getEnvDefault("REDIS_USERNAME", "")
 	c.Redis.Password = getEnvDefault("REDIS_PASSWORD", "")
@@ -339,16 +348,14 @@ func LoadConfig() (*Config, error) {
 	c.AWS.Region = requireEnv("AWS_REGION", &errs)
 	c.AWS.SecretsManagerCacheTTL = getEnvDuration("SECRETS_MANAGER_CACHE_TTL", 1*time.Hour, &errs)
 
-	c.Outbox.RelayMode = getEnvDefault("OUTBOX_RELAY_MODE", "cdc")
-	if c.Outbox.RelayMode != "cdc" && c.Outbox.RelayMode != "polling" {
-		errs = append(errs, "OUTBOX_RELAY_MODE must be 'cdc' or 'polling'")
+	switch mode := os.Getenv("OUTBOX_RELAY_MODE"); mode {
+	case "":
+	case "polling":
+		c.Deprecations = append(c.Deprecations, "OUTBOX_RELAY_MODE is no longer a setting and is ignored (the relay always polls): remove the variable")
+	default:
+		errs = append(errs, "OUTBOX_RELAY_MODE is no longer a setting: the relay only polls (cdc was never implemented); remove the variable")
 	}
 	c.Outbox.ShardCount = 64 // Fixed by DB schema; not overridable.
-	c.Outbox.WALLagAlertThresholdMB = getEnvInt64("OUTBOX_RELAY_WAL_LAG_ALERT_THRESHOLD_MB", 2000, &errs)
-	c.Outbox.WALLagCriticalThresholdMB = getEnvInt64("OUTBOX_RELAY_WAL_LAG_CRITICAL_THRESHOLD_MB", 5000, &errs)
-	c.Outbox.SlotSizeAlertMB = getEnvInt64("OUTBOX_RELAY_SLOT_SIZE_ALERT_MB", 8000, &errs)
-	c.Outbox.ConsumerHeartbeatTimeoutSec = getEnvInt("OUTBOX_RELAY_CONSUMER_HEARTBEAT_TIMEOUT_SEC", 60, &errs)
-	c.Outbox.ReconnectIntervalSec = getEnvInt("OUTBOX_RELAY_RECONNECT_INTERVAL_SEC", 60, &errs)
 	c.Outbox.PollIntervalSec = getEnvInt("OUTBOX_RELAY_POLL_INTERVAL_SEC", 10, &errs)
 	c.Outbox.MaxAttempts = getEnvInt("OUTBOX_RELAY_MAX_ATTEMPTS", 5, &errs)
 	c.Outbox.BatchSize = getEnvInt("OUTBOX_RELAY_BATCH_SIZE", 50, &errs)
@@ -488,12 +495,8 @@ func Validate(c *Config) error {
 			break
 		}
 	}
-	if c.Redis.RateLimitDB == c.Redis.CacheDB {
-		errs = append(errs, "REDIS_RATE_LIMIT_DB and REDIS_CACHE_DB must differ")
-	}
-
-	if c.Outbox.WALLagAlertThresholdMB >= c.Outbox.WALLagCriticalThresholdMB {
-		errs = append(errs, "OUTBOX_RELAY_WAL_LAG_ALERT_THRESHOLD_MB must be < OUTBOX_RELAY_WAL_LAG_CRITICAL_THRESHOLD_MB")
+	if c.Redis.RateLimitDB == c.Redis.StateDB {
+		errs = append(errs, "REDIS_RATE_LIMIT_DB and REDIS_STATE_DB must differ")
 	}
 
 	if c.Outbox.ClaimTTLSec <= c.Outbox.PollIntervalSec {
