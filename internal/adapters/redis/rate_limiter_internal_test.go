@@ -175,6 +175,30 @@ func TestRateLimiter_FallbackNeverShrinksABucketBelowOneToken(t *testing.T) {
 	}
 }
 
+func TestRateLimiter_CallerCancellationIsNotARedisFailure(t *testing.T) {
+	c, err := New(config.RedisConfig{Addrs: []string{"127.0.0.1:1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r := &RateLimiter{client: c.RateLimit, available: true, failureThreshold: 3, lruOrder: list.New(),
+		cfg: config.RateLimitConfig{FallbackMultiplier: 1, LocalMaxBuckets: 100}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for range 10 {
+		r.Take(ctx, []Bucket{bucket("ip", "1.2.3.4", 10, 1)}, 1)
+	}
+	if r.consecutiveFailures != 0 || !r.IsAvailable() {
+		t.Fatalf("aborted requests must not push the limiter into fallback, failures=%d available=%v", r.consecutiveFailures, r.IsAvailable())
+	}
+
+	r.Take(context.Background(), []Bucket{bucket("ip", "1.2.3.4", 10, 1)}, 1)
+	if r.consecutiveFailures != 1 {
+		t.Fatalf("a real Redis error on a live request still counts, got %d", r.consecutiveFailures)
+	}
+}
+
 func TestRateLimiter_ZeroCostChecksWithoutConsuming(t *testing.T) {
 	r := localLimiter()
 	ctx := context.Background()

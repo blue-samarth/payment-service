@@ -55,41 +55,48 @@ func (t *AuthThrottle) identity(r *http.Request) string {
 	return "ip:" + clientBucketIP(t.ClientIP, r)
 }
 
-func (t *AuthThrottle) admit(r *http.Request, authenticated bool) (RateDecision, string) {
+func (t *AuthThrottle) recordFailure(r *http.Request) (RateDecision, string) {
 	if t == nil {
 		return RateDecision{Allowed: true}, ""
 	}
 	id := t.identity(r)
-	var cost int64 = 1
-	if authenticated {
-		cost = 0
+	return t.Limiter.Take(r.Context(), []Bucket{{Namespace: NamespaceAuthFailure, ID: id, Limit: t.Limit}}, 1), id
+}
+
+func (t *AuthThrottle) count(metric string, tags map[string]string) {
+	if t != nil && t.Metrics != nil {
+		t.Metrics.Increment(metric, tags)
 	}
-	return t.Limiter.Take(r.Context(), []Bucket{{Namespace: NamespaceAuthFailure, ID: id, Limit: t.Limit}}, cost), id
 }
 
 func Authenticate(provider TokenProvider, log ports.Logger, throttle *AuthThrottle) func(http.Handler) http.Handler {
+	throttledLog := newLogSampler(logSampleInterval)
+	rejectedLog := newLogSampler(logSampleInterval)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			principal, ok := authenticate(r, provider)
 
-			if decision, identity := throttle.admit(r, ok); !decision.Allowed {
-				if throttle.Metrics != nil {
-					throttle.Metrics.Increment(ports.MetricAuthThrottled, map[string]string{
-						"identity_type": strings.SplitN(identity, ":", 2)[0],
-					})
-				}
-				log.Warn(ports.LogEventAuthThrottled, map[string]any{
-					"path":        r.URL.Path,
-					"identity":    identity,
-					"client_ip":   clientBucketIP(throttle.ClientIP, r),
-					"remote_addr": r.RemoteAddr,
-				})
-				writeRateLimited(w, decision)
-				return
-			}
-
 			if !ok {
-				log.Warn("auth.rejected", map[string]any{"path": r.URL.Path})
+				decision, identity := throttle.recordFailure(r)
+				if !decision.Allowed {
+					throttle.count(ports.MetricAuthThrottled, map[string]string{"identity_type": strings.SplitN(identity, ":", 2)[0]})
+					if emit, suppressed := throttledLog.allow(); emit {
+						log.Warn(ports.LogEventAuthThrottled, map[string]any{
+							"path":        r.URL.Path,
+							"identity":    identity,
+							"client_ip":   clientBucketIP(throttle.ClientIP, r),
+							"remote_addr": r.RemoteAddr,
+							"suppressed":  suppressed,
+						})
+					}
+					writeRateLimited(w, decision)
+					return
+				}
+
+				throttle.count(ports.MetricAuthRejected, nil)
+				if emit, suppressed := rejectedLog.allow(); emit {
+					log.Warn(ports.LogEventAuthRejected, map[string]any{"path": r.URL.Path, "suppressed": suppressed})
+				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
 				_, _ = w.Write([]byte(`{"error":{"code":"unauthorized","message":"missing or invalid service token"}}`))

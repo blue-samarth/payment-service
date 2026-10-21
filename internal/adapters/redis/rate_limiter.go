@@ -157,6 +157,9 @@ func (r *RateLimiter) takeRedis(ctx context.Context, buckets []Bucket, cost int6
 	}
 
 	res, err := tokenBucketScript.Run(ctx, r.client, keys, args...).Int64Slice()
+	if err != nil && ctx.Err() != nil {
+		return RateLimitResult{Allowed: false, RetryAfter: emptyBucketsRetry}
+	}
 	if err != nil || len(res) != 2 {
 		r.recordRedisFailure()
 		return r.takeLocal(buckets, cost)

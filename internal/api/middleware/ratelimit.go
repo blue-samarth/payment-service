@@ -33,6 +33,10 @@ type Limit struct {
 	RefillPerSec float64
 }
 
+func (l Limit) canBindBelow(outer Limit) bool {
+	return l.Capacity < outer.Capacity || l.RefillPerSec < outer.RefillPerSec
+}
+
 type Limits struct {
 	Merchant Limit
 	User     Limit
@@ -69,7 +73,7 @@ func RequestKeys(clientIP *ClientIP, limits Limits) RateLimitKeys {
 			if len(user) > MaxUserIDLength {
 				return nil, errUserIDTooLong
 			}
-			if merchant == "" || limits.User != limits.Merchant {
+			if merchant == "" || limits.User.canBindBelow(limits.Merchant) {
 				scope := merchant
 				if scope == "" {
 					scope = unauthenticatedScope
@@ -104,6 +108,7 @@ func bucketIP(ip string) string {
 }
 
 func RateLimit(limiter Limiter, log ports.Logger, metrics ports.MetricRecorder, keys RateLimitKeys) func(http.Handler) http.Handler {
+	rejectedLog := newLogSampler(logSampleInterval)
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			buckets, err := keys(r)
@@ -119,12 +124,15 @@ func RateLimit(limiter Limiter, log ports.Logger, metrics ports.MetricRecorder, 
 				if metrics != nil {
 					metrics.Increment(ports.MetricRateLimitRejected, map[string]string{"listener": listenerOf(buckets)})
 				}
-				log.Warn(ports.LogEventRateLimitRejected, map[string]any{
-					"client_ip":   bucketClientIP(buckets),
-					"remote_addr": r.RemoteAddr,
-					"path":        r.URL.Path,
-					"buckets":     namespaces(buckets),
-				})
+				if emit, suppressed := rejectedLog.allow(); emit {
+					log.Warn(ports.LogEventRateLimitRejected, map[string]any{
+						"client_ip":   bucketClientIP(buckets),
+						"remote_addr": r.RemoteAddr,
+						"path":        r.URL.Path,
+						"buckets":     namespaces(buckets),
+						"suppressed":  suppressed,
+					})
+				}
 				writeRateLimited(w, decision)
 				return
 			}

@@ -119,8 +119,8 @@ func TestRateLimitKeys_AuthFailuresAreThrottledPerIdentity(t *testing.T) {
 	if code := send(h, "wrong-token", "", "203.0.113.9:1"); code != http.StatusTooManyRequests {
 		t.Fatalf("once the identity is out of auth-failure tokens it gets 429, got %d", code)
 	}
-	if code := send(h, tokenA, "", "203.0.113.9:1"); code != http.StatusTooManyRequests {
-		t.Fatalf("a correct token is not confirmed while the identity is exhausted, got %d", code)
+	if code := send(h, tokenA, "", "203.0.113.9:1"); code != http.StatusOK {
+		t.Fatalf("valid tokens bypass the failure bucket, so a retry loop cannot take the identity's real traffic offline, got %d", code)
 	}
 	if code := send(h, tokenA, "", "203.0.113.10:1"); code != http.StatusOK {
 		t.Fatalf("other identities are unaffected, got %d", code)

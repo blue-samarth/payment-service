@@ -241,6 +241,29 @@ func TestRateLimit_UserBucketSkippedWhenItCannotBind(t *testing.T) {
 	}
 }
 
+func TestRateLimit_UserBucketKeptOnlyWhenSomeDimensionIsTighter(t *testing.T) {
+	cases := map[string]struct {
+		user Limit
+		keep bool
+	}{
+		"same limit":                {testLimits.Merchant, false},
+		"higher refill, same burst": {Limit{Capacity: testLimits.Merchant.Capacity, RefillPerSec: testLimits.Merchant.RefillPerSec * 2}, false},
+		"smaller burst":             {Limit{Capacity: testLimits.Merchant.Capacity / 2, RefillPerSec: testLimits.Merchant.RefillPerSec}, true},
+		"slower refill":             {Limit{Capacity: testLimits.Merchant.Capacity, RefillPerSec: testLimits.Merchant.RefillPerSec / 2}, true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			limits := testLimits
+			limits.User = tc.user
+			lim := &fakeLimiter{allow: true}
+			merchantChain(lim, RequestKeys(nil, limits), nil).ServeHTTP(httptest.NewRecorder(), request(tokenA, "customer-1", ""))
+			if _, ok := lim.bucket(NamespaceUser); ok != tc.keep {
+				t.Errorf("user bucket present=%v, want %v", ok, tc.keep)
+			}
+		})
+	}
+}
+
 func TestRateLimit_OverlongUserIDIsRejected(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
 	rec := httptest.NewRecorder()
@@ -397,8 +420,8 @@ func TestAuthThrottle_OneCallPerRequest(t *testing.T) {
 	lim.calls = nil
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, request(tokenA, "", "203.0.113.5:1"))
-	if rec.Code != http.StatusOK || len(lim.calls) != 1 || lim.calls[0].cost != 0 {
-		t.Fatalf("a valid token is one zero-cost check, got %d %+v", rec.Code, lim.calls)
+	if rec.Code != http.StatusOK || len(lim.calls) != 0 {
+		t.Fatalf("a valid token never touches the limiter, got %d %+v", rec.Code, lim.calls)
 	}
 }
 
@@ -436,13 +459,20 @@ func TestAuthThrottle_ConcurrentFailuresAreCappedAtCapacity(t *testing.T) {
 	}
 }
 
-func TestAuthThrottle_ExhaustedIdentityGets429EvenWithAValidToken(t *testing.T) {
+func TestAuthThrottle_ValidTokenPassesAnExhaustedIdentity(t *testing.T) {
 	lim := &fakeLimiter{allow: false, retryAfter: 30 * time.Second}
-	rec := httptest.NewRecorder()
-	authThrottled(lim, 10).ServeHTTP(rec, request(tokenA, "", "203.0.113.5:1"))
+	h := authThrottled(lim, 10)
 
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, request("wrong", "", "203.0.113.5:1"))
 	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "30" {
-		t.Fatalf("an exhausted identity gets 429 so a correct guess is not confirmed, got %d %q", rec.Code, rec.Header().Get("Retry-After"))
+		t.Fatalf("a bad token on an exhausted identity gets 429 with Retry-After, got %d %q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, request(tokenA, "", "203.0.113.5:1"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("a stale-token retry loop on the same certificate must not take the merchant's valid traffic offline, got %d", rec.Code)
 	}
 }
 
@@ -463,11 +493,95 @@ func TestAuthThrottle_KeysOnTheClientCertificateNotTheIP(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, withCert(request(tokenA, "", "203.0.113.5:1"), []byte("merchant-y-cert")))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("another merchant behind the same NAT address must not be locked out, got %d", rec.Code)
+	h.ServeHTTP(rec, withCert(request("wrong", "", "203.0.113.5:1"), []byte("merchant-y-cert")))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("another certificate behind the same NAT address has its own failure allowance, got %d", rec.Code)
 	}
 }
+
+func TestAuthThrottle_LogsAreSampledMetricsAreNot(t *testing.T) {
+	lim := &fakeLimiter{allow: false}
+	log := &countingLog{}
+	metrics := &tallyMetrics{counts: map[string]int{}}
+	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a"}, nil)
+	throttle := &AuthThrottle{Limiter: lim, Limit: Limit{Capacity: 1, RefillPerSec: 1}, Metrics: metrics}
+	h := Authenticate(provider, log, throttle)(okHandler())
+
+	for range 50 {
+		h.ServeHTTP(httptest.NewRecorder(), request("wrong", "", "203.0.113.5:1"))
+	}
+	if metrics.counts[ports.MetricAuthThrottled] != 50 {
+		t.Errorf("every throttled request is counted, got %d", metrics.counts[ports.MetricAuthThrottled])
+	}
+	if got := log.count(ports.LogEventAuthThrottled); got != 1 {
+		t.Errorf("a flood within one second must log once, not %d times", got)
+	}
+}
+
+func TestRateLimit_LogsAreSampledMetricsAreNot(t *testing.T) {
+	lim := &fakeLimiter{allow: false}
+	log := &countingLog{}
+	metrics := &tallyMetrics{counts: map[string]int{}}
+	h := RateLimit(lim, log, metrics, RequestKeys(nil, testLimits))(okHandler())
+
+	for range 50 {
+		h.ServeHTTP(httptest.NewRecorder(), request("", "", "203.0.113.5:1"))
+	}
+	if metrics.counts[ports.MetricRateLimitRejected] != 50 || log.count(ports.LogEventRateLimitRejected) != 1 {
+		t.Errorf("want 50 counted and 1 logged, got %d counted and %d logged",
+			metrics.counts[ports.MetricRateLimitRejected], log.count(ports.LogEventRateLimitRejected))
+	}
+}
+
+func TestLogSampler_ReportsSuppressedCount(t *testing.T) {
+	s := newLogSampler(20 * time.Millisecond)
+	if ok, _ := s.allow(); !ok {
+		t.Fatal("the first event is logged")
+	}
+	for range 3 {
+		if ok, _ := s.allow(); ok {
+			t.Fatal("events inside the interval are suppressed")
+		}
+	}
+	time.Sleep(30 * time.Millisecond)
+	if ok, suppressed := s.allow(); !ok || suppressed != 3 {
+		t.Fatalf("the next logged event carries the suppressed count, got ok=%v suppressed=%d", ok, suppressed)
+	}
+}
+
+type countingLog struct {
+	noopLog
+	mu     sync.Mutex
+	events map[string]int
+}
+
+func (c *countingLog) Warn(event string, _ map[string]any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.events == nil {
+		c.events = map[string]int{}
+	}
+	c.events[event]++
+}
+
+func (c *countingLog) count(event string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.events[event]
+}
+
+type tallyMetrics struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func (m *tallyMetrics) Increment(name string, _ map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.counts[name]++
+}
+func (m *tallyMetrics) Histogram(string, float64, map[string]string) {}
+func (m *tallyMetrics) Gauge(string, float64, map[string]string)     {}
 
 func TestAuthThrottle_LogsIdentityAndClientIP(t *testing.T) {
 	lim := &fakeLimiter{allow: false}

@@ -180,6 +180,8 @@ type RateLimitConfig struct {
 	RefillPerSec            float64
 	UserCapacity            int64
 	UserRefillPerSec        float64
+	IPCapacity              int64
+	IPRefillPerSec          float64
 	WebhookCapacity         int64
 	WebhookRefillPerSec     float64
 	AuthFailureCapacity     int64
@@ -363,6 +365,8 @@ func LoadConfig() (*Config, error) {
 	c.RateLimit.RefillPerSec = getEnvFloat64("RATE_LIMIT_REFILL_PER_SEC", 50, &errs)
 	c.RateLimit.UserCapacity = getEnvInt64("RATE_LIMIT_USER_CAPACITY", c.RateLimit.Capacity, &errs)
 	c.RateLimit.UserRefillPerSec = getEnvFloat64("RATE_LIMIT_USER_REFILL_PER_SEC", c.RateLimit.RefillPerSec, &errs)
+	c.RateLimit.IPCapacity = getEnvInt64("RATE_LIMIT_IP_CAPACITY", c.RateLimit.Capacity, &errs)
+	c.RateLimit.IPRefillPerSec = getEnvFloat64("RATE_LIMIT_IP_REFILL_PER_SEC", c.RateLimit.RefillPerSec, &errs)
 	c.RateLimit.WebhookCapacity = getEnvInt64("RATE_LIMIT_WEBHOOK_CAPACITY", 300, &errs)
 	c.RateLimit.WebhookRefillPerSec = getEnvFloat64("RATE_LIMIT_WEBHOOK_REFILL_PER_SEC", 100, &errs)
 	c.RateLimit.AuthFailureCapacity = getEnvInt64("AUTH_FAILURE_LIMIT_CAPACITY", 10, &errs)
@@ -538,6 +542,7 @@ func Validate(c *Config) error {
 		refill   float64
 	}{
 		{"RATE_LIMIT_USER", c.RateLimit.UserCapacity, c.RateLimit.UserRefillPerSec},
+		{"RATE_LIMIT_IP", c.RateLimit.IPCapacity, c.RateLimit.IPRefillPerSec},
 		{"RATE_LIMIT_WEBHOOK", c.RateLimit.WebhookCapacity, c.RateLimit.WebhookRefillPerSec},
 	} {
 		if l.capacity < 1 {
@@ -549,6 +554,9 @@ func Validate(c *Config) error {
 	}
 	if c.RateLimit.UserCapacity > c.RateLimit.Capacity {
 		errs = append(errs, "RATE_LIMIT_USER_CAPACITY must not exceed RATE_LIMIT_CAPACITY, or the per-user limit can never bind before the merchant limit")
+	}
+	if c.RateLimit.UserRefillPerSec > c.RateLimit.RefillPerSec {
+		errs = append(errs, "RATE_LIMIT_USER_REFILL_PER_SEC must not exceed RATE_LIMIT_REFILL_PER_SEC, or the per-user limit can never bind before the merchant limit")
 	}
 	if c.RateLimit.AuthFailureCapacity < 0 {
 		errs = append(errs, "AUTH_FAILURE_LIMIT_CAPACITY must not be negative (0 disables auth-failure throttling)")

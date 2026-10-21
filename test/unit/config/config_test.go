@@ -24,6 +24,8 @@ func validatableConfig() *Config {
 	c.RateLimit.RefillPerSec = 50
 	c.RateLimit.UserCapacity = 20
 	c.RateLimit.UserRefillPerSec = 5
+	c.RateLimit.IPCapacity = 100
+	c.RateLimit.IPRefillPerSec = 50
 	c.RateLimit.WebhookCapacity = 300
 	c.RateLimit.WebhookRefillPerSec = 100
 	c.Routing.FXReconciliationTolerancePct = 1.0
@@ -77,6 +79,7 @@ func setRequiredEnv(t *testing.T) {
 		"RATE_LIMIT_CAPACITY", "RATE_LIMIT_REFILL_PER_SEC", "CIRCUIT_BREAKER_FAILURE_THRESHOLD",
 		"AUTH_FAILURE_LIMIT_CAPACITY", "AUTH_FAILURE_REFILL_PER_SEC",
 		"RATE_LIMIT_USER_CAPACITY", "RATE_LIMIT_USER_REFILL_PER_SEC",
+		"RATE_LIMIT_IP_CAPACITY", "RATE_LIMIT_IP_REFILL_PER_SEC",
 		"RATE_LIMIT_WEBHOOK_CAPACITY", "RATE_LIMIT_WEBHOOK_REFILL_PER_SEC",
 		"SHUTDOWN_DRAIN_DELAY", "SHUTDOWN_TIMEOUT",
 	} {
@@ -638,6 +641,9 @@ func TestLoadConfig_UserAndWebhookLimits(t *testing.T) {
 	if c.RateLimit.UserCapacity != 10 || c.RateLimit.UserRefillPerSec != 2 {
 		t.Errorf("an explicit user limit must be used, got %d/%v", c.RateLimit.UserCapacity, c.RateLimit.UserRefillPerSec)
 	}
+	if c.RateLimit.IPCapacity != c.RateLimit.Capacity || c.RateLimit.IPRefillPerSec != c.RateLimit.RefillPerSec {
+		t.Errorf("the IP limit must default to the merchant limit, got %d/%v", c.RateLimit.IPCapacity, c.RateLimit.IPRefillPerSec)
+	}
 	if c.RateLimit.WebhookCapacity != 300 || c.RateLimit.WebhookRefillPerSec != 100 {
 		t.Errorf("webhook defaults = %d/%v, want 300/100", c.RateLimit.WebhookCapacity, c.RateLimit.WebhookRefillPerSec)
 	}
@@ -648,11 +654,14 @@ func TestValidate_UserAndWebhookLimits(t *testing.T) {
 		mutate func(*Config)
 		want   string
 	}{
-		"user capacity zero":    {func(c *Config) { c.RateLimit.UserCapacity = 0 }, "RATE_LIMIT_USER_CAPACITY must be at least 1"},
-		"user refill zero":      {func(c *Config) { c.RateLimit.UserRefillPerSec = 0 }, "RATE_LIMIT_USER_REFILL_PER_SEC"},
-		"webhook capacity zero": {func(c *Config) { c.RateLimit.WebhookCapacity = 0 }, "RATE_LIMIT_WEBHOOK_CAPACITY"},
-		"webhook refill zero":   {func(c *Config) { c.RateLimit.WebhookRefillPerSec = 0 }, "RATE_LIMIT_WEBHOOK_REFILL_PER_SEC"},
-		"user above merchant":   {func(c *Config) { c.RateLimit.UserCapacity = 101 }, "can never bind"},
+		"user capacity zero":         {func(c *Config) { c.RateLimit.UserCapacity = 0 }, "RATE_LIMIT_USER_CAPACITY must be at least 1"},
+		"user refill zero":           {func(c *Config) { c.RateLimit.UserRefillPerSec = 0 }, "RATE_LIMIT_USER_REFILL_PER_SEC"},
+		"webhook capacity zero":      {func(c *Config) { c.RateLimit.WebhookCapacity = 0 }, "RATE_LIMIT_WEBHOOK_CAPACITY"},
+		"webhook refill zero":        {func(c *Config) { c.RateLimit.WebhookRefillPerSec = 0 }, "RATE_LIMIT_WEBHOOK_REFILL_PER_SEC"},
+		"user above merchant":        {func(c *Config) { c.RateLimit.UserCapacity = 101 }, "RATE_LIMIT_USER_CAPACITY must not exceed"},
+		"user refill above merchant": {func(c *Config) { c.RateLimit.UserRefillPerSec = 51 }, "RATE_LIMIT_USER_REFILL_PER_SEC must not exceed"},
+		"ip capacity zero":           {func(c *Config) { c.RateLimit.IPCapacity = 0 }, "RATE_LIMIT_IP_CAPACITY"},
+		"ip refill zero":             {func(c *Config) { c.RateLimit.IPRefillPerSec = 0 }, "RATE_LIMIT_IP_REFILL_PER_SEC"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

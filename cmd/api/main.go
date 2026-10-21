@@ -230,7 +230,7 @@ func run() error {
 		RateLimits: middleware.Limits{
 			Merchant: middleware.Limit{Capacity: cfg.RateLimit.Capacity, RefillPerSec: cfg.RateLimit.RefillPerSec},
 			User:     middleware.Limit{Capacity: cfg.RateLimit.UserCapacity, RefillPerSec: cfg.RateLimit.UserRefillPerSec},
-			IP:       middleware.Limit{Capacity: cfg.RateLimit.Capacity, RefillPerSec: cfg.RateLimit.RefillPerSec},
+			IP:       middleware.Limit{Capacity: cfg.RateLimit.IPCapacity, RefillPerSec: cfg.RateLimit.IPRefillPerSec},
 		},
 		WebhookLimit: middleware.Limit{Capacity: cfg.RateLimit.WebhookCapacity, RefillPerSec: cfg.RateLimit.WebhookRefillPerSec},
 		AuthFailures: middleware.Limit{Capacity: cfg.RateLimit.AuthFailureCapacity, RefillPerSec: cfg.RateLimit.AuthFailureRefillPerSec},
