@@ -22,6 +22,12 @@ func validatableConfig() *Config {
 	c.RateLimit.FallbackMultiplier = 0.5
 	c.RateLimit.Capacity = 100
 	c.RateLimit.RefillPerSec = 50
+	c.RateLimit.UserCapacity = 20
+	c.RateLimit.UserRefillPerSec = 5
+	c.RateLimit.IPCapacity = 100
+	c.RateLimit.IPRefillPerSec = 50
+	c.RateLimit.WebhookCapacity = 300
+	c.RateLimit.WebhookRefillPerSec = 100
 	c.Routing.FXReconciliationTolerancePct = 1.0
 	c.Gateway.HTTPTimeout = 30 * time.Second
 	c.Gateway.MaxAttempts = 3
@@ -71,6 +77,10 @@ func setRequiredEnv(t *testing.T) {
 		"PORT", "WEBHOOK_PORT", "HEALTH_PORT", "WEBHOOK_TLS_MODE",
 		"SERVICE_TOKENS", "OPS_TOKENS", "WEBHOOK_SECRETS", "TRUSTED_PROXY_CIDRS",
 		"RATE_LIMIT_CAPACITY", "RATE_LIMIT_REFILL_PER_SEC", "CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+		"AUTH_FAILURE_LIMIT_CAPACITY", "AUTH_FAILURE_REFILL_PER_SEC",
+		"RATE_LIMIT_USER_CAPACITY", "RATE_LIMIT_USER_REFILL_PER_SEC",
+		"RATE_LIMIT_IP_CAPACITY", "RATE_LIMIT_IP_REFILL_PER_SEC",
+		"RATE_LIMIT_WEBHOOK_CAPACITY", "RATE_LIMIT_WEBHOOK_REFILL_PER_SEC",
 		"SHUTDOWN_DRAIN_DELAY", "SHUTDOWN_TIMEOUT",
 	} {
 		t.Setenv(k, "")
@@ -569,6 +579,113 @@ func TestLoadConfig_ShutdownTimeoutDefaultFollowsTheGatewayBudget(t *testing.T) 
 	}
 	if c.App.ShutdownTimeout != 35*time.Second {
 		t.Errorf("default SHUTDOWN_TIMEOUT must be the gateway budget + 15s, got %s", c.App.ShutdownTimeout)
+	}
+}
+
+func TestLoadConfig_AuthFailureLimit(t *testing.T) {
+	setRequiredEnv(t)
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.RateLimit.AuthFailureCapacity != 10 || c.RateLimit.AuthFailureRefillPerSec != 0.1 {
+		t.Errorf("defaults = %d/%v, want 10/0.1", c.RateLimit.AuthFailureCapacity, c.RateLimit.AuthFailureRefillPerSec)
+	}
+
+	t.Setenv("AUTH_FAILURE_LIMIT_CAPACITY", "0")
+	t.Setenv("AUTH_FAILURE_REFILL_PER_SEC", "0")
+	if _, err := LoadConfig(); err != nil {
+		t.Fatalf("capacity 0 disables the throttle, so its refill rate is irrelevant, got: %v", err)
+	}
+
+	for key, raw := range map[string]string{"AUTH_FAILURE_LIMIT_CAPACITY": "ten", "AUTH_FAILURE_REFILL_PER_SEC": "fast"} {
+		t.Run(key, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(key, raw)
+			if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), key) {
+				t.Fatalf("an unparseable %s must fail startup, got: %v", key, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_UserAndWebhookLimits(t *testing.T) {
+	setRequiredEnv(t)
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.RateLimit.UserCapacity != c.RateLimit.Capacity || c.RateLimit.UserRefillPerSec != c.RateLimit.RefillPerSec {
+		t.Errorf("the user limit must default to the merchant limit so upgrading changes nothing, got %d/%v vs %d/%v",
+			c.RateLimit.UserCapacity, c.RateLimit.UserRefillPerSec, c.RateLimit.Capacity, c.RateLimit.RefillPerSec)
+	}
+
+	t.Setenv("RATE_LIMIT_CAPACITY", "40")
+	t.Setenv("RATE_LIMIT_REFILL_PER_SEC", "8")
+	c, err = LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.RateLimit.UserCapacity != 40 || c.RateLimit.UserRefillPerSec != 8 {
+		t.Errorf("the user default must follow a configured merchant limit, got %d/%v", c.RateLimit.UserCapacity, c.RateLimit.UserRefillPerSec)
+	}
+
+	t.Setenv("RATE_LIMIT_USER_CAPACITY", "10")
+	t.Setenv("RATE_LIMIT_USER_REFILL_PER_SEC", "2")
+	c, err = LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.RateLimit.UserCapacity != 10 || c.RateLimit.UserRefillPerSec != 2 {
+		t.Errorf("an explicit user limit must be used, got %d/%v", c.RateLimit.UserCapacity, c.RateLimit.UserRefillPerSec)
+	}
+	if c.RateLimit.IPCapacity != c.RateLimit.Capacity || c.RateLimit.IPRefillPerSec != c.RateLimit.RefillPerSec {
+		t.Errorf("the IP limit must default to the merchant limit, got %d/%v", c.RateLimit.IPCapacity, c.RateLimit.IPRefillPerSec)
+	}
+	if c.RateLimit.WebhookCapacity != 300 || c.RateLimit.WebhookRefillPerSec != 100 {
+		t.Errorf("webhook defaults = %d/%v, want 300/100", c.RateLimit.WebhookCapacity, c.RateLimit.WebhookRefillPerSec)
+	}
+}
+
+func TestValidate_UserAndWebhookLimits(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(*Config)
+		want   string
+	}{
+		"user capacity zero":         {func(c *Config) { c.RateLimit.UserCapacity = 0 }, "RATE_LIMIT_USER_CAPACITY must be at least 1"},
+		"user refill zero":           {func(c *Config) { c.RateLimit.UserRefillPerSec = 0 }, "RATE_LIMIT_USER_REFILL_PER_SEC"},
+		"webhook capacity zero":      {func(c *Config) { c.RateLimit.WebhookCapacity = 0 }, "RATE_LIMIT_WEBHOOK_CAPACITY"},
+		"webhook refill zero":        {func(c *Config) { c.RateLimit.WebhookRefillPerSec = 0 }, "RATE_LIMIT_WEBHOOK_REFILL_PER_SEC"},
+		"user above merchant":        {func(c *Config) { c.RateLimit.UserCapacity = 101 }, "RATE_LIMIT_USER_CAPACITY must not exceed"},
+		"user refill above merchant": {func(c *Config) { c.RateLimit.UserRefillPerSec = 51 }, "RATE_LIMIT_USER_REFILL_PER_SEC must not exceed"},
+		"ip capacity zero":           {func(c *Config) { c.RateLimit.IPCapacity = 0 }, "RATE_LIMIT_IP_CAPACITY"},
+		"ip refill zero":             {func(c *Config) { c.RateLimit.IPRefillPerSec = 0 }, "RATE_LIMIT_IP_REFILL_PER_SEC"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := validatableConfig()
+			tc.mutate(c)
+			if err := Validate(c); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want %q, got: %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestValidate_AuthFailureLimit(t *testing.T) {
+	c := validatableConfig()
+	c.RateLimit.AuthFailureCapacity = -1
+	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "AUTH_FAILURE_LIMIT_CAPACITY") {
+		t.Fatalf("a negative capacity must be rejected, got: %v", err)
+	}
+
+	c = validatableConfig()
+	c.RateLimit.AuthFailureCapacity = 10
+	c.RateLimit.AuthFailureRefillPerSec = 0
+	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "AUTH_FAILURE_REFILL_PER_SEC") {
+		t.Fatalf("an enabled throttle needs a positive refill, got: %v", err)
 	}
 }
 

@@ -3,7 +3,11 @@ package redis
 import (
 	"container/list"
 	"context"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"samarth/payment-service/config"
 )
@@ -59,24 +63,171 @@ func TestNewRateLimiter_ZeroIntervalDoesNotPanicAndCloses(t *testing.T) {
 	rl.Close() // idempotent
 }
 
-// RL-15: the local fallback bucket must pick up a reconfigured capacity/rate
-// rather than keeping the values captured when it was first created.
-func TestRateLimiter_LocalBucketPicksUpNewLimits(t *testing.T) {
-	r := &RateLimiter{
-		available: false, // force the local path
+func localLimiter() *RateLimiter {
+	return &RateLimiter{
+		available: false,
 		lruOrder:  list.New(),
 		cfg:       config.RateLimitConfig{FallbackMultiplier: 1, LocalMaxBuckets: 100},
 	}
+}
+
+func bucket(namespace, id string, capacity int64, rate float64) Bucket {
+	return Bucket{Namespace: namespace, ID: id, Capacity: capacity, RefillPerSec: rate}
+}
+
+// RL-15: the local fallback bucket must pick up a reconfigured capacity/rate
+// rather than keeping the values captured when it was first created.
+func TestRateLimiter_LocalBucketPicksUpNewLimits(t *testing.T) {
+	r := localLimiter()
 	ctx := context.Background()
 
-	r.Allow(ctx, "u", "m", "ip", 10, 5) // creates buckets with capacity 10
-	r.Allow(ctx, "u", "m", "ip", 2, 1)  // reconfigure to capacity 2
+	r.Take(ctx, []Bucket{bucket("user", "u", 10, 5)}, 1)
+	r.Take(ctx, []Bucket{bucket("user", "u", 2, 1)}, 1)
 
-	entry, ok := r.localBuckets.Load("u")
+	entry, ok := r.localBuckets.Load(bucket("user", "u", 0, 0).localKey())
 	if !ok {
 		t.Fatal("expected a local bucket for the user dimension")
 	}
 	if got := entry.(*lruBucketEntry).bucket.capacity; got != 2 {
 		t.Errorf("local bucket should adopt the new capacity (2), got %v", got)
+	}
+}
+
+func TestRateLimiter_LocalFallbackKeepsNamespacesApart(t *testing.T) {
+	r := localLimiter()
+	ctx := context.Background()
+
+	if !r.Take(ctx, []Bucket{bucket("user", "1.2.3.4", 1, 0.0001)}, 1).Allowed {
+		t.Fatal("first request must pass")
+	}
+	if !r.Take(ctx, []Bucket{bucket("ip", "1.2.3.4", 1, 0.0001)}, 1).Allowed {
+		t.Fatal("a user id equal to an IP must not drain that IP's bucket during Redis fallback")
+	}
+}
+
+func TestRateLimiter_LocalKeysAreFixedSize(t *testing.T) {
+	huge := bucket("user", strings.Repeat("x", 1<<20), 1, 1)
+	if got, want := len(huge.localKey()), len(bucket("user", "u", 1, 1).localKey()); got != want {
+		t.Fatalf("a 1 MiB id must not become a 1 MiB map key during Redis fallback, got %d bytes, want %d", got, want)
+	}
+}
+
+func TestRateLimiter_EachBucketUsesItsOwnLimit(t *testing.T) {
+	r := localLimiter()
+	ctx := context.Background()
+	merchant := bucket("merchant", "m", 100, 0.0001)
+	user := bucket("user", "m\x00u", 2, 0.0001)
+
+	for i := range 2 {
+		if !r.Take(ctx, []Bucket{merchant, user}, 1).Allowed {
+			t.Fatalf("request %d is within the user limit", i+1)
+		}
+	}
+	if r.Take(ctx, []Bucket{merchant, user}, 1).Allowed {
+		t.Fatal("the smaller user limit must bind before the merchant limit")
+	}
+	if !r.Take(ctx, []Bucket{merchant, bucket("user", "m\x00other", 2, 0.0001)}, 1).Allowed {
+		t.Fatal("another user of the same merchant still has its own allowance")
+	}
+}
+
+func TestRateLimiter_LocalFallbackIsAtomicUnderConcurrency(t *testing.T) {
+	for range 20 {
+		r := localLimiter()
+		ctx := context.Background()
+		buckets := []Bucket{bucket("merchant", "m", 10, 0.0001), bucket("ip", "1.2.3.4", 10, 0.0001)}
+
+		var allowed atomic.Int64
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range 200 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if r.Take(ctx, buckets, 1).Allowed {
+					allowed.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		if got := allowed.Load(); got != 10 {
+			t.Fatalf("while Redis is down, 200 concurrent requests must admit exactly capacity (10), got %d", got)
+		}
+	}
+}
+
+func TestRateLimiter_FallbackNeverShrinksABucketBelowOneToken(t *testing.T) {
+	r := localLimiter()
+	r.cfg.FallbackMultiplier = 0.5
+	ctx := context.Background()
+	auth := []Bucket{bucket("auth_failure", "cert:abc", 1, 0.0001)}
+
+	if !r.Take(ctx, auth, 0).Allowed {
+		t.Fatal("capacity 1 x 0.5 must still hold one token in fallback, or every valid request gets 429 while Redis is down")
+	}
+	if !r.Take(ctx, auth, 1).Allowed {
+		t.Fatal("the one token can be taken")
+	}
+	if r.Take(ctx, auth, 1).Allowed {
+		t.Fatal("and only one")
+	}
+}
+
+func TestRateLimiter_CallerCancellationIsNotARedisFailure(t *testing.T) {
+	c, err := New(config.RedisConfig{Addrs: []string{"127.0.0.1:1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	r := &RateLimiter{client: c.RateLimit, available: true, failureThreshold: 3, lruOrder: list.New(),
+		cfg: config.RateLimitConfig{FallbackMultiplier: 1, LocalMaxBuckets: 100}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for range 10 {
+		r.Take(ctx, []Bucket{bucket("ip", "1.2.3.4", 10, 1)}, 1)
+	}
+	if r.consecutiveFailures != 0 || !r.IsAvailable() {
+		t.Fatalf("aborted requests must not push the limiter into fallback, failures=%d available=%v", r.consecutiveFailures, r.IsAvailable())
+	}
+
+	r.Take(context.Background(), []Bucket{bucket("ip", "1.2.3.4", 10, 1)}, 1)
+	if r.consecutiveFailures != 1 {
+		t.Fatalf("a real Redis error on a live request still counts, got %d", r.consecutiveFailures)
+	}
+
+	expired, cancelExpired := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancelExpired()
+	<-expired.Done()
+	r.Take(expired, []Bucket{bucket("ip", "1.2.3.4", 10, 1)}, 1)
+	if r.consecutiveFailures != 2 {
+		t.Fatalf("a deadline is a slow Redis, not a departed caller, so it must still count, got %d", r.consecutiveFailures)
+	}
+}
+
+func TestRateLimiter_ZeroCostChecksWithoutConsuming(t *testing.T) {
+	r := localLimiter()
+	ctx := context.Background()
+	b := []Bucket{bucket("auth_failure", "cert:abc", 1, 0.0001)}
+
+	for range 5 {
+		if !r.Take(ctx, b, 0).Allowed {
+			t.Fatal("a zero-cost check must not consume the token it checks for")
+		}
+	}
+	if !r.Take(ctx, b, 1).Allowed {
+		t.Fatal("the single token must still be there")
+	}
+	if res := r.Take(ctx, b, 0); res.Allowed || res.RetryAfter <= 0 {
+		t.Fatalf("an empty bucket must fail the check with a retry hint, got %+v", res)
+	}
+}
+
+func TestRateLimiter_NoBucketsFailsClosed(t *testing.T) {
+	if res := localLimiter().Take(context.Background(), nil, 1); res.Allowed || res.RetryAfter <= 0 {
+		t.Fatalf("a request with nothing to key on must be refused, not waved through, got %+v", res)
 	}
 }

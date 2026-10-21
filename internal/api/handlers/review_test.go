@@ -44,7 +44,7 @@ var (
 func resolveRequest(t *testing.T, resolver *fakeReviewResolver, header, token, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	provider := middleware.NewStaticTokenProvider(map[string]string{serviceToken: uuid.NewString()}, []string{opsToken})
-	h := middleware.Authenticate(provider, noopLog{})(http.HandlerFunc(NewReviewHandler(resolver, noopLog{}).Resolve))
+	h := middleware.Authenticate(provider, noopLog{}, nil, nil)(http.HandlerFunc(NewReviewHandler(resolver, noopLog{}).Resolve))
 
 	id := uuid.New()
 	req := httptest.NewRequest(http.MethodPost, "/payments/"+id.String()+"/resolve", strings.NewReader(body))

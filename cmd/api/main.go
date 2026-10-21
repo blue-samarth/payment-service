@@ -226,11 +226,15 @@ func run() error {
 		Logger:  logger,
 		Auth:    authProvider,
 		Limiter: limiterAdapter{rl: rateLimiter},
-		RateLimit: middleware.RateLimitConfig{
-			Capacity:     cfg.RateLimit.Capacity,
-			RefillPerSec: cfg.RateLimit.RefillPerSec,
+		Metrics: metrics,
+		RateLimits: middleware.Limits{
+			Merchant: middleware.Limit{Capacity: cfg.RateLimit.Capacity, RefillPerSec: cfg.RateLimit.RefillPerSec},
+			User:     middleware.Limit{Capacity: cfg.RateLimit.UserCapacity, RefillPerSec: cfg.RateLimit.UserRefillPerSec},
+			IP:       middleware.Limit{Capacity: cfg.RateLimit.IPCapacity, RefillPerSec: cfg.RateLimit.IPRefillPerSec},
 		},
-		ClientIP: middleware.NewClientIP(cfg.RateLimit.TrustedProxies),
+		WebhookLimit: middleware.Limit{Capacity: cfg.RateLimit.WebhookCapacity, RefillPerSec: cfg.RateLimit.WebhookRefillPerSec},
+		AuthFailures: middleware.Limit{Capacity: cfg.RateLimit.AuthFailureCapacity, RefillPerSec: cfg.RateLimit.AuthFailureRefillPerSec},
+		ClientIP:     middleware.NewClientIP(cfg.RateLimit.TrustedProxies),
 	}
 
 	gatewayBudget := time.Duration(cfg.Gateway.MaxAttempts) * cfg.Gateway.HTTPTimeout
@@ -252,6 +256,7 @@ func run() error {
 				Write:      gatewayBudget + 30*time.Second,
 				Idle:       120 * time.Second,
 			},
+			MaxHeaderBytes: maxHeaderBytes,
 		},
 		{
 			Name:      "webhook",
@@ -265,6 +270,7 @@ func run() error {
 				Write:      30 * time.Second,
 				Idle:       60 * time.Second,
 			},
+			MaxHeaderBytes: maxHeaderBytes,
 		},
 		{
 			Name:      "health",
@@ -277,7 +283,8 @@ func run() error {
 				Write:      10 * time.Second,
 				Idle:       30 * time.Second,
 			},
-			DrainLast: true,
+			MaxHeaderBytes: healthMaxHeaderBytes,
+			DrainLast:      true,
 		},
 	}, server.Options{
 		DrainDelay:      cfg.App.ShutdownDrainDelay,
@@ -294,6 +301,12 @@ type circuitBreakerAdapter struct {
 }
 
 type breakerStateAdapter struct{ store *redis.CircuitBreakerStore }
+
+const (
+	maxHeaderBytes       = 32 << 10
+	healthMaxHeaderBytes = 8 << 10
+)
+
 type limiterAdapter struct{ rl *redis.RateLimiter }
 
 func (a circuitBreakerAdapter) RecordSuccess(ctx context.Context, gatewayID string) error {
@@ -311,7 +324,11 @@ func (a breakerStateAdapter) BreakerState(ctx context.Context, gatewayID string)
 	return string(cb.State), cb.CooldownUntil, nil
 }
 
-func (a limiterAdapter) Allow(ctx context.Context, userID, merchantID, ip string, capacity int64, ratePerSec float64) middleware.RateDecision {
-	res := a.rl.Allow(ctx, userID, merchantID, ip, capacity, ratePerSec)
+func (a limiterAdapter) Take(ctx context.Context, buckets []middleware.Bucket, cost int64) middleware.RateDecision {
+	keys := make([]redis.Bucket, len(buckets))
+	for i, b := range buckets {
+		keys[i] = redis.Bucket{Namespace: b.Namespace, ID: b.ID, Capacity: b.Capacity, RefillPerSec: b.RefillPerSec}
+	}
+	res := a.rl.Take(ctx, keys, cost)
 	return middleware.RateDecision{Allowed: res.Allowed, RetryAfter: res.RetryAfter}
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"strings"
 
 	"samarth/payment-service/internal/ports"
 )
@@ -39,12 +40,61 @@ func MerchantIDFromContext(ctx context.Context) string {
 	return ""
 }
 
-func Authenticate(provider TokenProvider, log ports.Logger) func(http.Handler) http.Handler {
+type AuthThrottle struct {
+	Limiter  Limiter
+	ClientIP *ClientIP
+	Limit    Limit
+}
+
+func (t *AuthThrottle) identity(r *http.Request) string {
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		sum := sha256.Sum256(r.TLS.PeerCertificates[0].Raw)
+		return "cert:" + hex.EncodeToString(sum[:16])
+	}
+	return "ip:" + clientBucketIP(t.ClientIP, r)
+}
+
+func (t *AuthThrottle) recordFailure(r *http.Request) (RateDecision, string) {
+	if t == nil {
+		return RateDecision{Allowed: true}, ""
+	}
+	id := t.identity(r)
+	return t.Limiter.Take(r.Context(), []Bucket{{Namespace: NamespaceAuthFailure, ID: id, Limit: t.Limit}}, 1), id
+}
+
+func Authenticate(provider TokenProvider, log ports.Logger, metrics ports.MetricRecorder, throttle *AuthThrottle) func(http.Handler) http.Handler {
+	throttledLog := newLogSampler(logSampleInterval)
+	rejectedLog := newLogSampler(logSampleInterval)
+	count := func(metric string, tags map[string]string) {
+		if metrics != nil {
+			metrics.Increment(metric, tags)
+		}
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			principal, ok := authenticate(r, provider)
+
 			if !ok {
-				log.Warn("auth.rejected", map[string]any{"path": r.URL.Path})
+				count(ports.MetricAuthRejected, nil)
+				decision, identity := throttle.recordFailure(r)
+				if !decision.Allowed {
+					count(ports.MetricAuthThrottled, map[string]string{"identity_type": strings.SplitN(identity, ":", 2)[0]})
+					if emit, suppressed := throttledLog.allow(); emit {
+						log.Warn(ports.LogEventAuthThrottled, map[string]any{
+							"path":        r.URL.Path,
+							"identity":    identity,
+							"client_ip":   clientBucketIP(throttle.ClientIP, r),
+							"remote_addr": r.RemoteAddr,
+							"suppressed":  suppressed,
+						})
+					}
+					writeRateLimited(w, decision)
+					return
+				}
+
+				if emit, suppressed := rejectedLog.allow(); emit {
+					log.Warn(ports.LogEventAuthRejected, map[string]any{"path": r.URL.Path, "suppressed": suppressed})
+				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
 				_, _ = w.Write([]byte(`{"error":{"code":"unauthorized","message":"missing or invalid service token"}}`))

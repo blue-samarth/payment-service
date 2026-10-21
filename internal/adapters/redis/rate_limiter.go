@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,7 @@ type RateLimiter struct {
 	lruOrder            *list.List
 	lruMu               sync.Mutex
 	lruCount            int
+	localMu             sync.Mutex
 	logger              ports.Logger
 	metrics             ports.MetricRecorder
 	fallbackStartedAt   time.Time
@@ -44,7 +46,6 @@ type lruBucketEntry struct {
 }
 
 type localBucket struct {
-	mu         sync.Mutex
 	tokens     float64
 	capacity   float64
 	lastRefill time.Time
@@ -109,9 +110,32 @@ func bucketKey(namespace, entityID string) string {
 
 const minRefillRate = 1e-9
 
-func (r *RateLimiter) Allow(ctx context.Context, userID, merchantID, ip string, capacity int64, ratePerSec float64) RateLimitResult {
-	if ratePerSec <= 0 {
-		ratePerSec = minRefillRate
+type Bucket struct {
+	Namespace    string
+	ID           string
+	Capacity     int64
+	RefillPerSec float64
+}
+
+func (b Bucket) localKey() string {
+	return bucketKey(b.Namespace, b.ID)
+}
+
+func (b Bucket) rate() float64 {
+	if b.RefillPerSec <= 0 {
+		return minRefillRate
+	}
+	return b.RefillPerSec
+}
+
+const emptyBucketsRetry = time.Second
+
+func (r *RateLimiter) Take(ctx context.Context, buckets []Bucket, cost int64) RateLimitResult {
+	if len(buckets) == 0 {
+		return RateLimitResult{Allowed: false, RetryAfter: emptyBucketsRetry}
+	}
+	if cost < 0 {
+		cost = 0
 	}
 
 	r.mu.RLock()
@@ -119,24 +143,27 @@ func (r *RateLimiter) Allow(ctx context.Context, userID, merchantID, ip string, 
 	r.mu.RUnlock()
 
 	if avail {
-		return r.allowRedis(ctx, userID, merchantID, ip, capacity, ratePerSec)
+		return r.takeRedis(ctx, buckets, cost)
 	}
-	return r.allowLocal(userID, merchantID, ip, capacity, ratePerSec)
+	return r.takeLocal(buckets, cost)
 }
 
-func (r *RateLimiter) allowRedis(ctx context.Context, userID, merchantID, ip string, capacity int64, ratePerSec float64) RateLimitResult {
-	nowMs := time.Now().UnixMilli()
-
-	keys := []string{
-		bucketKey("user", userID),
-		bucketKey("merchant", merchantID),
-		bucketKey("ip", ip),
+func (r *RateLimiter) takeRedis(ctx context.Context, buckets []Bucket, cost int64) RateLimitResult {
+	keys := make([]string, len(buckets))
+	args := make([]any, 0, 2+2*len(buckets))
+	args = append(args, time.Now().UnixMilli(), cost)
+	for i, b := range buckets {
+		keys[i] = bucketKey(b.Namespace, b.ID)
+		args = append(args, b.Capacity, b.rate())
 	}
 
-	res, err := tokenBucketScript.Run(ctx, r.client, keys, capacity, ratePerSec, nowMs, 1).Int64Slice()
+	res, err := tokenBucketScript.Run(ctx, r.client, keys, args...).Int64Slice()
+	if err != nil && errors.Is(ctx.Err(), context.Canceled) {
+		return RateLimitResult{Allowed: false, RetryAfter: emptyBucketsRetry}
+	}
 	if err != nil || len(res) != 2 {
 		r.recordRedisFailure()
-		return r.allowLocal(userID, merchantID, ip, capacity, ratePerSec)
+		return r.takeLocal(buckets, cost)
 	}
 	r.recordRedisSuccess()
 
@@ -156,34 +183,38 @@ func (r *RateLimiter) recordRedisSuccess() {
 	atomic.StoreInt32(&r.consecutiveFailures, 0)
 }
 
-func (r *RateLimiter) allowLocal(userID, merchantID, ip string, capacity int64, ratePerSec float64) RateLimitResult {
-	localCap := float64(capacity) * r.cfg.FallbackMultiplier
+func (r *RateLimiter) localCapacity(b Bucket) float64 {
+	return max(1, float64(b.Capacity)*r.cfg.FallbackMultiplier)
+}
 
-	ids := []string{userID, merchantID, ip}
-	buckets := make([]*localBucket, len(ids))
-	for i, id := range ids {
-		buckets[i] = r.getOrCreateBucket(id, localCap, ratePerSec)
+func (r *RateLimiter) takeLocal(keys []Bucket, cost int64) RateLimitResult {
+	need := float64(max(cost, 1))
+
+	buckets := make([]*localBucket, len(keys))
+	for i, k := range keys {
+		buckets[i] = r.getOrCreateBucket(k.localKey(), r.localCapacity(k), k.rate())
 	}
+
+	r.localMu.Lock()
+	defer r.localMu.Unlock()
 
 	allowed := true
 	var maxWait time.Duration
 	now := time.Now()
-	for _, b := range buckets {
-		b.mu.Lock()
-		b.capacity = localCap
-		b.refillRate = ratePerSec
+	for i, b := range buckets {
+		b.capacity = r.localCapacity(keys[i])
+		b.refillRate = keys[i].rate()
 		elapsed := now.Sub(b.lastRefill).Seconds()
 		b.tokens = min(b.capacity, b.tokens+elapsed*b.refillRate)
 		b.lastRefill = now
-		if b.tokens < 1 {
+		if b.tokens < need {
 			allowed = false
 			if b.refillRate > 0 {
-				if wait := time.Duration((1-b.tokens)/b.refillRate*1000) * time.Millisecond; wait > maxWait {
+				if wait := time.Duration((need-b.tokens)/b.refillRate*1000) * time.Millisecond; wait > maxWait {
 					maxWait = wait
 				}
 			}
 		}
-		b.mu.Unlock()
 	}
 
 	if !allowed {
@@ -191,11 +222,7 @@ func (r *RateLimiter) allowLocal(userID, merchantID, ip string, capacity int64, 
 	}
 
 	for _, b := range buckets {
-		b.mu.Lock()
-		if b.tokens >= 1 {
-			b.tokens--
-		}
-		b.mu.Unlock()
+		b.tokens -= float64(cost)
 	}
 	return RateLimitResult{Allowed: true}
 }

@@ -16,9 +16,12 @@ type Deps struct {
 	Webhook       *handlers.WebhookHandler
 	Health        *handlers.HealthHandler
 	Logger        ports.Logger
+	Metrics       ports.MetricRecorder
 	Auth          middleware.TokenProvider
 	Limiter       middleware.Limiter
-	RateLimit     middleware.RateLimitConfig
+	RateLimits    middleware.Limits
+	WebhookLimit  middleware.Limit
+	AuthFailures  middleware.Limit
 	ClientIP      *middleware.ClientIP
 	ResponseCache middleware.ResponseCacheStore
 }
@@ -38,10 +41,18 @@ func NewMerchantRouter(deps Deps) http.Handler {
 		middleware.Recover(deps.Logger),
 	}
 	if deps.Auth != nil {
-		chain = append(chain, middleware.Authenticate(deps.Auth, deps.Logger))
+		var throttle *middleware.AuthThrottle
+		if deps.Limiter != nil && deps.AuthFailures.Capacity > 0 {
+			throttle = &middleware.AuthThrottle{
+				Limiter:  deps.Limiter,
+				ClientIP: deps.ClientIP,
+				Limit:    deps.AuthFailures,
+			}
+		}
+		chain = append(chain, middleware.Authenticate(deps.Auth, deps.Logger, deps.Metrics, throttle))
 	}
 	if deps.Limiter != nil {
-		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.RateLimit, deps.Logger, middleware.RequestKeys(deps.ClientIP)))
+		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.Logger, deps.Metrics, middleware.RequestKeys(deps.ClientIP, deps.RateLimits)))
 	}
 	if deps.ResponseCache != nil {
 		chain = append(chain, middleware.ResponseCache(deps.ResponseCache, deps.Logger))
@@ -60,7 +71,7 @@ func NewWebhookRouter(deps Deps) http.Handler {
 		middleware.Recover(deps.Logger),
 	}
 	if deps.Limiter != nil {
-		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.RateLimit, deps.Logger, middleware.WebhookKeys(deps.ClientIP)))
+		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.Logger, deps.Metrics, middleware.WebhookKeys(deps.ClientIP, deps.WebhookLimit)))
 	}
 	return middleware.Chain(mux, chain...)
 }
