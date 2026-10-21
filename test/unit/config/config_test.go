@@ -197,10 +197,11 @@ func TestLoadConfig_RedisStateDB(t *testing.T) {
 		wantDB      int
 		deprecation string
 	}{
-		"default":                {nil, 1, ""},
-		"new name":               {map[string]string{"REDIS_STATE_DB": "3"}, 3, ""},
-		"old name still works":   {map[string]string{"REDIS_CACHE_DB": "4"}, 4, "REDIS_CACHE_DB is deprecated"},
-		"new name wins over old": {map[string]string{"REDIS_STATE_DB": "3", "REDIS_CACHE_DB": "4"}, 3, "REDIS_CACHE_DB is ignored"},
+		"default":                              {nil, 1, ""},
+		"new name":                             {map[string]string{"REDIS_STATE_DB": "3"}, 3, ""},
+		"old name still works":                 {map[string]string{"REDIS_CACHE_DB": "4"}, 4, "REDIS_CACHE_DB is deprecated"},
+		"new name wins over old, values shown": {map[string]string{"REDIS_STATE_DB": "3", "REDIS_CACHE_DB": "4"}, 3, "REDIS_CACHE_DB=4 is ignored because REDIS_STATE_DB=3 is set, and they differ"},
+		"both names, same value":               {map[string]string{"REDIS_STATE_DB": "3", "REDIS_CACHE_DB": "3"}, 3, "REDIS_CACHE_DB=3 is ignored because REDIS_STATE_DB is set to the same database"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -734,13 +735,21 @@ func TestValidate_AuthFailureLimit(t *testing.T) {
 
 func TestLoadConfig_RelayModeIsNoLongerASetting(t *testing.T) {
 	setRequiredEnv(t)
-	if _, err := LoadConfig(); err != nil {
+	c, err := LoadConfig()
+	if err != nil {
 		t.Fatalf("unset is fine, got: %v", err)
+	}
+	if len(c.Deprecations) != 0 {
+		t.Errorf("unset produces no warning, got %v", c.Deprecations)
 	}
 
 	t.Setenv("OUTBOX_RELAY_MODE", "polling")
-	if _, err := LoadConfig(); err != nil {
+	c, err = LoadConfig()
+	if err != nil {
 		t.Fatalf("polling is what the relay does, so it is accepted, got: %v", err)
+	}
+	if got := strings.Join(c.Deprecations, "; "); !strings.Contains(got, "OUTBOX_RELAY_MODE is no longer a setting and is ignored") {
+		t.Errorf("a leftover polling value must warn so operators remove it, got %q", got)
 	}
 
 	for _, mode := range []string{"cdc", "kafka"} {

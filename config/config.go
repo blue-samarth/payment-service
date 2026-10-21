@@ -322,8 +322,13 @@ func LoadConfig() (*Config, error) {
 	case os.Getenv("REDIS_STATE_DB") == "":
 		c.Redis.StateDB = getEnvInt("REDIS_CACHE_DB", 1, &errs)
 		c.Deprecations = append(c.Deprecations, "REDIS_CACHE_DB is deprecated and will be removed in the next release: rename it to REDIS_STATE_DB (the database holds circuit-breaker and intent state, not a cache)")
+	case legacy == os.Getenv("REDIS_STATE_DB"):
+		c.Deprecations = append(c.Deprecations, fmt.Sprintf("REDIS_CACHE_DB=%s is ignored because REDIS_STATE_DB is set to the same database: remove REDIS_CACHE_DB", legacy))
 	default:
-		c.Deprecations = append(c.Deprecations, "REDIS_CACHE_DB is ignored because REDIS_STATE_DB is set: remove REDIS_CACHE_DB")
+		c.Deprecations = append(c.Deprecations, fmt.Sprintf(
+			"REDIS_CACHE_DB=%s is ignored because REDIS_STATE_DB=%s is set, and they differ: circuit-breaker and intent state is now read from database %s. If the live state is in database %s, set REDIS_STATE_DB=%s; then remove REDIS_CACHE_DB",
+			legacy, os.Getenv("REDIS_STATE_DB"), os.Getenv("REDIS_STATE_DB"), legacy, legacy,
+		))
 	}
 	c.Redis.TLSEnabled = getEnvBool("REDIS_TLS_ENABLED", true, &errs)
 	c.Redis.Username = getEnvDefault("REDIS_USERNAME", "")
@@ -343,7 +348,11 @@ func LoadConfig() (*Config, error) {
 	c.AWS.Region = requireEnv("AWS_REGION", &errs)
 	c.AWS.SecretsManagerCacheTTL = getEnvDuration("SECRETS_MANAGER_CACHE_TTL", 1*time.Hour, &errs)
 
-	if mode := os.Getenv("OUTBOX_RELAY_MODE"); mode != "" && mode != "polling" {
+	switch mode := os.Getenv("OUTBOX_RELAY_MODE"); mode {
+	case "":
+	case "polling":
+		c.Deprecations = append(c.Deprecations, "OUTBOX_RELAY_MODE is no longer a setting and is ignored (the relay always polls): remove the variable")
+	default:
 		errs = append(errs, "OUTBOX_RELAY_MODE is no longer a setting: the relay only polls (cdc was never implemented); remove the variable")
 	}
 	c.Outbox.ShardCount = 64 // Fixed by DB schema; not overridable.
