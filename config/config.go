@@ -361,8 +361,8 @@ func LoadConfig() (*Config, error) {
 	c.RateLimit.HealthCheckInterval = time.Duration(healthCheckMs) * time.Millisecond
 	c.RateLimit.Capacity = getEnvInt64("RATE_LIMIT_CAPACITY", 100, &errs)
 	c.RateLimit.RefillPerSec = getEnvFloat64("RATE_LIMIT_REFILL_PER_SEC", 50, &errs)
-	c.RateLimit.UserCapacity = getEnvInt64("RATE_LIMIT_USER_CAPACITY", 20, &errs)
-	c.RateLimit.UserRefillPerSec = getEnvFloat64("RATE_LIMIT_USER_REFILL_PER_SEC", 5, &errs)
+	c.RateLimit.UserCapacity = getEnvInt64("RATE_LIMIT_USER_CAPACITY", c.RateLimit.Capacity, &errs)
+	c.RateLimit.UserRefillPerSec = getEnvFloat64("RATE_LIMIT_USER_REFILL_PER_SEC", c.RateLimit.RefillPerSec, &errs)
 	c.RateLimit.WebhookCapacity = getEnvInt64("RATE_LIMIT_WEBHOOK_CAPACITY", 300, &errs)
 	c.RateLimit.WebhookRefillPerSec = getEnvFloat64("RATE_LIMIT_WEBHOOK_REFILL_PER_SEC", 100, &errs)
 	c.RateLimit.AuthFailureCapacity = getEnvInt64("AUTH_FAILURE_LIMIT_CAPACITY", 10, &errs)

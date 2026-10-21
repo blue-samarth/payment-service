@@ -4,6 +4,8 @@ import (
 	"container/list"
 	"context"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"samarth/payment-service/config"
@@ -125,6 +127,34 @@ func TestRateLimiter_EachBucketUsesItsOwnLimit(t *testing.T) {
 	}
 	if !r.Take(ctx, []Bucket{merchant, bucket("user", "m\x00other", 2, 0.0001)}, 1).Allowed {
 		t.Fatal("another user of the same merchant still has its own allowance")
+	}
+}
+
+func TestRateLimiter_LocalFallbackIsAtomicUnderConcurrency(t *testing.T) {
+	for range 20 {
+		r := localLimiter()
+		ctx := context.Background()
+		buckets := []Bucket{bucket("merchant", "m", 10, 0.0001), bucket("ip", "1.2.3.4", 10, 0.0001)}
+
+		var allowed atomic.Int64
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for range 200 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				if r.Take(ctx, buckets, 1).Allowed {
+					allowed.Add(1)
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		if got := allowed.Load(); got != 10 {
+			t.Fatalf("while Redis is down, 200 concurrent requests must admit exactly capacity (10), got %d", got)
+		}
 	}
 }
 

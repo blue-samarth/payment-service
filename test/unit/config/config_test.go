@@ -614,8 +614,29 @@ func TestLoadConfig_UserAndWebhookLimits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if c.RateLimit.UserCapacity != 20 || c.RateLimit.UserRefillPerSec != 5 {
-		t.Errorf("user defaults = %d/%v, want 20/5", c.RateLimit.UserCapacity, c.RateLimit.UserRefillPerSec)
+	if c.RateLimit.UserCapacity != c.RateLimit.Capacity || c.RateLimit.UserRefillPerSec != c.RateLimit.RefillPerSec {
+		t.Errorf("the user limit must default to the merchant limit so upgrading changes nothing, got %d/%v vs %d/%v",
+			c.RateLimit.UserCapacity, c.RateLimit.UserRefillPerSec, c.RateLimit.Capacity, c.RateLimit.RefillPerSec)
+	}
+
+	t.Setenv("RATE_LIMIT_CAPACITY", "40")
+	t.Setenv("RATE_LIMIT_REFILL_PER_SEC", "8")
+	c, err = LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.RateLimit.UserCapacity != 40 || c.RateLimit.UserRefillPerSec != 8 {
+		t.Errorf("the user default must follow a configured merchant limit, got %d/%v", c.RateLimit.UserCapacity, c.RateLimit.UserRefillPerSec)
+	}
+
+	t.Setenv("RATE_LIMIT_USER_CAPACITY", "10")
+	t.Setenv("RATE_LIMIT_USER_REFILL_PER_SEC", "2")
+	c, err = LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.RateLimit.UserCapacity != 10 || c.RateLimit.UserRefillPerSec != 2 {
+		t.Errorf("an explicit user limit must be used, got %d/%v", c.RateLimit.UserCapacity, c.RateLimit.UserRefillPerSec)
 	}
 	if c.RateLimit.WebhookCapacity != 300 || c.RateLimit.WebhookRefillPerSec != 100 {
 		t.Errorf("webhook defaults = %d/%v, want 300/100", c.RateLimit.WebhookCapacity, c.RateLimit.WebhookRefillPerSec)

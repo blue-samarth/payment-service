@@ -29,6 +29,7 @@ type RateLimiter struct {
 	lruOrder            *list.List
 	lruMu               sync.Mutex
 	lruCount            int
+	localMu             sync.Mutex
 	logger              ports.Logger
 	metrics             ports.MetricRecorder
 	fallbackStartedAt   time.Time
@@ -44,7 +45,6 @@ type lruBucketEntry struct {
 }
 
 type localBucket struct {
-	mu         sync.Mutex
 	tokens     float64
 	capacity   float64
 	lastRefill time.Time
@@ -187,11 +187,13 @@ func (r *RateLimiter) takeLocal(keys []Bucket, cost int64) RateLimitResult {
 		buckets[i] = r.getOrCreateBucket(k.localKey(), float64(k.Capacity)*r.cfg.FallbackMultiplier, k.rate())
 	}
 
+	r.localMu.Lock()
+	defer r.localMu.Unlock()
+
 	allowed := true
 	var maxWait time.Duration
 	now := time.Now()
 	for i, b := range buckets {
-		b.mu.Lock()
 		b.capacity = float64(keys[i].Capacity) * r.cfg.FallbackMultiplier
 		b.refillRate = keys[i].rate()
 		elapsed := now.Sub(b.lastRefill).Seconds()
@@ -205,7 +207,6 @@ func (r *RateLimiter) takeLocal(keys []Bucket, cost int64) RateLimitResult {
 				}
 			}
 		}
-		b.mu.Unlock()
 	}
 
 	if !allowed {
@@ -213,9 +214,7 @@ func (r *RateLimiter) takeLocal(keys []Bucket, cost int64) RateLimitResult {
 	}
 
 	for _, b := range buckets {
-		b.mu.Lock()
-		b.tokens = max(0, b.tokens-float64(cost))
-		b.mu.Unlock()
+		b.tokens -= float64(cost)
 	}
 	return RateLimitResult{Allowed: true}
 }
