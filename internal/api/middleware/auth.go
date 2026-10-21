@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"strings"
 
 	"samarth/payment-service/internal/ports"
 )
@@ -43,6 +44,7 @@ type AuthThrottle struct {
 	Limiter  Limiter
 	ClientIP *ClientIP
 	Limit    Limit
+	Metrics  ports.MetricRecorder
 }
 
 func (t *AuthThrottle) identity(r *http.Request) string {
@@ -71,6 +73,11 @@ func Authenticate(provider TokenProvider, log ports.Logger, throttle *AuthThrott
 			principal, ok := authenticate(r, provider)
 
 			if decision, identity := throttle.admit(r, ok); !decision.Allowed {
+				if throttle.Metrics != nil {
+					throttle.Metrics.Increment(ports.MetricAuthThrottled, map[string]string{
+						"identity_type": strings.SplitN(identity, ":", 2)[0],
+					})
+				}
 				log.Warn(ports.LogEventAuthThrottled, map[string]any{
 					"path":        r.URL.Path,
 					"identity":    identity,

@@ -69,11 +69,13 @@ func RequestKeys(clientIP *ClientIP, limits Limits) RateLimitKeys {
 			if len(user) > MaxUserIDLength {
 				return nil, errUserIDTooLong
 			}
-			scope := merchant
-			if scope == "" {
-				scope = unauthenticatedScope
+			if merchant == "" || limits.User != limits.Merchant {
+				scope := merchant
+				if scope == "" {
+					scope = unauthenticatedScope
+				}
+				buckets = append(buckets, Bucket{Namespace: NamespaceUser, ID: scope + "\x00" + user, Limit: limits.User})
 			}
-			buckets = append(buckets, Bucket{Namespace: NamespaceUser, ID: scope + "\x00" + user, Limit: limits.User})
 		}
 		buckets = append(buckets, Bucket{Namespace: NamespaceIP, ID: clientBucketIP(clientIP, r), Limit: limits.IP})
 		return buckets, nil
@@ -101,7 +103,7 @@ func bucketIP(ip string) string {
 	return netip.PrefixFrom(addr, ipv6BucketPrefix).Masked().String()
 }
 
-func RateLimit(limiter Limiter, log ports.Logger, keys RateLimitKeys) func(http.Handler) http.Handler {
+func RateLimit(limiter Limiter, log ports.Logger, metrics ports.MetricRecorder, keys RateLimitKeys) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			buckets, err := keys(r)
@@ -114,6 +116,9 @@ func RateLimit(limiter Limiter, log ports.Logger, keys RateLimitKeys) func(http.
 
 			decision := limiter.Take(r.Context(), buckets, 1)
 			if !decision.Allowed {
+				if metrics != nil {
+					metrics.Increment(ports.MetricRateLimitRejected, map[string]string{"listener": listenerOf(buckets)})
+				}
 				log.Warn(ports.LogEventRateLimitRejected, map[string]any{
 					"client_ip":   bucketClientIP(buckets),
 					"remote_addr": r.RemoteAddr,
@@ -127,6 +132,15 @@ func RateLimit(limiter Limiter, log ports.Logger, keys RateLimitKeys) func(http.
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func listenerOf(buckets []Bucket) string {
+	for _, b := range buckets {
+		if b.Namespace == NamespaceWebhookIP {
+			return "webhook"
+		}
+	}
+	return "merchant"
 }
 
 func bucketClientIP(buckets []Bucket) string {

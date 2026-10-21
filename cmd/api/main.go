@@ -226,6 +226,7 @@ func run() error {
 		Logger:  logger,
 		Auth:    authProvider,
 		Limiter: limiterAdapter{rl: rateLimiter},
+		Metrics: metrics,
 		RateLimits: middleware.Limits{
 			Merchant: middleware.Limit{Capacity: cfg.RateLimit.Capacity, RefillPerSec: cfg.RateLimit.RefillPerSec},
 			User:     middleware.Limit{Capacity: cfg.RateLimit.UserCapacity, RefillPerSec: cfg.RateLimit.UserRefillPerSec},

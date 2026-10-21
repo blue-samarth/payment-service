@@ -52,7 +52,7 @@ func limitsOf(capacity int64) middleware.Limits {
 func merchantStack(lim middleware.Limiter, capacity int64, throttle *middleware.AuthThrottle) http.Handler {
 	provider := middleware.NewStaticTokenProvider(map[string]string{tokenA: "merchant-a", tokenB: "merchant-b"}, nil)
 	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	limited := middleware.RateLimit(lim, quietLog{}, middleware.RequestKeys(nil, limitsOf(capacity)))(ok)
+	limited := middleware.RateLimit(lim, quietLog{}, nil, middleware.RequestKeys(nil, limitsOf(capacity)))(ok)
 	return middleware.Authenticate(provider, quietLog{}, throttle)(limited)
 }
 
@@ -94,7 +94,7 @@ func TestRateLimitKeys_MerchantCannotDrainAWebhookBucket(t *testing.T) {
 	}
 
 	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	webhook := middleware.RateLimit(lim, quietLog{}, middleware.WebhookKeys(nil, middleware.Limit{Capacity: 1, RefillPerSec: oneShot}))(ok)
+	webhook := middleware.RateLimit(lim, quietLog{}, nil, middleware.WebhookKeys(nil, middleware.Limit{Capacity: 1, RefillPerSec: oneShot}))(ok)
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/gateway/stripe", nil)
 	req.RemoteAddr = "198.51.100.7:1"
 	rec := httptest.NewRecorder()

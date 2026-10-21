@@ -158,6 +158,23 @@ func TestRateLimiter_LocalFallbackIsAtomicUnderConcurrency(t *testing.T) {
 	}
 }
 
+func TestRateLimiter_FallbackNeverShrinksABucketBelowOneToken(t *testing.T) {
+	r := localLimiter()
+	r.cfg.FallbackMultiplier = 0.5
+	ctx := context.Background()
+	auth := []Bucket{bucket("auth_failure", "cert:abc", 1, 0.0001)}
+
+	if !r.Take(ctx, auth, 0).Allowed {
+		t.Fatal("capacity 1 x 0.5 must still hold one token in fallback, or every valid request gets 429 while Redis is down")
+	}
+	if !r.Take(ctx, auth, 1).Allowed {
+		t.Fatal("the one token can be taken")
+	}
+	if r.Take(ctx, auth, 1).Allowed {
+		t.Fatal("and only one")
+	}
+}
+
 func TestRateLimiter_ZeroCostChecksWithoutConsuming(t *testing.T) {
 	r := localLimiter()
 	ctx := context.Background()

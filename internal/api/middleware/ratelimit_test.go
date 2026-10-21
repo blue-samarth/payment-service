@@ -108,7 +108,7 @@ var (
 
 func merchantChain(lim Limiter, keys RateLimitKeys, throttle *AuthThrottle) http.Handler {
 	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a", tokenB: "merchant-b"}, nil)
-	return Authenticate(provider, noopLog{}, throttle)(RateLimit(lim, noopLog{}, keys)(okHandler()))
+	return Authenticate(provider, noopLog{}, throttle)(RateLimit(lim, noopLog{}, nil, keys)(okHandler()))
 }
 
 func request(token, userID, remote string) *http.Request {
@@ -127,7 +127,7 @@ func request(token, userID, remote string) *http.Request {
 
 func TestRateLimit_Allows(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	h := RateLimit(lim, noopLog{}, RequestKeys(nil, testLimits))(okHandler())
+	h := RateLimit(lim, noopLog{}, nil, RequestKeys(nil, testLimits))(okHandler())
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, request("", "", "203.0.113.5:4444"))
@@ -146,7 +146,8 @@ func TestRateLimit_Allows(t *testing.T) {
 func TestRateLimit_Rejects429AndLogsTheClientIP(t *testing.T) {
 	lim := &fakeLimiter{allow: false, retryAfter: 2 * time.Second}
 	log := &capturingLog{fields: map[string]map[string]any{}}
-	h := RateLimit(lim, log, RequestKeys(NewClientIP(nil), testLimits))(okHandler())
+	metrics := &countingMetrics{counts: map[string]map[string]string{}}
+	h := RateLimit(lim, log, metrics, RequestKeys(NewClientIP(nil), testLimits))(okHandler())
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, request("", "", "203.0.113.5:4444"))
@@ -157,7 +158,23 @@ func TestRateLimit_Rejects429AndLogsTheClientIP(t *testing.T) {
 	if got := log.fields[ports.LogEventRateLimitRejected]["client_ip"]; got != "203.0.113.5" {
 		t.Errorf("the rejection log must carry the derived client IP, got %v", got)
 	}
+	if tags, ok := metrics.counts[ports.MetricRateLimitRejected]; !ok || tags["listener"] != "merchant" {
+		t.Errorf("a rejection must be counted with its listener for alerting, got %v", metrics.counts)
+	}
 }
+
+type countingMetrics struct {
+	mu     sync.Mutex
+	counts map[string]map[string]string
+}
+
+func (m *countingMetrics) Increment(name string, tags map[string]string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.counts[name] = tags
+}
+func (m *countingMetrics) Histogram(string, float64, map[string]string) {}
+func (m *countingMetrics) Gauge(string, float64, map[string]string)     {}
 
 func TestRateLimit_EachDimensionCarriesItsOwnLimit(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
@@ -208,6 +225,22 @@ func TestRateLimit_UserIDIsScopedToTheMerchant(t *testing.T) {
 	}
 }
 
+func TestRateLimit_UserBucketSkippedWhenItCannotBind(t *testing.T) {
+	equal := testLimits
+	equal.User = equal.Merchant
+
+	lim := &fakeLimiter{allow: true}
+	merchantChain(lim, RequestKeys(nil, equal), nil).ServeHTTP(httptest.NewRecorder(), request(tokenA, "customer-1", ""))
+	if _, ok := lim.bucket(NamespaceUser); ok {
+		t.Error("a user bucket with the merchant's own limit can never bind, so it must not cost a Redis write")
+	}
+
+	RateLimit(lim, noopLog{}, nil, RequestKeys(nil, equal))(okHandler()).ServeHTTP(httptest.NewRecorder(), request("", "customer-1", ""))
+	if _, ok := lim.bucket(NamespaceUser); !ok {
+		t.Error("without a merchant the user bucket spans every IP, so it can still bind and must be kept")
+	}
+}
+
 func TestRateLimit_OverlongUserIDIsRejected(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
 	rec := httptest.NewRecorder()
@@ -234,7 +267,7 @@ func TestRateLimit_MerchantCannotReachAWebhookBucket(t *testing.T) {
 	webhook := &fakeLimiter{allow: true}
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/gateway/stripe", nil)
 	req.RemoteAddr = "198.51.100.7:1"
-	RateLimit(webhook, noopLog{}, WebhookKeys(nil, webhookLimit))(okHandler()).ServeHTTP(httptest.NewRecorder(), req)
+	RateLimit(webhook, noopLog{}, nil, WebhookKeys(nil, webhookLimit))(okHandler()).ServeHTTP(httptest.NewRecorder(), req)
 
 	for _, mb := range merchant.last() {
 		for _, wb := range webhook.last() {
@@ -247,7 +280,7 @@ func TestRateLimit_MerchantCannotReachAWebhookBucket(t *testing.T) {
 
 func TestRateLimit_NoPrincipalUsesIPAndScopedUserOnly(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	RateLimit(lim, noopLog{}, RequestKeys(nil, testLimits))(okHandler()).ServeHTTP(httptest.NewRecorder(), request("", "u1", "203.0.113.5:1"))
+	RateLimit(lim, noopLog{}, nil, RequestKeys(nil, testLimits))(okHandler()).ServeHTTP(httptest.NewRecorder(), request("", "u1", "203.0.113.5:1"))
 
 	if _, ok := lim.bucket(NamespaceMerchant); ok {
 		t.Error("without a principal the merchant dimension must be skipped, not keyed on \"\"")
@@ -259,10 +292,10 @@ func TestRateLimit_NoPrincipalUsesIPAndScopedUserOnly(t *testing.T) {
 
 func TestRateLimit_UnparseablePeerStillGetsAnIPBucket(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	RateLimit(lim, noopLog{}, RequestKeys(nil, testLimits))(okHandler()).ServeHTTP(httptest.NewRecorder(), request("", "", ""))
+	RateLimit(lim, noopLog{}, nil, RequestKeys(nil, testLimits))(okHandler()).ServeHTTP(httptest.NewRecorder(), request("", "", ""))
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
 	req.RemoteAddr = ""
-	RateLimit(lim, noopLog{}, WebhookKeys(nil, webhookLimit))(okHandler()).ServeHTTP(httptest.NewRecorder(), req)
+	RateLimit(lim, noopLog{}, nil, WebhookKeys(nil, webhookLimit))(okHandler()).ServeHTTP(httptest.NewRecorder(), req)
 
 	if b, ok := lim.bucket(NamespaceWebhookIP); !ok || b.ID != unknownClient {
 		t.Fatalf("a request with no usable address is limited under a shared fallback key, not waved through, got %+v", lim.last())
@@ -279,7 +312,7 @@ func TestRateLimit_IgnoresForwardedForFromUntrustedPeer(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			lim := &fakeLimiter{allow: true}
-			h := RateLimit(lim, noopLog{}, tc.keys)(okHandler())
+			h := RateLimit(lim, noopLog{}, nil, tc.keys)(okHandler())
 
 			for _, spoofed := range []string{"198.51.100.7", "198.51.100.8", "198.51.100.9"} {
 				req := httptest.NewRequest(http.MethodPost, "/", nil)
@@ -305,7 +338,7 @@ func TestRateLimit_IPv6SharesOneBucketPer64(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			lim := &fakeLimiter{allow: true}
-			h := RateLimit(lim, noopLog{}, tc.keys)(okHandler())
+			h := RateLimit(lim, noopLog{}, nil, tc.keys)(okHandler())
 
 			serve := func(remote string) string {
 				req := httptest.NewRequest(http.MethodPost, "/", nil)
@@ -331,7 +364,7 @@ func TestRateLimit_IPv6SharesOneBucketPer64(t *testing.T) {
 
 func TestRateLimit_WebhookKeysAreOneIPBucketWithTheWebhookLimit(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	h := RateLimit(lim, noopLog{}, WebhookKeys(nil, webhookLimit))(okHandler())
+	h := RateLimit(lim, noopLog{}, nil, WebhookKeys(nil, webhookLimit))(okHandler())
 
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/gateway/stripe", nil)
 	req.RemoteAddr = "203.0.113.5:4444"
@@ -440,12 +473,21 @@ func TestAuthThrottle_LogsIdentityAndClientIP(t *testing.T) {
 	lim := &fakeLimiter{allow: false}
 	log := &capturingLog{fields: map[string]map[string]any{}}
 	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a"}, nil)
-	throttle := &AuthThrottle{Limiter: lim, ClientIP: NewClientIP(nil), Limit: Limit{Capacity: 1, RefillPerSec: 1}}
+	metrics := &countingMetrics{counts: map[string]map[string]string{}}
+	throttle := &AuthThrottle{Limiter: lim, ClientIP: NewClientIP(nil), Limit: Limit{Capacity: 1, RefillPerSec: 1}, Metrics: metrics}
 	Authenticate(provider, log, throttle)(okHandler()).ServeHTTP(httptest.NewRecorder(), request("wrong", "", "203.0.113.5:1"))
 
 	f := log.fields[ports.LogEventAuthThrottled]
 	if f["client_ip"] != "203.0.113.5" || f["identity"] != "ip:203.0.113.5" {
 		t.Errorf("the throttle log must say who was throttled, got %v", f)
+	}
+	if tags, ok := metrics.counts[ports.MetricAuthThrottled]; !ok || tags["identity_type"] != "ip" {
+		t.Errorf("a throttle must be counted by identity type (low cardinality) for alerting, got %v", metrics.counts)
+	}
+
+	Authenticate(provider, log, throttle)(okHandler()).ServeHTTP(httptest.NewRecorder(), withCert(request("wrong", "", "203.0.113.5:1"), []byte("cert")))
+	if tags := metrics.counts[ports.MetricAuthThrottled]; tags["identity_type"] != "cert" {
+		t.Errorf("a certificate identity is counted as cert, got %v", tags)
 	}
 }
 

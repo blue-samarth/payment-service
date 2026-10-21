@@ -45,6 +45,7 @@ const (
 
 	MetricRateLimitAllowed                  = "rate_limit.allowed"
 	MetricRateLimitRejected                 = "rate_limit.rejected"
+	MetricAuthThrottled                     = "auth.throttled"
 	MetricRateLimitFallbackActive           = "rate_limit.fallback_active"
 	MetricRateLimitRedisAvailable           = "rate_limit_redis_available"
 	MetricRateLimitFallbackActivationsTotal = "rate_limit_fallback_activations_total"

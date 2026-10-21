@@ -179,12 +179,16 @@ func (r *RateLimiter) recordRedisSuccess() {
 	atomic.StoreInt32(&r.consecutiveFailures, 0)
 }
 
+func (r *RateLimiter) localCapacity(b Bucket) float64 {
+	return max(1, float64(b.Capacity)*r.cfg.FallbackMultiplier)
+}
+
 func (r *RateLimiter) takeLocal(keys []Bucket, cost int64) RateLimitResult {
 	need := float64(max(cost, 1))
 
 	buckets := make([]*localBucket, len(keys))
 	for i, k := range keys {
-		buckets[i] = r.getOrCreateBucket(k.localKey(), float64(k.Capacity)*r.cfg.FallbackMultiplier, k.rate())
+		buckets[i] = r.getOrCreateBucket(k.localKey(), r.localCapacity(k), k.rate())
 	}
 
 	r.localMu.Lock()
@@ -194,7 +198,7 @@ func (r *RateLimiter) takeLocal(keys []Bucket, cost int64) RateLimitResult {
 	var maxWait time.Duration
 	now := time.Now()
 	for i, b := range buckets {
-		b.capacity = float64(keys[i].Capacity) * r.cfg.FallbackMultiplier
+		b.capacity = r.localCapacity(keys[i])
 		b.refillRate = keys[i].rate()
 		elapsed := now.Sub(b.lastRefill).Seconds()
 		b.tokens = min(b.capacity, b.tokens+elapsed*b.refillRate)
