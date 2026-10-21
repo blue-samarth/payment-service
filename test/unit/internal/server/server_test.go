@@ -390,6 +390,26 @@ func TestRun_ReadHeaderTimeoutDropsSlowClients(t *testing.T) {
 	}
 }
 
+func TestRun_MaxHeaderBytesRejectsOversizedHeaders(t *testing.T) {
+	r := start(t, []server.Listener{
+		{Name: "merchant", Addr: "127.0.0.1:0", Handler: http.HandlerFunc(ok), MaxHeaderBytes: 1 << 10},
+	}, server.Options{})
+
+	req, err := http.NewRequest(http.MethodGet, r.url("merchant", "/"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("X-User-ID", strings.Repeat("u", 8<<10))
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("a header block over MaxHeaderBytes must be refused with 431, got %d", resp.StatusCode)
+	}
+}
+
 func TestRun_WriteTimeoutBoundsSlowHandlers(t *testing.T) {
 	r := start(t, []server.Listener{
 		{Name: "merchant", Addr: "127.0.0.1:0", Handler: slow(500*time.Millisecond, nil), Timeouts: server.Timeouts{Write: 100 * time.Millisecond}},

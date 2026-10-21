@@ -2,9 +2,12 @@ package middleware
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,7 +25,7 @@ type fakeLimiter struct {
 	calls      []take
 }
 
-func (f *fakeLimiter) Take(_ context.Context, buckets []Bucket, _ int64, _ float64, cost int64) RateDecision {
+func (f *fakeLimiter) Take(_ context.Context, buckets []Bucket, cost int64) RateDecision {
 	f.calls = append(f.calls, take{buckets: buckets, cost: cost})
 	return RateDecision{Allowed: f.allow, RetryAfter: f.retryAfter}
 }
@@ -31,13 +34,35 @@ func (f *fakeLimiter) last() []Bucket {
 	return f.calls[len(f.calls)-1].buckets
 }
 
-func (f *fakeLimiter) bucket(namespace string) (string, bool) {
+func (f *fakeLimiter) bucket(namespace string) (Bucket, bool) {
 	for _, b := range f.last() {
 		if b.Namespace == namespace {
-			return b.ID, true
+			return b, true
 		}
 	}
-	return "", false
+	return Bucket{}, false
+}
+
+type atomicLimiter struct {
+	mu     sync.Mutex
+	tokens map[string]int64
+}
+
+func (a *atomicLimiter) Take(_ context.Context, buckets []Bucket, cost int64) RateDecision {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, b := range buckets {
+		if _, ok := a.tokens[b.ID]; !ok {
+			a.tokens[b.ID] = b.Capacity
+		}
+		if a.tokens[b.ID] < max(cost, 1) {
+			return RateDecision{Allowed: false, RetryAfter: time.Second}
+		}
+	}
+	for _, b := range buckets {
+		a.tokens[b.ID] -= cost
+	}
+	return RateDecision{Allowed: true}
 }
 
 type noopLog struct{}
@@ -49,6 +74,18 @@ func (noopLog) Debug(string, map[string]any)        {}
 func (noopLog) Trace(string, map[string]any)        {}
 func (l noopLog) With(map[string]any) ports.Logger  { return l }
 
+type capturingLog struct {
+	noopLog
+	mu     sync.Mutex
+	fields map[string]map[string]any
+}
+
+func (c *capturingLog) Warn(event string, f map[string]any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.fields[event] = f
+}
+
 func okHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -56,119 +93,152 @@ func okHandler() http.Handler {
 	})
 }
 
-var testCfg = RateLimitConfig{Capacity: 10, RefillPerSec: 5}
+var testLimits = Limits{
+	Merchant: Limit{Capacity: 100, RefillPerSec: 50},
+	User:     Limit{Capacity: 20, RefillPerSec: 5},
+	IP:       Limit{Capacity: 100, RefillPerSec: 50},
+}
+
+var webhookLimit = Limit{Capacity: 300, RefillPerSec: 100}
 
 var (
 	tokenA = "svc-a-" + strings.Repeat("a", 32)
 	tokenB = "svc-b-" + strings.Repeat("b", 32)
 )
 
-func merchantChain(lim *fakeLimiter, keys RateLimitKeys) http.Handler {
+func merchantChain(lim Limiter, keys RateLimitKeys, throttle *AuthThrottle) http.Handler {
 	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a", tokenB: "merchant-b"}, nil)
-	return Authenticate(provider, noopLog{}, nil)(RateLimit(lim, testCfg, noopLog{}, keys)(okHandler()))
+	return Authenticate(provider, noopLog{}, throttle)(RateLimit(lim, noopLog{}, keys)(okHandler()))
+}
+
+func request(token, userID, remote string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
+	if token != "" {
+		req.Header.Set("X-Service-Token", token)
+	}
+	if userID != "" {
+		req.Header.Set("X-User-ID", userID)
+	}
+	if remote != "" {
+		req.RemoteAddr = remote
+	}
+	return req
 }
 
 func TestRateLimit_Allows(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	h := RateLimit(lim, testCfg, noopLog{}, RequestKeys(nil))(okHandler())
+	h := RateLimit(lim, noopLog{}, RequestKeys(nil, testLimits))(okHandler())
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
-	req.RemoteAddr = "203.0.113.5:4444"
-	h.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, request("", "", "203.0.113.5:4444"))
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
-	if ip, _ := lim.bucket(NamespaceIP); ip != "203.0.113.5" {
-		t.Errorf("expected IP parsed to 203.0.113.5, got %q", ip)
+	if ip, _ := lim.bucket(NamespaceIP); ip.ID != "203.0.113.5" || ip.Limit != testLimits.IP {
+		t.Errorf("expected the IP bucket with the IP limit, got %+v", ip)
 	}
 	if lim.calls[0].cost != 1 {
 		t.Errorf("a request costs one token, got %d", lim.calls[0].cost)
 	}
 }
 
-func TestRateLimit_Rejects429(t *testing.T) {
+func TestRateLimit_Rejects429AndLogsTheClientIP(t *testing.T) {
 	lim := &fakeLimiter{allow: false, retryAfter: 2 * time.Second}
-	h := RateLimit(lim, testCfg, noopLog{}, RequestKeys(nil))(okHandler())
+	log := &capturingLog{fields: map[string]map[string]any{}}
+	h := RateLimit(lim, log, RequestKeys(NewClientIP(nil), testLimits))(okHandler())
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/payments", nil))
+	h.ServeHTTP(rec, request("", "", "203.0.113.5:4444"))
 
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("expected 429, got %d", rec.Code)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "2" {
+		t.Fatalf("expected 429 with Retry-After 2, got %d %q", rec.Code, rec.Header().Get("Retry-After"))
 	}
-	if rec.Header().Get("Retry-After") != "2" {
-		t.Errorf("expected Retry-After: 2, got %q", rec.Header().Get("Retry-After"))
+	if got := log.fields[ports.LogEventRateLimitRejected]["client_ip"]; got != "203.0.113.5" {
+		t.Errorf("the rejection log must carry the derived client IP, got %v", got)
+	}
+}
+
+func TestRateLimit_EachDimensionCarriesItsOwnLimit(t *testing.T) {
+	lim := &fakeLimiter{allow: true}
+	merchantChain(lim, RequestKeys(nil, testLimits), nil).ServeHTTP(httptest.NewRecorder(), request(tokenA, "customer-1", "203.0.113.5:1"))
+
+	m, _ := lim.bucket(NamespaceMerchant)
+	u, _ := lim.bucket(NamespaceUser)
+	if m.Limit != testLimits.Merchant || u.Limit != testLimits.User {
+		t.Errorf("merchant and user buckets must carry their own limits, got merchant=%+v user=%+v", m.Limit, u.Limit)
 	}
 }
 
 func TestRateLimit_MerchantBucketFromTokenNotHeader(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	h := merchantChain(lim, RequestKeys(nil))
-
-	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
-	req.Header.Set("X-Service-Token", tokenA)
+	req := request(tokenA, "", "")
 	req.Header.Set("X-Merchant-ID", "victim")
-	h.ServeHTTP(httptest.NewRecorder(), req)
+	merchantChain(lim, RequestKeys(nil, testLimits), nil).ServeHTTP(httptest.NewRecorder(), req)
 
-	if got, _ := lim.bucket(NamespaceMerchant); got != "merchant-a" {
-		t.Errorf("bucket must key on the token-bound merchant, not X-Merchant-ID, got %q", got)
+	if got, _ := lim.bucket(NamespaceMerchant); got.ID != "merchant-a" {
+		t.Errorf("bucket must key on the token-bound merchant, not X-Merchant-ID, got %q", got.ID)
 	}
 }
 
 func TestRateLimit_MissingUserIDSkipsTheUserDimension(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	h := merchantChain(lim, RequestKeys(nil))
+	h := merchantChain(lim, RequestKeys(nil, testLimits), nil)
 
-	users := map[string]bool{}
 	for _, token := range []string{tokenA, tokenB} {
-		req := httptest.NewRequest(http.MethodPost, "/payments", nil)
-		req.Header.Set("X-Service-Token", token)
-		req.RemoteAddr = "203.0.113.5:1"
-		h.ServeHTTP(httptest.NewRecorder(), req)
-		if id, ok := lim.bucket(NamespaceUser); ok {
-			users[id] = true
+		h.ServeHTTP(httptest.NewRecorder(), request(token, "", "203.0.113.5:1"))
+		if _, ok := lim.bucket(NamespaceUser); ok {
+			t.Fatal("a request without X-User-ID must not be keyed on an empty user bucket")
 		}
-	}
-	if len(users) != 0 {
-		t.Fatalf("two merchants sending no X-User-ID must not share an empty-string user bucket, got %v", users)
 	}
 }
 
 func TestRateLimit_UserIDIsScopedToTheMerchant(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	h := merchantChain(lim, RequestKeys(nil))
+	h := merchantChain(lim, RequestKeys(nil, testLimits), nil)
 
 	ids := map[string]string{}
 	for name, token := range map[string]string{"a": tokenA, "b": tokenB} {
-		req := httptest.NewRequest(http.MethodPost, "/payments", nil)
-		req.Header.Set("X-Service-Token", token)
-		req.Header.Set("X-User-ID", "customer-42")
-		h.ServeHTTP(httptest.NewRecorder(), req)
-		ids[name], _ = lim.bucket(NamespaceUser)
+		h.ServeHTTP(httptest.NewRecorder(), request(token, "customer-42", ""))
+		b, _ := lim.bucket(NamespaceUser)
+		ids[name] = b.ID
 	}
 	if ids["a"] == "" || ids["a"] == ids["b"] {
 		t.Fatalf("the same X-User-ID under two merchants must be two buckets, got %v", ids)
 	}
 }
 
+func TestRateLimit_OverlongUserIDIsRejected(t *testing.T) {
+	lim := &fakeLimiter{allow: true}
+	rec := httptest.NewRecorder()
+	merchantChain(lim, RequestKeys(nil, testLimits), nil).ServeHTTP(rec, request(tokenA, strings.Repeat("u", MaxUserIDLength+1), ""))
+
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_user_id") {
+		t.Fatalf("an X-User-ID over %d characters must be a 400, got %d %s", MaxUserIDLength, rec.Code, rec.Body.String())
+	}
+	if len(lim.calls) != 0 {
+		t.Error("a rejected X-User-ID must not reach the limiter")
+	}
+
+	rec = httptest.NewRecorder()
+	merchantChain(lim, RequestKeys(nil, testLimits), nil).ServeHTTP(rec, request(tokenA, strings.Repeat("u", MaxUserIDLength), ""))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("exactly %d characters is allowed, got %d", MaxUserIDLength, rec.Code)
+	}
+}
+
 func TestRateLimit_MerchantCannotReachAWebhookBucket(t *testing.T) {
 	merchant := &fakeLimiter{allow: true}
-	merchantReq := httptest.NewRequest(http.MethodPost, "/payments", nil)
-	merchantReq.Header.Set("X-Service-Token", tokenA)
-	merchantReq.Header.Set("X-User-ID", "webhook:198.51.100.7")
-	merchantReq.RemoteAddr = "203.0.113.5:1"
-	merchantChain(merchant, RequestKeys(nil)).ServeHTTP(httptest.NewRecorder(), merchantReq)
+	merchantChain(merchant, RequestKeys(nil, testLimits), nil).ServeHTTP(httptest.NewRecorder(), request(tokenA, "webhook:198.51.100.7", "203.0.113.5:1"))
 
 	webhook := &fakeLimiter{allow: true}
-	webhookReq := httptest.NewRequest(http.MethodPost, "/webhooks/gateway/stripe", nil)
-	webhookReq.RemoteAddr = "198.51.100.7:1"
-	RateLimit(webhook, testCfg, noopLog{}, WebhookKeys(nil))(okHandler()).ServeHTTP(httptest.NewRecorder(), webhookReq)
+	req := httptest.NewRequest(http.MethodPost, "/webhooks/gateway/stripe", nil)
+	req.RemoteAddr = "198.51.100.7:1"
+	RateLimit(webhook, noopLog{}, WebhookKeys(nil, webhookLimit))(okHandler()).ServeHTTP(httptest.NewRecorder(), req)
 
 	for _, mb := range merchant.last() {
 		for _, wb := range webhook.last() {
-			if mb == wb {
+			if mb.Namespace == wb.Namespace && mb.ID == wb.ID {
 				t.Fatalf("a merchant header reached the webhook bucket %+v", wb)
 			}
 		}
@@ -177,18 +247,25 @@ func TestRateLimit_MerchantCannotReachAWebhookBucket(t *testing.T) {
 
 func TestRateLimit_NoPrincipalUsesIPAndScopedUserOnly(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	h := RateLimit(lim, testCfg, noopLog{}, RequestKeys(nil))(okHandler())
-
-	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
-	req.Header.Set("X-User-ID", "u1")
-	req.RemoteAddr = "203.0.113.5:1"
-	h.ServeHTTP(httptest.NewRecorder(), req)
+	RateLimit(lim, noopLog{}, RequestKeys(nil, testLimits))(okHandler()).ServeHTTP(httptest.NewRecorder(), request("", "u1", "203.0.113.5:1"))
 
 	if _, ok := lim.bucket(NamespaceMerchant); ok {
-		t.Error("without a principal there is no merchant to key on; the dimension must be skipped, not keyed on \"\"")
+		t.Error("without a principal the merchant dimension must be skipped, not keyed on \"\"")
 	}
-	if user, _ := lim.bucket(NamespaceUser); !strings.HasPrefix(user, unauthenticatedScope) {
-		t.Errorf("an unauthenticated user key must be scoped apart from merchant users, got %q", user)
+	if user, _ := lim.bucket(NamespaceUser); !strings.HasPrefix(user.ID, unauthenticatedScope) {
+		t.Errorf("an unauthenticated user key must be scoped apart from merchant users, got %q", user.ID)
+	}
+}
+
+func TestRateLimit_UnparseablePeerStillGetsAnIPBucket(t *testing.T) {
+	lim := &fakeLimiter{allow: true}
+	RateLimit(lim, noopLog{}, RequestKeys(nil, testLimits))(okHandler()).ServeHTTP(httptest.NewRecorder(), request("", "", ""))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = ""
+	RateLimit(lim, noopLog{}, WebhookKeys(nil, webhookLimit))(okHandler()).ServeHTTP(httptest.NewRecorder(), req)
+
+	if b, ok := lim.bucket(NamespaceWebhookIP); !ok || b.ID != unknownClient {
+		t.Fatalf("a request with no usable address is limited under a shared fallback key, not waved through, got %+v", lim.last())
 	}
 }
 
@@ -197,12 +274,12 @@ func TestRateLimit_IgnoresForwardedForFromUntrustedPeer(t *testing.T) {
 		keys      RateLimitKeys
 		namespace string
 	}{
-		"merchant": {RequestKeys(NewClientIP(nil)), NamespaceIP},
-		"webhook":  {WebhookKeys(NewClientIP(nil)), NamespaceWebhookIP},
+		"merchant": {RequestKeys(NewClientIP(nil), testLimits), NamespaceIP},
+		"webhook":  {WebhookKeys(NewClientIP(nil), webhookLimit), NamespaceWebhookIP},
 	} {
 		t.Run(name, func(t *testing.T) {
 			lim := &fakeLimiter{allow: true}
-			h := RateLimit(lim, testCfg, noopLog{}, tc.keys)(okHandler())
+			h := RateLimit(lim, noopLog{}, tc.keys)(okHandler())
 
 			for _, spoofed := range []string{"198.51.100.7", "198.51.100.8", "198.51.100.9"} {
 				req := httptest.NewRequest(http.MethodPost, "/", nil)
@@ -210,8 +287,8 @@ func TestRateLimit_IgnoresForwardedForFromUntrustedPeer(t *testing.T) {
 				req.RemoteAddr = "203.0.113.5:5555"
 				h.ServeHTTP(httptest.NewRecorder(), req)
 
-				if ip, _ := lim.bucket(tc.namespace); ip != "203.0.113.5" {
-					t.Fatalf("a rotated X-Forwarded-For must not change the IP bucket, got %q", ip)
+				if ip, _ := lim.bucket(tc.namespace); ip.ID != "203.0.113.5" {
+					t.Fatalf("a rotated X-Forwarded-For must not change the IP bucket, got %q", ip.ID)
 				}
 			}
 		})
@@ -223,19 +300,19 @@ func TestRateLimit_IPv6SharesOneBucketPer64(t *testing.T) {
 		keys      RateLimitKeys
 		namespace string
 	}{
-		"merchant": {RequestKeys(nil), NamespaceIP},
-		"webhook":  {WebhookKeys(nil), NamespaceWebhookIP},
+		"merchant": {RequestKeys(nil, testLimits), NamespaceIP},
+		"webhook":  {WebhookKeys(nil, webhookLimit), NamespaceWebhookIP},
 	} {
 		t.Run(name, func(t *testing.T) {
 			lim := &fakeLimiter{allow: true}
-			h := RateLimit(lim, testCfg, noopLog{}, tc.keys)(okHandler())
+			h := RateLimit(lim, noopLog{}, tc.keys)(okHandler())
 
 			serve := func(remote string) string {
 				req := httptest.NewRequest(http.MethodPost, "/", nil)
 				req.RemoteAddr = remote
 				h.ServeHTTP(httptest.NewRecorder(), req)
 				ip, _ := lim.bucket(tc.namespace)
-				return ip
+				return ip.ID
 			}
 			for _, remote := range []string{"[2001:db8:1:2::1]:1", "[2001:db8:1:2:ffff:ffff:ffff:ffff]:1"} {
 				if got := serve(remote); got != "2001:db8:1:2::/64" {
@@ -252,9 +329,9 @@ func TestRateLimit_IPv6SharesOneBucketPer64(t *testing.T) {
 	}
 }
 
-func TestRateLimit_WebhookKeysAreOneIPBucket(t *testing.T) {
+func TestRateLimit_WebhookKeysAreOneIPBucketWithTheWebhookLimit(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	h := RateLimit(lim, testCfg, noopLog{}, WebhookKeys(nil))(okHandler())
+	h := RateLimit(lim, noopLog{}, WebhookKeys(nil, webhookLimit))(okHandler())
 
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/gateway/stripe", nil)
 	req.RemoteAddr = "203.0.113.5:4444"
@@ -262,73 +339,120 @@ func TestRateLimit_WebhookKeysAreOneIPBucket(t *testing.T) {
 	h.ServeHTTP(httptest.NewRecorder(), req)
 
 	got := lim.last()
-	if len(got) != 1 || got[0] != (Bucket{Namespace: NamespaceWebhookIP, ID: "203.0.113.5"}) {
-		t.Errorf("webhooks are limited per caller IP only, in their own namespace, got %+v", got)
+	want := Bucket{Namespace: NamespaceWebhookIP, ID: "203.0.113.5", Limit: webhookLimit}
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("webhooks are limited per caller IP only, with their own limit, got %+v", got)
 	}
 }
 
-func authThrottled(lim *fakeLimiter) http.Handler {
+func authThrottled(lim Limiter, capacity int64) http.Handler {
 	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a"}, nil)
-	throttle := &AuthThrottle{Limiter: lim, Capacity: 10, RefillPerSec: 0.1}
+	throttle := &AuthThrottle{Limiter: lim, Limit: Limit{Capacity: capacity, RefillPerSec: 0.0001}}
 	return Authenticate(provider, noopLog{}, throttle)(okHandler())
 }
 
-func TestAuthThrottle_FailureConsumesAndSuccessDoesNot(t *testing.T) {
+func TestAuthThrottle_OneCallPerRequest(t *testing.T) {
 	lim := &fakeLimiter{allow: true}
-	h := authThrottled(lim)
+	h := authThrottled(lim, 10)
 
-	bad := httptest.NewRequest(http.MethodPost, "/payments", nil)
-	bad.Header.Set("X-Service-Token", "wrong")
-	bad.RemoteAddr = "203.0.113.5:1"
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, bad)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("a bad token is still a 401 while under the limit, got %d", rec.Code)
-	}
-	if len(lim.calls) != 2 || lim.calls[0].cost != 0 || lim.calls[1].cost != 1 {
-		t.Fatalf("expected a zero-cost check then one consumed token, got %+v", lim.calls)
-	}
-	if b := lim.calls[1].buckets; len(b) != 1 || b[0] != (Bucket{Namespace: NamespaceAuthFailure, ID: "203.0.113.5"}) {
-		t.Errorf("failures are counted per client IP in their own namespace, got %+v", b)
+	h.ServeHTTP(rec, request("wrong", "", "203.0.113.5:1"))
+	if rec.Code != http.StatusUnauthorized || len(lim.calls) != 1 || lim.calls[0].cost != 1 {
+		t.Fatalf("a bad token is one call that consumes one token, got %d %+v", rec.Code, lim.calls)
 	}
 
 	lim.calls = nil
-	good := httptest.NewRequest(http.MethodPost, "/payments", nil)
-	good.Header.Set("X-Service-Token", tokenA)
-	good.RemoteAddr = "203.0.113.5:1"
 	rec = httptest.NewRecorder()
-	h.ServeHTTP(rec, good)
+	h.ServeHTTP(rec, request(tokenA, "", "203.0.113.5:1"))
 	if rec.Code != http.StatusOK || len(lim.calls) != 1 || lim.calls[0].cost != 0 {
-		t.Fatalf("a valid token must pass and consume nothing, got %d %+v", rec.Code, lim.calls)
+		t.Fatalf("a valid token is one zero-cost check, got %d %+v", rec.Code, lim.calls)
 	}
 }
 
-func TestAuthThrottle_ExhaustedIPIsRejectedBeforeTheTokenIsChecked(t *testing.T) {
-	lim := &fakeLimiter{allow: false, retryAfter: 30 * time.Second}
-	h := authThrottled(lim)
+func TestAuthThrottle_ConcurrentFailuresAreCappedAtCapacity(t *testing.T) {
+	lim := &atomicLimiter{tokens: map[string]int64{}}
+	h := authThrottled(lim, 5)
 
-	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
-	req.Header.Set("X-Service-Token", tokenA)
-	req.RemoteAddr = "203.0.113.5:1"
+	const parallel = 100
+	codes := make(chan int, parallel)
+	var wg sync.WaitGroup
+	for range parallel {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, request("wrong", "", "203.0.113.5:1"))
+			codes <- rec.Code
+		}()
+	}
+	wg.Wait()
+	close(codes)
+
+	answered := 0
+	for code := range codes {
+		switch code {
+		case http.StatusUnauthorized:
+			answered++
+		case http.StatusTooManyRequests:
+		default:
+			t.Fatalf("unexpected status %d", code)
+		}
+	}
+	if answered != 5 {
+		t.Fatalf("%d parallel guesses must get exactly capacity (5) answers, the rest 429; got %d answered", parallel, answered)
+	}
+}
+
+func TestAuthThrottle_ExhaustedIdentityGets429EvenWithAValidToken(t *testing.T) {
+	lim := &fakeLimiter{allow: false, retryAfter: 30 * time.Second}
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	authThrottled(lim, 10).ServeHTTP(rec, request(tokenA, "", "203.0.113.5:1"))
 
 	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "30" {
-		t.Fatalf("an IP out of auth-failure tokens gets 429 with Retry-After, got %d %q", rec.Code, rec.Header().Get("Retry-After"))
+		t.Fatalf("an exhausted identity gets 429 so a correct guess is not confirmed, got %d %q", rec.Code, rec.Header().Get("Retry-After"))
 	}
-	if len(lim.calls) != 1 {
-		t.Errorf("a rejected request must not consume a further token, got %+v", lim.calls)
+}
+
+func withCert(req *http.Request, raw []byte) *http.Request {
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{{Raw: raw}}}
+	return req
+}
+
+func TestAuthThrottle_KeysOnTheClientCertificateNotTheIP(t *testing.T) {
+	lim := &atomicLimiter{tokens: map[string]int64{}}
+	h := authThrottled(lim, 1)
+
+	h.ServeHTTP(httptest.NewRecorder(), withCert(request("wrong", "", "203.0.113.5:1"), []byte("merchant-x-cert")))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, withCert(request("wrong", "", "203.0.113.5:1"), []byte("merchant-x-cert")))
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("the failing certificate is throttled, got %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, withCert(request(tokenA, "", "203.0.113.5:1"), []byte("merchant-y-cert")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("another merchant behind the same NAT address must not be locked out, got %d", rec.Code)
+	}
+}
+
+func TestAuthThrottle_LogsIdentityAndClientIP(t *testing.T) {
+	lim := &fakeLimiter{allow: false}
+	log := &capturingLog{fields: map[string]map[string]any{}}
+	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a"}, nil)
+	throttle := &AuthThrottle{Limiter: lim, ClientIP: NewClientIP(nil), Limit: Limit{Capacity: 1, RefillPerSec: 1}}
+	Authenticate(provider, log, throttle)(okHandler()).ServeHTTP(httptest.NewRecorder(), request("wrong", "", "203.0.113.5:1"))
+
+	f := log.fields[ports.LogEventAuthThrottled]
+	if f["client_ip"] != "203.0.113.5" || f["identity"] != "ip:203.0.113.5" {
+		t.Errorf("the throttle log must say who was throttled, got %v", f)
 	}
 }
 
 func TestAuthThrottle_NilDisablesThrottling(t *testing.T) {
 	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a"}, nil)
-	h := Authenticate(provider, noopLog{}, nil)(okHandler())
-
-	req := httptest.NewRequest(http.MethodPost, "/payments", nil)
-	req.Header.Set("X-Service-Token", "wrong")
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	Authenticate(provider, noopLog{}, nil)(okHandler()).ServeHTTP(rec, request("wrong", "", ""))
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("got %d", rec.Code)
 	}

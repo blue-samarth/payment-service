@@ -110,20 +110,28 @@ func bucketKey(namespace, entityID string) string {
 const minRefillRate = 1e-9
 
 type Bucket struct {
-	Namespace string
-	ID        string
+	Namespace    string
+	ID           string
+	Capacity     int64
+	RefillPerSec float64
 }
 
 func (b Bucket) localKey() string {
-	return b.Namespace + "\x00" + b.ID
+	return bucketKey(b.Namespace, b.ID)
 }
 
-func (r *RateLimiter) Take(ctx context.Context, buckets []Bucket, capacity int64, ratePerSec float64, cost int64) RateLimitResult {
-	if len(buckets) == 0 {
-		return RateLimitResult{Allowed: true}
+func (b Bucket) rate() float64 {
+	if b.RefillPerSec <= 0 {
+		return minRefillRate
 	}
-	if ratePerSec <= 0 {
-		ratePerSec = minRefillRate
+	return b.RefillPerSec
+}
+
+const emptyBucketsRetry = time.Second
+
+func (r *RateLimiter) Take(ctx context.Context, buckets []Bucket, cost int64) RateLimitResult {
+	if len(buckets) == 0 {
+		return RateLimitResult{Allowed: false, RetryAfter: emptyBucketsRetry}
 	}
 	if cost < 0 {
 		cost = 0
@@ -134,23 +142,24 @@ func (r *RateLimiter) Take(ctx context.Context, buckets []Bucket, capacity int64
 	r.mu.RUnlock()
 
 	if avail {
-		return r.takeRedis(ctx, buckets, capacity, ratePerSec, cost)
+		return r.takeRedis(ctx, buckets, cost)
 	}
-	return r.takeLocal(buckets, capacity, ratePerSec, cost)
+	return r.takeLocal(buckets, cost)
 }
 
-func (r *RateLimiter) takeRedis(ctx context.Context, buckets []Bucket, capacity int64, ratePerSec float64, cost int64) RateLimitResult {
-	nowMs := time.Now().UnixMilli()
-
+func (r *RateLimiter) takeRedis(ctx context.Context, buckets []Bucket, cost int64) RateLimitResult {
 	keys := make([]string, len(buckets))
+	args := make([]any, 0, 2+2*len(buckets))
+	args = append(args, time.Now().UnixMilli(), cost)
 	for i, b := range buckets {
 		keys[i] = bucketKey(b.Namespace, b.ID)
+		args = append(args, b.Capacity, b.rate())
 	}
 
-	res, err := tokenBucketScript.Run(ctx, r.client, keys, capacity, ratePerSec, nowMs, cost).Int64Slice()
+	res, err := tokenBucketScript.Run(ctx, r.client, keys, args...).Int64Slice()
 	if err != nil || len(res) != 2 {
 		r.recordRedisFailure()
-		return r.takeLocal(buckets, capacity, ratePerSec, cost)
+		return r.takeLocal(buckets, cost)
 	}
 	r.recordRedisSuccess()
 
@@ -170,22 +179,21 @@ func (r *RateLimiter) recordRedisSuccess() {
 	atomic.StoreInt32(&r.consecutiveFailures, 0)
 }
 
-func (r *RateLimiter) takeLocal(keys []Bucket, capacity int64, ratePerSec float64, cost int64) RateLimitResult {
-	localCap := float64(capacity) * r.cfg.FallbackMultiplier
+func (r *RateLimiter) takeLocal(keys []Bucket, cost int64) RateLimitResult {
 	need := float64(max(cost, 1))
 
 	buckets := make([]*localBucket, len(keys))
 	for i, k := range keys {
-		buckets[i] = r.getOrCreateBucket(k.localKey(), localCap, ratePerSec)
+		buckets[i] = r.getOrCreateBucket(k.localKey(), float64(k.Capacity)*r.cfg.FallbackMultiplier, k.rate())
 	}
 
 	allowed := true
 	var maxWait time.Duration
 	now := time.Now()
-	for _, b := range buckets {
+	for i, b := range buckets {
 		b.mu.Lock()
-		b.capacity = localCap
-		b.refillRate = ratePerSec
+		b.capacity = float64(keys[i].Capacity) * r.cfg.FallbackMultiplier
+		b.refillRate = keys[i].rate()
 		elapsed := now.Sub(b.lastRefill).Seconds()
 		b.tokens = min(b.capacity, b.tokens+elapsed*b.refillRate)
 		b.lastRefill = now

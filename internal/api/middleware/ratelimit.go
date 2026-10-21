@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/netip"
 	"strconv"
@@ -19,11 +20,29 @@ const (
 	NamespaceAuthFailure = "auth_failure"
 )
 
-const unauthenticatedScope = "unauthenticated"
+const (
+	unauthenticatedScope = "unauthenticated"
+	unknownClient        = "unknown"
+	MaxUserIDLength      = 128
+)
+
+var errUserIDTooLong = errors.New("X-User-ID must be at most 128 characters")
+
+type Limit struct {
+	Capacity     int64
+	RefillPerSec float64
+}
+
+type Limits struct {
+	Merchant Limit
+	User     Limit
+	IP       Limit
+}
 
 type Bucket struct {
 	Namespace string
 	ID        string
+	Limit
 }
 
 type RateDecision struct {
@@ -32,47 +51,46 @@ type RateDecision struct {
 }
 
 type Limiter interface {
-	Take(ctx context.Context, buckets []Bucket, capacity int64, ratePerSec float64, cost int64) RateDecision
-}
-
-type RateLimitConfig struct {
-	Capacity     int64
-	RefillPerSec float64
+	Take(ctx context.Context, buckets []Bucket, cost int64) RateDecision
 }
 
 const ipv6BucketPrefix = 64
 
-type RateLimitKeys func(r *http.Request) []Bucket
+type RateLimitKeys func(r *http.Request) ([]Bucket, error)
 
-func RequestKeys(clientIP *ClientIP) RateLimitKeys {
-	return func(r *http.Request) []Bucket {
+func RequestKeys(clientIP *ClientIP, limits Limits) RateLimitKeys {
+	return func(r *http.Request) ([]Bucket, error) {
 		var buckets []Bucket
 		merchant := merchantBucketID(r.Context())
 		if merchant != "" {
-			buckets = append(buckets, Bucket{Namespace: NamespaceMerchant, ID: merchant})
+			buckets = append(buckets, Bucket{Namespace: NamespaceMerchant, ID: merchant, Limit: limits.Merchant})
 		}
 		if user := strings.TrimSpace(r.Header.Get("X-User-ID")); user != "" {
+			if len(user) > MaxUserIDLength {
+				return nil, errUserIDTooLong
+			}
 			scope := merchant
 			if scope == "" {
 				scope = unauthenticatedScope
 			}
-			buckets = append(buckets, Bucket{Namespace: NamespaceUser, ID: scope + "\x00" + user})
+			buckets = append(buckets, Bucket{Namespace: NamespaceUser, ID: scope + "\x00" + user, Limit: limits.User})
 		}
-		if ip := bucketIP(clientIP.From(r)); ip != "" {
-			buckets = append(buckets, Bucket{Namespace: NamespaceIP, ID: ip})
-		}
-		return buckets
+		buckets = append(buckets, Bucket{Namespace: NamespaceIP, ID: clientBucketIP(clientIP, r), Limit: limits.IP})
+		return buckets, nil
 	}
 }
 
-func WebhookKeys(clientIP *ClientIP) RateLimitKeys {
-	return func(r *http.Request) []Bucket {
-		ip := bucketIP(clientIP.From(r))
-		if ip == "" {
-			return nil
-		}
-		return []Bucket{{Namespace: NamespaceWebhookIP, ID: ip}}
+func WebhookKeys(clientIP *ClientIP, limit Limit) RateLimitKeys {
+	return func(r *http.Request) ([]Bucket, error) {
+		return []Bucket{{Namespace: NamespaceWebhookIP, ID: clientBucketIP(clientIP, r), Limit: limit}}, nil
 	}
+}
+
+func clientBucketIP(clientIP *ClientIP, r *http.Request) string {
+	if ip := bucketIP(clientIP.From(r)); ip != "" {
+		return ip
+	}
+	return unknownClient
 }
 
 func bucketIP(ip string) string {
@@ -83,14 +101,21 @@ func bucketIP(ip string) string {
 	return netip.PrefixFrom(addr, ipv6BucketPrefix).Masked().String()
 }
 
-func RateLimit(limiter Limiter, cfg RateLimitConfig, log ports.Logger, keys RateLimitKeys) func(http.Handler) http.Handler {
+func RateLimit(limiter Limiter, log ports.Logger, keys RateLimitKeys) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			buckets := keys(r)
+			buckets, err := keys(r)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"code":"invalid_user_id","message":"` + err.Error() + `"}}`))
+				return
+			}
 
-			decision := limiter.Take(r.Context(), buckets, cfg.Capacity, cfg.RefillPerSec, 1)
+			decision := limiter.Take(r.Context(), buckets, 1)
 			if !decision.Allowed {
 				log.Warn(ports.LogEventRateLimitRejected, map[string]any{
+					"client_ip":   bucketClientIP(buckets),
 					"remote_addr": r.RemoteAddr,
 					"path":        r.URL.Path,
 					"buckets":     namespaces(buckets),
@@ -102,6 +127,15 @@ func RateLimit(limiter Limiter, cfg RateLimitConfig, log ports.Logger, keys Rate
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func bucketClientIP(buckets []Bucket) string {
+	for _, b := range buckets {
+		if b.Namespace == NamespaceIP || b.Namespace == NamespaceWebhookIP {
+			return b.ID
+		}
+	}
+	return ""
 }
 
 func writeRateLimited(w http.ResponseWriter, decision RateDecision) {

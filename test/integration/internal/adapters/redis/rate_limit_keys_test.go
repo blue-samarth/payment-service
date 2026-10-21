@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"samarth/payment-service/internal/adapters/redis"
@@ -17,12 +19,12 @@ import (
 
 type limiter struct{ rl *redis.RateLimiter }
 
-func (l limiter) Take(ctx context.Context, buckets []middleware.Bucket, capacity int64, rate float64, cost int64) middleware.RateDecision {
+func (l limiter) Take(ctx context.Context, buckets []middleware.Bucket, cost int64) middleware.RateDecision {
 	keys := make([]redis.Bucket, len(buckets))
 	for i, b := range buckets {
-		keys[i] = redis.Bucket{Namespace: b.Namespace, ID: b.ID}
+		keys[i] = redis.Bucket{Namespace: b.Namespace, ID: b.ID, Capacity: b.Capacity, RefillPerSec: b.RefillPerSec}
 	}
-	res := l.rl.Take(ctx, keys, capacity, rate, cost)
+	res := l.rl.Take(ctx, keys, cost)
 	return middleware.RateDecision{Allowed: res.Allowed, RetryAfter: res.RetryAfter}
 }
 
@@ -42,10 +44,15 @@ var (
 
 const oneShot = 0.0001
 
+func limitsOf(capacity int64) middleware.Limits {
+	l := middleware.Limit{Capacity: capacity, RefillPerSec: oneShot}
+	return middleware.Limits{Merchant: l, User: l, IP: l}
+}
+
 func merchantStack(lim middleware.Limiter, capacity int64, throttle *middleware.AuthThrottle) http.Handler {
 	provider := middleware.NewStaticTokenProvider(map[string]string{tokenA: "merchant-a", tokenB: "merchant-b"}, nil)
 	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	limited := middleware.RateLimit(lim, middleware.RateLimitConfig{Capacity: capacity, RefillPerSec: oneShot}, quietLog{}, middleware.RequestKeys(nil))(ok)
+	limited := middleware.RateLimit(lim, quietLog{}, middleware.RequestKeys(nil, limitsOf(capacity)))(ok)
 	return middleware.Authenticate(provider, quietLog{}, throttle)(limited)
 }
 
@@ -87,7 +94,7 @@ func TestRateLimitKeys_MerchantCannotDrainAWebhookBucket(t *testing.T) {
 	}
 
 	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	webhook := middleware.RateLimit(lim, middleware.RateLimitConfig{Capacity: 1, RefillPerSec: oneShot}, quietLog{}, middleware.WebhookKeys(nil))(ok)
+	webhook := middleware.RateLimit(lim, quietLog{}, middleware.WebhookKeys(nil, middleware.Limit{Capacity: 1, RefillPerSec: oneShot}))(ok)
 	req := httptest.NewRequest(http.MethodPost, "/webhooks/gateway/stripe", nil)
 	req.RemoteAddr = "198.51.100.7:1"
 	rec := httptest.NewRecorder()
@@ -97,11 +104,11 @@ func TestRateLimitKeys_MerchantCannotDrainAWebhookBucket(t *testing.T) {
 	}
 }
 
-func TestRateLimitKeys_AuthFailuresAreThrottledPerIP(t *testing.T) {
+func TestRateLimitKeys_AuthFailuresAreThrottledPerIdentity(t *testing.T) {
 	c := testsupport.RequireRedis(t)
 	testsupport.FlushRedis(t, c)
 	lim := limiter{rateLimiter(c)}
-	throttle := &middleware.AuthThrottle{Limiter: lim, Capacity: 2, RefillPerSec: oneShot}
+	throttle := &middleware.AuthThrottle{Limiter: lim, Limit: middleware.Limit{Capacity: 2, RefillPerSec: oneShot}}
 	h := merchantStack(lim, 100, throttle)
 
 	for i := range 2 {
@@ -110,12 +117,39 @@ func TestRateLimitKeys_AuthFailuresAreThrottledPerIP(t *testing.T) {
 		}
 	}
 	if code := send(h, "wrong-token", "", "203.0.113.9:1"); code != http.StatusTooManyRequests {
-		t.Fatalf("once the IP is out of auth-failure tokens it gets 429, got %d", code)
+		t.Fatalf("once the identity is out of auth-failure tokens it gets 429, got %d", code)
 	}
 	if code := send(h, tokenA, "", "203.0.113.9:1"); code != http.StatusTooManyRequests {
-		t.Fatalf("the block applies before the token is checked, got %d", code)
+		t.Fatalf("a correct token is not confirmed while the identity is exhausted, got %d", code)
 	}
 	if code := send(h, tokenA, "", "203.0.113.10:1"); code != http.StatusOK {
-		t.Fatalf("other addresses are unaffected, got %d", code)
+		t.Fatalf("other identities are unaffected, got %d", code)
+	}
+}
+
+func TestRateLimitKeys_ConcurrentAuthFailuresAreCappedAtCapacity(t *testing.T) {
+	c := testsupport.RequireRedis(t)
+	testsupport.FlushRedis(t, c)
+	lim := limiter{rateLimiter(c)}
+	const capacity = 5
+	throttle := &middleware.AuthThrottle{Limiter: lim, Limit: middleware.Limit{Capacity: capacity, RefillPerSec: oneShot}}
+	h := merchantStack(lim, 1000, throttle)
+
+	const parallel = 100
+	var answered atomic.Int64
+	var wg sync.WaitGroup
+	for range parallel {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if send(h, "wrong-token", "", "203.0.113.20:1") == http.StatusUnauthorized {
+				answered.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if answered.Load() != capacity {
+		t.Fatalf("%d parallel bad tokens must get exactly %d answers through the atomic Lua take, got %d", parallel, capacity, answered.Load())
 	}
 }

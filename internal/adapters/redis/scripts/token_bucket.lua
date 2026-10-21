@@ -1,22 +1,25 @@
-local capacity  = tonumber(ARGV[1])
-local rate      = tonumber(ARGV[2])
-local now_ms    = tonumber(ARGV[3])
-local requested = tonumber(ARGV[4])
+local now_ms    = tonumber(ARGV[1])
+local requested = tonumber(ARGV[2])
 local need      = math.max(requested, 1)
-
-local ttl
-if rate <= 0 then
-  ttl = 3600
-else
-  ttl = math.ceil(capacity / rate) + 10
-end
 
 local n = #KEYS
 local refilled = {}
+local ttls = {}
 local allowed = 1
 local max_wait = 0
 
 for i = 1, n do
+  local capacity = tonumber(ARGV[1 + 2 * i])
+  local rate     = tonumber(ARGV[2 + 2 * i])
+
+  local ttl
+  if rate <= 0 then
+    ttl = 3600
+  else
+    ttl = math.ceil(capacity / rate) + 10
+  end
+  ttls[i] = ttl
+
   local data    = redis.call('HMGET', KEYS[i], 'tokens', 'last_ms')
   local tokens  = tonumber(data[1])
   local last_ms = tonumber(data[2])
@@ -41,13 +44,11 @@ for i = 1, n do
   end
 end
 
-for i = 1, n do
-  local tokens = refilled[i]
-  if allowed == 1 then
-    tokens = tokens - requested
+if allowed == 1 and requested > 0 then
+  for i = 1, n do
+    redis.call('HMSET', KEYS[i], 'tokens', refilled[i] - requested, 'last_ms', now_ms)
+    redis.call('EXPIRE', KEYS[i], ttls[i])
   end
-  redis.call('HMSET', KEYS[i], 'tokens', tokens, 'last_ms', now_ms)
-  redis.call('EXPIRE', KEYS[i], ttl)
 end
 
 return { allowed, max_wait }

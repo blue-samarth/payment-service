@@ -22,6 +22,10 @@ func validatableConfig() *Config {
 	c.RateLimit.FallbackMultiplier = 0.5
 	c.RateLimit.Capacity = 100
 	c.RateLimit.RefillPerSec = 50
+	c.RateLimit.UserCapacity = 20
+	c.RateLimit.UserRefillPerSec = 5
+	c.RateLimit.WebhookCapacity = 300
+	c.RateLimit.WebhookRefillPerSec = 100
 	c.Routing.FXReconciliationTolerancePct = 1.0
 	c.Gateway.HTTPTimeout = 30 * time.Second
 	c.Gateway.MaxAttempts = 3
@@ -72,6 +76,8 @@ func setRequiredEnv(t *testing.T) {
 		"SERVICE_TOKENS", "OPS_TOKENS", "WEBHOOK_SECRETS", "TRUSTED_PROXY_CIDRS",
 		"RATE_LIMIT_CAPACITY", "RATE_LIMIT_REFILL_PER_SEC", "CIRCUIT_BREAKER_FAILURE_THRESHOLD",
 		"AUTH_FAILURE_LIMIT_CAPACITY", "AUTH_FAILURE_REFILL_PER_SEC",
+		"RATE_LIMIT_USER_CAPACITY", "RATE_LIMIT_USER_REFILL_PER_SEC",
+		"RATE_LIMIT_WEBHOOK_CAPACITY", "RATE_LIMIT_WEBHOOK_REFILL_PER_SEC",
 		"SHUTDOWN_DRAIN_DELAY", "SHUTDOWN_TIMEOUT",
 	} {
 		t.Setenv(k, "")
@@ -596,6 +602,43 @@ func TestLoadConfig_AuthFailureLimit(t *testing.T) {
 			t.Setenv(key, raw)
 			if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), key) {
 				t.Fatalf("an unparseable %s must fail startup, got: %v", key, err)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_UserAndWebhookLimits(t *testing.T) {
+	setRequiredEnv(t)
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.RateLimit.UserCapacity != 20 || c.RateLimit.UserRefillPerSec != 5 {
+		t.Errorf("user defaults = %d/%v, want 20/5", c.RateLimit.UserCapacity, c.RateLimit.UserRefillPerSec)
+	}
+	if c.RateLimit.WebhookCapacity != 300 || c.RateLimit.WebhookRefillPerSec != 100 {
+		t.Errorf("webhook defaults = %d/%v, want 300/100", c.RateLimit.WebhookCapacity, c.RateLimit.WebhookRefillPerSec)
+	}
+}
+
+func TestValidate_UserAndWebhookLimits(t *testing.T) {
+	cases := map[string]struct {
+		mutate func(*Config)
+		want   string
+	}{
+		"user capacity zero":    {func(c *Config) { c.RateLimit.UserCapacity = 0 }, "RATE_LIMIT_USER_CAPACITY must be at least 1"},
+		"user refill zero":      {func(c *Config) { c.RateLimit.UserRefillPerSec = 0 }, "RATE_LIMIT_USER_REFILL_PER_SEC"},
+		"webhook capacity zero": {func(c *Config) { c.RateLimit.WebhookCapacity = 0 }, "RATE_LIMIT_WEBHOOK_CAPACITY"},
+		"webhook refill zero":   {func(c *Config) { c.RateLimit.WebhookRefillPerSec = 0 }, "RATE_LIMIT_WEBHOOK_REFILL_PER_SEC"},
+		"user above merchant":   {func(c *Config) { c.RateLimit.UserCapacity = 101 }, "can never bind"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := validatableConfig()
+			tc.mutate(c)
+			if err := Validate(c); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want %q, got: %v", tc.want, err)
 			}
 		})
 	}

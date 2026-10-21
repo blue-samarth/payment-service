@@ -40,42 +40,48 @@ func MerchantIDFromContext(ctx context.Context) string {
 }
 
 type AuthThrottle struct {
-	Limiter      Limiter
-	ClientIP     *ClientIP
-	Capacity     int64
-	RefillPerSec float64
+	Limiter  Limiter
+	ClientIP *ClientIP
+	Limit    Limit
 }
 
-func (t *AuthThrottle) bucket(r *http.Request) []Bucket {
-	return []Bucket{{Namespace: NamespaceAuthFailure, ID: bucketIP(t.ClientIP.From(r))}}
-}
-
-func (t *AuthThrottle) check(r *http.Request) RateDecision {
-	if t == nil {
-		return RateDecision{Allowed: true}
+func (t *AuthThrottle) identity(r *http.Request) string {
+	if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		sum := sha256.Sum256(r.TLS.PeerCertificates[0].Raw)
+		return "cert:" + hex.EncodeToString(sum[:16])
 	}
-	return t.Limiter.Take(r.Context(), t.bucket(r), t.Capacity, t.RefillPerSec, 0)
+	return "ip:" + clientBucketIP(t.ClientIP, r)
 }
 
-func (t *AuthThrottle) recordFailure(r *http.Request) {
+func (t *AuthThrottle) admit(r *http.Request, authenticated bool) (RateDecision, string) {
 	if t == nil {
-		return
+		return RateDecision{Allowed: true}, ""
 	}
-	t.Limiter.Take(r.Context(), t.bucket(r), t.Capacity, t.RefillPerSec, 1)
+	id := t.identity(r)
+	var cost int64 = 1
+	if authenticated {
+		cost = 0
+	}
+	return t.Limiter.Take(r.Context(), []Bucket{{Namespace: NamespaceAuthFailure, ID: id, Limit: t.Limit}}, cost), id
 }
 
 func Authenticate(provider TokenProvider, log ports.Logger, throttle *AuthThrottle) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if decision := throttle.check(r); !decision.Allowed {
-				log.Warn(ports.LogEventAuthThrottled, map[string]any{"path": r.URL.Path, "remote_addr": r.RemoteAddr})
+			principal, ok := authenticate(r, provider)
+
+			if decision, identity := throttle.admit(r, ok); !decision.Allowed {
+				log.Warn(ports.LogEventAuthThrottled, map[string]any{
+					"path":        r.URL.Path,
+					"identity":    identity,
+					"client_ip":   clientBucketIP(throttle.ClientIP, r),
+					"remote_addr": r.RemoteAddr,
+				})
 				writeRateLimited(w, decision)
 				return
 			}
 
-			principal, ok := authenticate(r, provider)
 			if !ok {
-				throttle.recordFailure(r)
 				log.Warn("auth.rejected", map[string]any{"path": r.URL.Path})
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)

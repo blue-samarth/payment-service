@@ -23,13 +23,14 @@ type Timeouts struct {
 }
 
 type Listener struct {
-	Name      string
-	Addr      string
-	Handler   http.Handler
-	TLS       *tls.Config
-	Transport string
-	Timeouts  Timeouts
-	DrainLast bool
+	Name           string
+	Addr           string
+	Handler        http.Handler
+	TLS            *tls.Config
+	Transport      string
+	Timeouts       Timeouts
+	MaxHeaderBytes int
+	DrainLast      bool
 }
 
 type Options struct {
@@ -145,6 +146,7 @@ func bind(listeners []Listener) ([]running, error) {
 				ReadTimeout:       l.Timeouts.Read,
 				WriteTimeout:      l.Timeouts.Write,
 				IdleTimeout:       l.Timeouts.Idle,
+				MaxHeaderBytes:    l.MaxHeaderBytes,
 			},
 		})
 	}
