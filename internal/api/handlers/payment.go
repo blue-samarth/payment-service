@@ -55,9 +55,17 @@ func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	merchantID, err := uuid.Parse(req.MerchantID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_merchant_id", "merchant_id must be a valid UUID")
+	c, ok := requireCaller(w, r)
+	if !ok {
+		return
+	}
+	merchantID, err := c.merchantFor(req.MerchantID)
+	switch {
+	case errors.Is(err, errMerchantMismatch):
+		writeError(w, http.StatusForbidden, "merchant_mismatch", err.Error())
+		return
+	case err != nil:
+		writeError(w, http.StatusBadRequest, "invalid_merchant_id", err.Error())
 		return
 	}
 	if req.Amount <= 0 {
@@ -134,8 +142,13 @@ func (h *PaymentHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	c, ok := requireCaller(w, r)
+	if !ok {
+		return
+	}
+
 	txn, err := h.svc.GetPayment(r.Context(), id)
-	if err != nil {
+	if err != nil || !c.owns(txn) {
 		writeError(w, http.StatusNotFound, "not_found", "payment not found")
 		return
 	}

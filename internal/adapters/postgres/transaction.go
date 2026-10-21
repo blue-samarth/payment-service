@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"samarth/payment-service/internal/domain/transaction"
+	"samarth/payment-service/internal/ports"
 )
 
 type TransactionRepository struct {
@@ -22,7 +23,7 @@ func NewTransactionRepository(db *DB, q *Queries) *TransactionRepository {
 	return &TransactionRepository{db: db, q: q}
 }
 
-var ErrNotFound = errors.New("transaction not found")
+var ErrNotFound = fmt.Errorf("transaction %w", ports.ErrNotFound)
 var ErrVersionConflict = errors.New("transaction version conflict")
 
 func (r *TransactionRepository) Insert(ctx context.Context, t *transaction.Transaction) error {

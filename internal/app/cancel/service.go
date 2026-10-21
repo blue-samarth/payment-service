@@ -45,6 +45,7 @@ func (s *Service) SetIdempotency(g *idempotency.Guard) { s.idem = g }
 
 type CancelInput struct {
 	TransactionID  uuid.UUID
+	MerchantID     uuid.UUID
 	By             transaction.Actor
 	Via            transaction.CancelVia
 	IdempotencyKey string
@@ -56,6 +57,10 @@ type idempotencyCancelResponse struct {
 }
 
 func (s *Service) Cancel(ctx context.Context, in CancelInput) (Result, error) {
+	if err := s.checkOwner(ctx, in); err != nil {
+		return Result{}, err
+	}
+
 	if s.idem == nil {
 		outcome, status, err := s.cancel(ctx, in)
 		if err != nil {
@@ -100,6 +105,20 @@ func (s *Service) Cancel(ctx context.Context, in CancelInput) (Result, error) {
 	default:
 		return Result{Verdict: res.Verdict}, nil
 	}
+}
+
+func (s *Service) checkOwner(ctx context.Context, in CancelInput) error {
+	if in.MerchantID == uuid.Nil {
+		return nil
+	}
+	txn, err := s.txns.GetByID(ctx, in.TransactionID)
+	if err != nil {
+		return fmt.Errorf("cancel: load transaction %s: %w", in.TransactionID, err)
+	}
+	if txn.MerchantID != in.MerchantID {
+		return fmt.Errorf("cancel: transaction %s: %w", in.TransactionID, ports.ErrNotFound)
+	}
+	return nil
 }
 
 func (s *Service) cancel(ctx context.Context, in CancelInput) (Outcome, transaction.Status, error) {

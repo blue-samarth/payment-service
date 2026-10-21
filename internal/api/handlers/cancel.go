@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 
 	"github.com/google/uuid"
 
 	appcancel "samarth/payment-service/internal/app/cancel"
 	"samarth/payment-service/internal/app/idempotency"
-	"samarth/payment-service/internal/domain/transaction"
+	"samarth/payment-service/internal/ports"
 )
 
 type CancelService interface {
@@ -40,15 +41,25 @@ func (h *CancelHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 
 	var req cancelRequest
 	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			writeError(w, http.StatusBadRequest, "invalid_request_body", "request body is not valid JSON")
+			return
+		}
 	}
-	actor := transaction.Actor(req.Actor)
-	if actor == "" {
-		actor = transaction.ActorMerchant
+
+	c, ok := requireCaller(w, r)
+	if !ok {
+		return
 	}
-	via := transaction.CancelVia(req.Via)
-	if via == "" {
-		via = transaction.CancelViaAPI
+	actor, err := c.actorFor("actor", req.Actor)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_actor", err.Error())
+		return
+	}
+	via, err := c.viaFor(req.Via)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_via", err.Error())
+		return
 	}
 
 	idemKey := r.Header.Get("Idempotency-Key")
@@ -59,16 +70,20 @@ func (h *CancelHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.svc.Cancel(r.Context(), appcancel.CancelInput{
 		TransactionID:  transactionID,
+		MerchantID:     c.merchant,
 		By:             actor,
 		Via:            via,
 		IdempotencyKey: idemKey,
 	})
 	if err != nil {
-		if errors.Is(err, idempotency.ErrKeyRequired) {
+		switch {
+		case errors.Is(err, ports.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "payment not found")
+		case errors.Is(err, idempotency.ErrKeyRequired):
 			writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required")
-			return
+		default:
+			writeError(w, http.StatusInternalServerError, "cancel_failed", "could not process cancellation")
 		}
-		writeError(w, http.StatusInternalServerError, "cancel_failed", "could not process cancellation")
 		return
 	}
 

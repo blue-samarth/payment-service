@@ -11,6 +11,7 @@ import (
 	"samarth/payment-service/internal/app/idempotency"
 	apprefund "samarth/payment-service/internal/app/refund"
 	domainrefund "samarth/payment-service/internal/domain/refund"
+	"samarth/payment-service/internal/ports"
 )
 
 type RefundService interface {
@@ -56,8 +57,14 @@ func (h *RefundHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_reason", "reason is required")
 		return
 	}
-	if req.InitiatedBy == "" {
-		req.InitiatedBy = "api"
+	c, ok := requireCaller(w, r)
+	if !ok {
+		return
+	}
+	initiatedBy, err := c.actorFor("initiated_by", req.InitiatedBy)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_initiated_by", err.Error())
+		return
 	}
 
 	idemKey := r.Header.Get("Idempotency-Key")
@@ -68,14 +75,17 @@ func (h *RefundHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.svc.InitiateRefund(r.Context(), apprefund.InitiateInput{
 		TransactionID:  transactionID,
+		MerchantID:     c.merchant,
 		Amount:         req.Amount,
 		Reason:         req.Reason,
-		InitiatedBy:    req.InitiatedBy,
+		InitiatedBy:    string(initiatedBy),
 		IdempotencyKey: idemKey,
 	})
 	if err != nil {
 		var over domainrefund.ErrOverRefund
 		switch {
+		case errors.Is(err, ports.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "payment not found")
 		case errors.Is(err, apprefund.ErrNotRefundable):
 			writeError(w, http.StatusUnprocessableEntity, "not_refundable", "transaction is not in a refundable state")
 		case errors.As(err, &over):

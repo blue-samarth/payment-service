@@ -4,6 +4,7 @@ import . "samarth/payment-service/internal/app/cancel"
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
@@ -47,6 +48,26 @@ func txnWith(status transaction.Status, intent bool) *transaction.Transaction {
 	t.Status = status
 	t.CancelIntent = intent
 	return t
+}
+
+func TestCancel_AnotherMerchantsTransactionIsNotFound(t *testing.T) {
+	store := &fakeStore{txn: txnWith(transaction.StatusProcessing, false), setResult: true}
+	s := NewService(store, noopLogger{}, noopMetrics{})
+
+	_, err := s.Cancel(context.Background(), CancelInput{TransactionID: store.txn.ID, MerchantID: uuid.New(), By: transaction.ActorMerchant, Via: transaction.CancelViaAPI})
+	if !errors.Is(err, ports.ErrNotFound) {
+		t.Fatalf("expected ports.ErrNotFound, got %v", err)
+	}
+	if store.setCalls != 0 {
+		t.Fatal("no intent may be set on another merchant's transaction")
+	}
+
+	if _, err := s.Cancel(context.Background(), CancelInput{TransactionID: store.txn.ID, MerchantID: store.txn.MerchantID, By: transaction.ActorMerchant, Via: transaction.CancelViaAPI}); err != nil {
+		t.Fatalf("the owner must be able to cancel, got %v", err)
+	}
+	if store.setCalls != 1 {
+		t.Fatalf("expected the owner's cancel to set intent once, got %d", store.setCalls)
+	}
 }
 
 func TestCancel_AlreadyTerminal(t *testing.T) {

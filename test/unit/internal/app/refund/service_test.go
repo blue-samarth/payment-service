@@ -195,6 +195,25 @@ func TestInitiateRefund_Success(t *testing.T) {
 	}
 }
 
+func TestInitiateRefund_AnotherMerchantsTransactionIsNotFound(t *testing.T) {
+	parent := succeededTxn(100000)
+	refunds := &fakeRefunds{}
+	outbox := &fakeOutbox{}
+	s := svc(&fakeTxns{txn: parent}, refunds, outbox)
+
+	_, err := s.InitiateRefund(context.Background(), InitiateInput{TransactionID: parent.ID, MerchantID: uuid.New(), Amount: 100, Reason: "r", InitiatedBy: "merchant"})
+	if !errors.Is(err, ports.ErrNotFound) {
+		t.Fatalf("expected ports.ErrNotFound, got %v", err)
+	}
+	if len(refunds.inserted) != 0 || len(outbox.events) != 0 {
+		t.Error("nothing may be written for another merchant's transaction")
+	}
+
+	if _, err := s.InitiateRefund(context.Background(), InitiateInput{TransactionID: parent.ID, MerchantID: parent.MerchantID, Amount: 100, Reason: "r", InitiatedBy: "merchant"}); err != nil {
+		t.Fatalf("the owner must be able to refund, got %v", err)
+	}
+}
+
 func TestInitiateRefund_NotRefundable(t *testing.T) {
 	parent := succeededTxn(100000)
 	parent.Status = transaction.StatusPending
