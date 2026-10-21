@@ -32,7 +32,7 @@ const (
 	LogEventOutboxPublishFailure = "outbox.publish_failure"
 	LogEventOutboxDeadLetter     = "outbox.dead_letter"
 	LogEventOutboxReplay         = "outbox.replay"
-	LogEventRelayModeSwitch      = "relay.mode_switch"
+	LogEventRelayStarted         = "relay.started"
 	LogEventRelayConsumerStale   = "relay.consumer_stale"
 
 	LogEventRefundInitiated         = "refund.initiated"
@@ -82,7 +82,7 @@ const (
 	LogEventPartitionCreated           = "partition.created"
 	LogEventPartitionDetached          = "partition.detached"
 	LogEventPartitionDropped           = "partition.dropped"
-	LogEventPartitionManagementSkipped = "partition.management_skipped_wal_lag"
+	LogEventPartitionManagementSkipped = "partition.management_skipped"
 )
 
 const (

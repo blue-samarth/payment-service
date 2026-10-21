@@ -52,7 +52,7 @@ Supported payment methods: card, UPI, netbanking, wallet (varies by gateway capa
 Key reliability properties the service is built around:
 
 - **No lost writes**: every state change that must also emit an event does so inside one DB transaction via the **transactional outbox** pattern.
-- **No duplicate side effects**: idempotency is enforced both at the HTTP layer (whole-response caching) and the business layer (`idempotency.Guard`), plus a DB-level advisory lock on the parent transaction for refund sums.
+- **No duplicate side effects**: idempotency is enforced in the business layer (`idempotency.Guard`, reserve and operation in one database transaction), plus a DB-level advisory lock on the parent transaction for refund sums.
 - **No double-charging on ambiguous gateway failures**: the fallback logic distinguishes "definitely declined" (safe to retry elsewhere) from "unknown, maybe charged" (never retried automatically).
 - **Self-healing on stuck payments**: a background reaper reconciles any transaction whose processing lease expired without a resolution.
 
@@ -69,7 +69,7 @@ flowchart TB
 
     subgraph "cmd/api — HTTP server"
         Router[api.Router]
-        MW[Middleware chain:<br/>RequestID → Recover → Auth →<br/>RateLimit → Idempotency]
+        MW[Middleware chain:<br/>RequestID → Recover → Auth →<br/>RateLimit]
         Handlers[Payment / Refund / Cancel /<br/>Webhook / Health handlers]
     end
 
@@ -163,7 +163,7 @@ internal/
     observability/ slog logger with field redaction, no-op metrics
   api/
     handlers/      HTTP handlers (payment, refund, cancel, webhook, health)
-    middleware/    Auth, RateLimit, ClientIP, Idempotency, RequestID, Recover
+    middleware/    Auth, RateLimit, ClientIP, RequestID, Recover
   server/          Listener lifecycle: bind, serve, drain, concurrent shutdown
   jobs/
     partition_manager/  Weekly outbox partition lifecycle
@@ -272,7 +272,7 @@ sequenceDiagram
 
 Key implementation details:
 
-- **`Idempotency-Key` is mandatory** on `POST /payments` and `POST /payments/{id}/refunds`. It's combined with `merchantID + operation` into a composite hash (`idempotency.Composite`), and the request body is hashed (`idempotency.RequestHash`) to detect key reuse with a different payload (→ `409 idempotency_key_reused`).
+- **`Idempotency-Key` is mandatory** on `POST /payments`, `POST /payments/{id}/refunds` and `POST /payments/{id}/cancel`. It's combined with a scope (the merchant ID, or the transaction ID for cancel) and the operation into a composite hash (`idempotency.Composite`), and the request body is hashed (`idempotency.RequestHash`) to detect key reuse with a different payload (→ `409 idempotency_key_reused`).
 - **The processing lease** (`processing_lease` table, `LeaseStore.Acquire`) prevents two concurrent `ProcessPayment` calls (e.g., a client retry racing the reaper) from both calling the gateway. If the lease isn't acquired, the current (possibly still-`PENDING`) transaction is returned untouched.
 - **`EstimatedTimeoutSeconds`** comes from `ConfigStore.GetProcessingTimeout(gateway, method)` and becomes the lease TTL — it must be positive or transaction creation fails.
 - If `ProcessPayment` errors after a successful `CreatePayment` (e.g. gateway adapter unavailable), the handler returns **`202 Accepted`** with the created-but-unprocessed transaction rather than failing the whole request.
@@ -388,10 +388,9 @@ stateDiagram-v2
 
 ## 9. Idempotency
 
-Idempotency is enforced at **two layers**, both following the same Reserve → run-or-lookup → Complete shape:
+Idempotency is enforced in **one place**, the business layer: `app/idempotency.Guard`, used by `payment.Service.CreatePayment`, `refund.Service.InitiateRefund` and `cancel.Service.Cancel` to guard the domain operation itself (insert + outbox write), independent of how it is invoked. There is no HTTP response cache in front of it: a replay reloads the current state from Postgres rather than returning a stored snapshot, so a retried payment that has since settled reports `SUCCEEDED`, not the `PENDING` it got the first time.
 
-1. **HTTP layer** (`middleware.Idempotency`): caches the *entire HTTP response* (status + body) keyed by `merchant + method + path + Idempotency-Key`, scoped per merchant so two different merchants can safely reuse the same key string.
-2. **Business layer** (`app/idempotency.Guard`): used inside `payment.Service.CreatePayment` and `refund.Service.InitiateRefund` to guard the underlying domain operation itself (insert + outbox write), independent of how it's invoked.
+Composite keys are scoped per operation: create-payment and initiate-refund by the token-bound merchant (so two merchants can reuse the same key string safely), cancel by the transaction ID.
 
 ```mermaid
 flowchart TD
@@ -421,11 +420,11 @@ Four possible verdicts, mapped to distinct HTTP outcomes by the handlers:
 | Verdict | Meaning | HTTP response |
 |---|---|---|
 | `Created` | First time seeing this key; op ran | `201 Created` |
-| `Replayed` | Op already completed; cached response returned | `200 OK` |
+| `Replayed` | Op already completed; the stored result (for example the created transaction ID) is used to reload current state | `200 OK` with the current resource |
 | `InProgress` | Another request with this key is still running | `409 idempotency_in_progress` |
 | `KeyReused` | Same key, different request body | `409 idempotency_key_reused` |
 
-A failed op **rolls back the reservation** (the whole guard runs inside `Transactor.WithinTx`), so a request that errors midway doesn't permanently strand the key — a retry can claim it fresh. At the HTTP layer specifically, a `5xx` response is deliberately **not cached** and the reservation is released, for the same reason.
+A failed op **rolls back the reservation** (the whole guard runs inside `Transactor.WithinTx`), so a request that errors midway doesn't permanently strand the key — a retry can claim it fresh.
 
 ---
 
@@ -770,7 +769,7 @@ The webhook listener needs a publicly trusted certificate, unlike the private-CA
 | Merchant | `GET` | `/payments/{id}` | service/ops token | Fetch a transaction by ID |
 | Merchant | `POST` | `/payments/{id}/refunds` | service/ops token | Initiate + immediately attempt a refund. Requires `Idempotency-Key`. |
 | Merchant | `POST` | `/payments/{id}/resolve` | ops token only | Settle a payment marked for manual review (§13): `{"status":"SUCCEEDED"\|"FAILED","gateway_reference_id":"…","note":"…"}`. `403` without an ops principal, `409` if not under review |
-| Merchant | `POST` | `/payments/{id}/cancel` | service/ops token | Request cancellation (idempotent; safe on already-terminal transactions) |
+| Merchant | `POST` | `/payments/{id}/cancel` | service/ops token | Request cancellation (idempotent; safe on already-terminal transactions). Requires `Idempotency-Key`. |
 | Webhook | `POST` | `/webhooks/gateway/{gateway_id}` | gateway signature | Inbound gateway status callback |
 | Health | `GET` | `/health` | none | Liveness: the process is serving; no dependency calls |
 | Health | `GET` | `/health-db` | none | Postgres reachability (`503` when down) |
@@ -834,6 +833,7 @@ Deployments that ran the single-listener build must change the following togethe
 | Webhook rate limit | Merchant limits (100 / 50 per s) | Own limit, 300 / 100 per s (`RATE_LIMIT_WEBHOOK_*`) | None. |
 | Rate-limit buckets | — | New Redis keys for user and webhook buckets | None. Those counters start fresh once on deploy. |
 | `OUTBOX_RELAY_MODE` | Defaulted to `cdc`, which was never implemented; the relay polled regardless | Defaults to `polling`; `cdc` fails startup | Remove `OUTBOX_RELAY_MODE=cdc` from manifests (or set `polling`). The CDC-only `OUTBOX_RELAY_WAL_LAG_*`, `_SLOT_SIZE_ALERT_MB`, `_CONSUMER_HEARTBEAT_TIMEOUT_SEC` and `_RECONNECT_INTERVAL_SEC` are ignored and can be deleted. |
+| Log and schema names | `relay.mode_switch`, `partition.management_skipped_wal_lag`, `partition_management_log.wal_lag_mb` | `relay.started`, `partition.management_skipped`; migration `000008` drops the never-written `wal_lag_mb` column | Update any log-based alerts or dashboards using the old event names. Run migrations before rollout. |
 | `WEBHOOK_TLS_MODE=lb` rate limiting | Silent | Startup warning `rate_limit.proxy_untrusted` when `TRUSTED_PROXY_CIDRS` is empty | Use an LB that sets `X-Forwarded-For` and list its subnets. |
 | Token strength | Any length | Service and ops tokens at least 32 characters | Rotate short tokens before rolling out. |
 | Production guardrails | `ALLOW_NO_AUTH=true` and `MTLS_STRICT_MODE=false` accepted everywhere | Both fail startup when `ENVIRONMENT=prod` | Remove them from production manifests. |
