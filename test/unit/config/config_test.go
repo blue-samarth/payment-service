@@ -14,8 +14,7 @@ func validatableConfig() *Config {
 	c := &Config{}
 	c.App.Environment = "dev"
 	c.Observability.LogLevel = "info"
-	c.Outbox.WALLagAlertThresholdMB = 2000
-	c.Outbox.WALLagCriticalThresholdMB = 5000
+	c.Outbox.RelayMode = RelayModePolling
 	c.Outbox.PollIntervalSec = 10
 	c.Outbox.ClaimTTLSec = 60
 	c.Outbox.WorkerCount = 1
@@ -80,6 +79,7 @@ func setRequiredEnv(t *testing.T) {
 		"AUTH_FAILURE_LIMIT_CAPACITY", "AUTH_FAILURE_REFILL_PER_SEC",
 		"RATE_LIMIT_USER_CAPACITY", "RATE_LIMIT_USER_REFILL_PER_SEC",
 		"RATE_LIMIT_IP_CAPACITY", "RATE_LIMIT_IP_REFILL_PER_SEC",
+		"OUTBOX_RELAY_MODE",
 		"RATE_LIMIT_WEBHOOK_CAPACITY", "RATE_LIMIT_WEBHOOK_REFILL_PER_SEC",
 		"SHUTDOWN_DRAIN_DELAY", "SHUTDOWN_TIMEOUT",
 	} {
@@ -686,6 +686,44 @@ func TestValidate_AuthFailureLimit(t *testing.T) {
 	c.RateLimit.AuthFailureRefillPerSec = 0
 	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "AUTH_FAILURE_REFILL_PER_SEC") {
 		t.Fatalf("an enabled throttle needs a positive refill, got: %v", err)
+	}
+}
+
+func TestLoadConfig_RelayModeIsPollingOnly(t *testing.T) {
+	setRequiredEnv(t)
+
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if c.Outbox.RelayMode != RelayModePolling {
+		t.Errorf("the relay only polls, so the default must say so, got %q", c.Outbox.RelayMode)
+	}
+
+	t.Setenv("OUTBOX_RELAY_MODE", "polling")
+	if _, err := LoadConfig(); err != nil {
+		t.Fatalf("polling is accepted explicitly, got: %v", err)
+	}
+
+	t.Setenv("OUTBOX_RELAY_MODE", "cdc")
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "OUTBOX_RELAY_MODE=cdc is not implemented") {
+		t.Fatalf("asking for CDC must fail loudly instead of silently polling, got: %v", err)
+	}
+
+	t.Setenv("OUTBOX_RELAY_MODE", "kafka")
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "OUTBOX_RELAY_MODE must be 'polling'") {
+		t.Fatalf("an unknown mode must be rejected, got: %v", err)
+	}
+}
+
+func TestLoadConfig_LeftoverCDCVariablesAreIgnored(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("OUTBOX_RELAY_WAL_LAG_ALERT_THRESHOLD_MB", "9000")
+	t.Setenv("OUTBOX_RELAY_WAL_LAG_CRITICAL_THRESHOLD_MB", "100")
+	t.Setenv("OUTBOX_RELAY_SLOT_SIZE_ALERT_MB", "not-a-number")
+
+	if _, err := LoadConfig(); err != nil {
+		t.Fatalf("settings for a relay mode that does not exist must not be read or validated, got: %v", err)
 	}
 }
 

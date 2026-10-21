@@ -798,7 +798,7 @@ All configuration is via environment variables, loaded and validated in `config/
 | App | `ENVIRONMENT` (prod/staging/dev), `PORT`, `WEBHOOK_PORT`, `HEALTH_PORT`, `WEBHOOK_TLS_MODE` (`app`\|`lb`), `MTLS_STRICT_MODE`, `SHUTDOWN_DRAIN_DELAY` (5s), `SHUTDOWN_TIMEOUT` (gateway budget + 15s) | The three ports must be distinct. `SHUTDOWN_TIMEOUT` must be at least the gateway budget. With `ENVIRONMENT=prod`, `MTLS_STRICT_MODE=false` and `ALLOW_NO_AUTH=true` fail startup; `REDIS_TLS_ENABLED=false` and `WEBHOOK_TLS_MODE=lb` stay allowed (the first logs a warning) |
 | Database | `DATABASE_PRIMARY_HOST`, `DATABASE_REPLICA_HOST`, `DATABASE_NAME/USER/PASSWORD`, `DATABASE_SSL_MODE` | Pool sizing via `DATABASE_MAX_OPEN_CONNS` etc. |
 | Redis | `REDIS_ADDRS` (single primary endpoint), `REDIS_TLS_ENABLED`, `REDIS_USERNAME`, `REDIS_PASSWORD`, separate DBs for rate-limit vs. cache | Cluster mode is unsupported: it has only database 0 |
-| Outbox | `OUTBOX_RELAY_MODE` (`cdc`\|`polling`), `OUTBOX_RELAY_BATCH_SIZE`, `OUTBOX_RELAY_MAX_ATTEMPTS`, WAL-lag alert thresholds | Shard count fixed at 64 by schema |
+| Outbox | `OUTBOX_RELAY_MODE` (`polling`, the only implementation), `OUTBOX_RELAY_POLL_INTERVAL_SEC`, `OUTBOX_RELAY_BATCH_SIZE`, `OUTBOX_RELAY_MAX_ATTEMPTS`, `OUTBOX_RELAY_CLAIM_TTL_SEC` | Shard count fixed at 64 by schema. `cdc` is rejected at startup: it was the default but never implemented, so the relay polled regardless. |
 | Rate limit | `RATE_LIMIT_CAPACITY` (100), `RATE_LIMIT_REFILL_PER_SEC` (50), `RATE_LIMIT_USER_CAPACITY` / `RATE_LIMIT_USER_REFILL_PER_SEC` (default: the merchant limit), `RATE_LIMIT_IP_CAPACITY` / `RATE_LIMIT_IP_REFILL_PER_SEC` (default: the merchant limit), `RATE_LIMIT_WEBHOOK_CAPACITY` (300), `RATE_LIMIT_WEBHOOK_REFILL_PER_SEC` (100), `AUTH_FAILURE_LIMIT_CAPACITY` (10, `0` disables), `AUTH_FAILURE_REFILL_PER_SEC` (0.1), `TRUSTED_PROXY_CIDRS` (empty), `RATE_LIMIT_FALLBACK_MULTIPLIER` (0,1], `RATE_LIMIT_LOCAL_MAX_BUCKETS` | `X-Forwarded-For` is ignored unless the peer is in `TRUSTED_PROXY_CIDRS` |
 | Routing | `ROUTING_SNAPSHOT_TTL_SECONDS`, `GATEWAY_FEE_CACHE_TTL_SEC`, `FX_RECONCILIATION_TOLERANCE_PCT` | |
 | Security | `TLS_CERT_FILE/KEY_FILE/CA_FILE`, `WEBHOOK_TLS_CERT_FILE/KEY_FILE`, `TLS_CERT_REFRESH_INTERVAL_SECONDS`, `DEK_CACHE_TTL_SECONDS` | Merchant TLS files are required; webhook files are required when `WEBHOOK_TLS_MODE=app` |
@@ -806,7 +806,7 @@ All configuration is via environment variables, loaded and validated in `config/
 | Gateways | `STRIPE_API_KEY`, `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`, `PAYU_MERCHANT_KEY`/`PAYU_MERCHANT_SALT`, plus `*_BASE_URL` overrides for testing, `CIRCUIT_BREAKER_FAILURE_THRESHOLD` (5) | |
 | Auth | `SERVICE_TOKENS` (`token=merchantUUID,...`), `OPS_TOKENS` (comma-separated), `WEBHOOK_SECRETS` (`gatewayID=secret,...`) | `SERVICE_TOKENS` splits each entry on its **last** `=`, so tokens may contain `=`; the merchant must be a UUID and is stored in canonical form. Service and ops tokens must be at least 32 characters. `WEBHOOK_SECRETS` splits on the **first** `=`, so secrets may contain `=`. Empty parts and duplicates fail startup; errors name the entry number, never the value. Omit all tokens and set `ALLOW_NO_AUTH=true` to run without auth (rejected when `ENVIRONMENT=prod`) |
 
-`Validate(c)` additionally enforces cross-field invariants, e.g. `OUTBOX_RELAY_WAL_LAG_ALERT_THRESHOLD_MB < OUTBOX_RELAY_WAL_LAG_CRITICAL_THRESHOLD_MB`.
+`Validate(c)` additionally enforces cross-field invariants, e.g. `OUTBOX_RELAY_CLAIM_TTL_SEC > OUTBOX_RELAY_POLL_INTERVAL_SEC`.
 
 ### Upgrading to the three-listener layout
 
@@ -833,6 +833,7 @@ Deployments that ran the single-listener build must change the following togethe
 | Rate-limit logs | One line per rejection | At most one line per second per event and process, with a `suppressed` count | Use the metrics for rates; logs are for identifying callers. |
 | Webhook rate limit | Merchant limits (100 / 50 per s) | Own limit, 300 / 100 per s (`RATE_LIMIT_WEBHOOK_*`) | None. |
 | Rate-limit buckets | — | New Redis keys for user and webhook buckets | None. Those counters start fresh once on deploy. |
+| `OUTBOX_RELAY_MODE` | Defaulted to `cdc`, which was never implemented; the relay polled regardless | Defaults to `polling`; `cdc` fails startup | Remove `OUTBOX_RELAY_MODE=cdc` from manifests (or set `polling`). The CDC-only `OUTBOX_RELAY_WAL_LAG_*`, `_SLOT_SIZE_ALERT_MB`, `_CONSUMER_HEARTBEAT_TIMEOUT_SEC` and `_RECONNECT_INTERVAL_SEC` are ignored and can be deleted. |
 | `WEBHOOK_TLS_MODE=lb` rate limiting | Silent | Startup warning `rate_limit.proxy_untrusted` when `TRUSTED_PROXY_CIDRS` is empty | Use an LB that sets `X-Forwarded-For` and list its subnets. |
 | Token strength | Any length | Service and ops tokens at least 32 characters | Rotate short tokens before rolling out. |
 | Production guardrails | `ALLOW_NO_AUTH=true` and `MTLS_STRICT_MODE=false` accepted everywhere | Both fail startup when `ENVIRONMENT=prod` | Remove them from production manifests. |

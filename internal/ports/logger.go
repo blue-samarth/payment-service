@@ -102,7 +102,6 @@ const (
 	FieldActor          = "actor"
 	FieldDurationMs     = "duration_ms"
 	FieldRelayMode      = "relay_mode"
-	FieldWALLagMB       = "wal_lag_mb"
 	FieldPartitionName  = "partition_name"
 	FieldMismatchType   = "mismatch_type"
 )
