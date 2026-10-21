@@ -137,7 +137,9 @@ func buildReaper(cfg *config.Config, db *postgres.DB, queries *postgres.Queries,
 	paymentSvc.SetIdempotency(idemGuard)
 	refundSvc.SetIdempotency(idemGuard)
 
-	return leaseexpiry.New(txnRepo, paymentSvc, idempotencyRepo, logger, leaseexpiry.Config{
+	reaper := leaseexpiry.New(txnRepo, paymentSvc, idempotencyRepo, logger, leaseexpiry.Config{
 		IdempotencyProcessingTimeout: time.Duration(cfg.Jobs.IdempotencyProcessingTimeoutSec) * time.Second,
 	})
+	reaper.SetReviewGauge(txnRepo, metrics)
+	return reaper
 }
