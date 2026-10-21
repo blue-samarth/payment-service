@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -157,7 +158,7 @@ func (r *RateLimiter) takeRedis(ctx context.Context, buckets []Bucket, cost int6
 	}
 
 	res, err := tokenBucketScript.Run(ctx, r.client, keys, args...).Int64Slice()
-	if err != nil && ctx.Err() != nil {
+	if err != nil && errors.Is(ctx.Err(), context.Canceled) {
 		return RateLimitResult{Allowed: false, RetryAfter: emptyBucketsRetry}
 	}
 	if err != nil || len(res) != 2 {

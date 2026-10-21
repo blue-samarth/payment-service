@@ -47,10 +47,9 @@ func NewMerchantRouter(deps Deps) http.Handler {
 				Limiter:  deps.Limiter,
 				ClientIP: deps.ClientIP,
 				Limit:    deps.AuthFailures,
-				Metrics:  deps.Metrics,
 			}
 		}
-		chain = append(chain, middleware.Authenticate(deps.Auth, deps.Logger, throttle))
+		chain = append(chain, middleware.Authenticate(deps.Auth, deps.Logger, deps.Metrics, throttle))
 	}
 	if deps.Limiter != nil {
 		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.Logger, deps.Metrics, middleware.RequestKeys(deps.ClientIP, deps.RateLimits)))

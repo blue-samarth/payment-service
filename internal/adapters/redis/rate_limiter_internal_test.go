@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"samarth/payment-service/config"
 )
@@ -196,6 +197,14 @@ func TestRateLimiter_CallerCancellationIsNotARedisFailure(t *testing.T) {
 	r.Take(context.Background(), []Bucket{bucket("ip", "1.2.3.4", 10, 1)}, 1)
 	if r.consecutiveFailures != 1 {
 		t.Fatalf("a real Redis error on a live request still counts, got %d", r.consecutiveFailures)
+	}
+
+	expired, cancelExpired := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancelExpired()
+	<-expired.Done()
+	r.Take(expired, []Bucket{bucket("ip", "1.2.3.4", 10, 1)}, 1)
+	if r.consecutiveFailures != 2 {
+		t.Fatalf("a deadline is a slow Redis, not a departed caller, so it must still count, got %d", r.consecutiveFailures)
 	}
 }
 

@@ -53,7 +53,7 @@ func merchantStack(lim middleware.Limiter, capacity int64, throttle *middleware.
 	provider := middleware.NewStaticTokenProvider(map[string]string{tokenA: "merchant-a", tokenB: "merchant-b"}, nil)
 	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	limited := middleware.RateLimit(lim, quietLog{}, nil, middleware.RequestKeys(nil, limitsOf(capacity)))(ok)
-	return middleware.Authenticate(provider, quietLog{}, throttle)(limited)
+	return middleware.Authenticate(provider, quietLog{}, nil, throttle)(limited)
 }
 
 func send(h http.Handler, token, userID, remote string) int {

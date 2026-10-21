@@ -44,7 +44,6 @@ type AuthThrottle struct {
 	Limiter  Limiter
 	ClientIP *ClientIP
 	Limit    Limit
-	Metrics  ports.MetricRecorder
 }
 
 func (t *AuthThrottle) identity(r *http.Request) string {
@@ -63,23 +62,23 @@ func (t *AuthThrottle) recordFailure(r *http.Request) (RateDecision, string) {
 	return t.Limiter.Take(r.Context(), []Bucket{{Namespace: NamespaceAuthFailure, ID: id, Limit: t.Limit}}, 1), id
 }
 
-func (t *AuthThrottle) count(metric string, tags map[string]string) {
-	if t != nil && t.Metrics != nil {
-		t.Metrics.Increment(metric, tags)
-	}
-}
-
-func Authenticate(provider TokenProvider, log ports.Logger, throttle *AuthThrottle) func(http.Handler) http.Handler {
+func Authenticate(provider TokenProvider, log ports.Logger, metrics ports.MetricRecorder, throttle *AuthThrottle) func(http.Handler) http.Handler {
 	throttledLog := newLogSampler(logSampleInterval)
 	rejectedLog := newLogSampler(logSampleInterval)
+	count := func(metric string, tags map[string]string) {
+		if metrics != nil {
+			metrics.Increment(metric, tags)
+		}
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			principal, ok := authenticate(r, provider)
 
 			if !ok {
+				count(ports.MetricAuthRejected, nil)
 				decision, identity := throttle.recordFailure(r)
 				if !decision.Allowed {
-					throttle.count(ports.MetricAuthThrottled, map[string]string{"identity_type": strings.SplitN(identity, ":", 2)[0]})
+					count(ports.MetricAuthThrottled, map[string]string{"identity_type": strings.SplitN(identity, ":", 2)[0]})
 					if emit, suppressed := throttledLog.allow(); emit {
 						log.Warn(ports.LogEventAuthThrottled, map[string]any{
 							"path":        r.URL.Path,
@@ -93,7 +92,6 @@ func Authenticate(provider TokenProvider, log ports.Logger, throttle *AuthThrott
 					return
 				}
 
-				throttle.count(ports.MetricAuthRejected, nil)
 				if emit, suppressed := rejectedLog.allow(); emit {
 					log.Warn(ports.LogEventAuthRejected, map[string]any{"path": r.URL.Path, "suppressed": suppressed})
 				}

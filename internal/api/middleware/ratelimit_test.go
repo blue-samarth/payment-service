@@ -108,7 +108,7 @@ var (
 
 func merchantChain(lim Limiter, keys RateLimitKeys, throttle *AuthThrottle) http.Handler {
 	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a", tokenB: "merchant-b"}, nil)
-	return Authenticate(provider, noopLog{}, throttle)(RateLimit(lim, noopLog{}, nil, keys)(okHandler()))
+	return Authenticate(provider, noopLog{}, nil, throttle)(RateLimit(lim, noopLog{}, nil, keys)(okHandler()))
 }
 
 func request(token, userID, remote string) *http.Request {
@@ -404,7 +404,7 @@ func TestRateLimit_WebhookKeysAreOneIPBucketWithTheWebhookLimit(t *testing.T) {
 func authThrottled(lim Limiter, capacity int64) http.Handler {
 	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a"}, nil)
 	throttle := &AuthThrottle{Limiter: lim, Limit: Limit{Capacity: capacity, RefillPerSec: 0.0001}}
-	return Authenticate(provider, noopLog{}, throttle)(okHandler())
+	return Authenticate(provider, noopLog{}, nil, throttle)(okHandler())
 }
 
 func TestAuthThrottle_OneCallPerRequest(t *testing.T) {
@@ -504,14 +504,15 @@ func TestAuthThrottle_LogsAreSampledMetricsAreNot(t *testing.T) {
 	log := &countingLog{}
 	metrics := &tallyMetrics{counts: map[string]int{}}
 	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a"}, nil)
-	throttle := &AuthThrottle{Limiter: lim, Limit: Limit{Capacity: 1, RefillPerSec: 1}, Metrics: metrics}
-	h := Authenticate(provider, log, throttle)(okHandler())
+	throttle := &AuthThrottle{Limiter: lim, Limit: Limit{Capacity: 1, RefillPerSec: 1}}
+	h := Authenticate(provider, log, metrics, throttle)(okHandler())
 
 	for range 50 {
 		h.ServeHTTP(httptest.NewRecorder(), request("wrong", "", "203.0.113.5:1"))
 	}
-	if metrics.counts[ports.MetricAuthThrottled] != 50 {
-		t.Errorf("every throttled request is counted, got %d", metrics.counts[ports.MetricAuthThrottled])
+	if metrics.counts[ports.MetricAuthThrottled] != 50 || metrics.counts[ports.MetricAuthRejected] != 50 {
+		t.Errorf("every failed token is counted in auth.rejected and every 429 in auth.throttled, got rejected=%d throttled=%d",
+			metrics.counts[ports.MetricAuthRejected], metrics.counts[ports.MetricAuthThrottled])
 	}
 	if got := log.count(ports.LogEventAuthThrottled); got != 1 {
 		t.Errorf("a flood within one second must log once, not %d times", got)
@@ -588,8 +589,8 @@ func TestAuthThrottle_LogsIdentityAndClientIP(t *testing.T) {
 	log := &capturingLog{fields: map[string]map[string]any{}}
 	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a"}, nil)
 	metrics := &countingMetrics{counts: map[string]map[string]string{}}
-	throttle := &AuthThrottle{Limiter: lim, ClientIP: NewClientIP(nil), Limit: Limit{Capacity: 1, RefillPerSec: 1}, Metrics: metrics}
-	Authenticate(provider, log, throttle)(okHandler()).ServeHTTP(httptest.NewRecorder(), request("wrong", "", "203.0.113.5:1"))
+	throttle := &AuthThrottle{Limiter: lim, ClientIP: NewClientIP(nil), Limit: Limit{Capacity: 1, RefillPerSec: 1}}
+	Authenticate(provider, log, metrics, throttle)(okHandler()).ServeHTTP(httptest.NewRecorder(), request("wrong", "", "203.0.113.5:1"))
 
 	f := log.fields[ports.LogEventAuthThrottled]
 	if f["client_ip"] != "203.0.113.5" || f["identity"] != "ip:203.0.113.5" {
@@ -599,17 +600,26 @@ func TestAuthThrottle_LogsIdentityAndClientIP(t *testing.T) {
 		t.Errorf("a throttle must be counted by identity type (low cardinality) for alerting, got %v", metrics.counts)
 	}
 
-	Authenticate(provider, log, throttle)(okHandler()).ServeHTTP(httptest.NewRecorder(), withCert(request("wrong", "", "203.0.113.5:1"), []byte("cert")))
+	Authenticate(provider, log, metrics, throttle)(okHandler()).ServeHTTP(httptest.NewRecorder(), withCert(request("wrong", "", "203.0.113.5:1"), []byte("cert")))
 	if tags := metrics.counts[ports.MetricAuthThrottled]; tags["identity_type"] != "cert" {
 		t.Errorf("a certificate identity is counted as cert, got %v", tags)
 	}
 }
 
-func TestAuthThrottle_NilDisablesThrottling(t *testing.T) {
+func TestAuthThrottle_NilDisablesThrottlingButNotMetrics(t *testing.T) {
 	provider := NewStaticTokenProvider(map[string]string{tokenA: "merchant-a"}, nil)
-	rec := httptest.NewRecorder()
-	Authenticate(provider, noopLog{}, nil)(okHandler()).ServeHTTP(rec, request("wrong", "", ""))
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("got %d", rec.Code)
+	metrics := &tallyMetrics{counts: map[string]int{}}
+	h := Authenticate(provider, noopLog{}, metrics, nil)(okHandler())
+
+	for range 20 {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, request("wrong", "", ""))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("without a throttle a bad token is always 401, got %d", rec.Code)
+		}
+	}
+	if metrics.counts[ports.MetricAuthRejected] != 20 {
+		t.Fatalf("with the throttle disabled (AUTH_FAILURE_LIMIT_CAPACITY=0 or no limiter) a flood must still be visible in auth.rejected, got %d",
+			metrics.counts[ports.MetricAuthRejected])
 	}
 }
