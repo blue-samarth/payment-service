@@ -220,6 +220,7 @@ func run() error {
 		Payment: handlers.NewPaymentHandler(paymentSvc),
 		Refund:  handlers.NewRefundHandler(refundSvc),
 		Cancel:  handlers.NewCancelHandler(cancelSvc),
+		Review:  handlers.NewReviewHandler(paymentSvc, logger),
 		Webhook: handlers.NewWebhookHandler(webhookSvc, registry, webhookSecrets, configStore, logger),
 		Health:  health,
 		Logger:  logger,

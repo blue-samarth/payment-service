@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 
 	"samarth/payment-service/internal/adapters/postgres"
+	"samarth/payment-service/internal/app/payment"
 	"samarth/payment-service/internal/domain/transaction"
 	leaseexpiry "samarth/payment-service/internal/jobs/lease_expiry"
 	"samarth/payment-service/internal/testsupport"
@@ -175,6 +176,60 @@ func TestLeaseReaper_MarksUnrecoverableChargeForReviewAndStopsListingIt(t *testi
 	}
 	if marked, err := repo.MarkReviewRequired(ctx, stuck.ID, "again"); err != nil || marked {
 		t.Fatalf("marking is once only, got marked=%v err=%v", marked, err)
+	}
+	if n, err := repo.CountPendingReview(ctx); err != nil || n != 1 {
+		t.Fatalf("expected one pending review, got %d err=%v", n, err)
+	}
+	if persisted.ReviewRequiredAt == nil || persisted.ReviewReason != "replay_window_passed" {
+		t.Fatalf("GetByID must surface the review fields, got %v %q", persisted.ReviewRequiredAt, persisted.ReviewReason)
+	}
+
+	resolved, err := buildService(pg, srv.URL).ResolveReview(ctx, stuck.ID, payment.ResolveInput{
+		Status: transaction.StatusSucceeded, GatewayReferenceID: "pi_found_in_dashboard",
+	})
+	if err != nil {
+		t.Fatalf("ResolveReview: %v", err)
+	}
+	if resolved.Status != transaction.StatusSucceeded {
+		t.Fatalf("got %s", resolved.Status)
+	}
+	reloaded, err := repo.GetByID(ctx, stuck.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Status != transaction.StatusSucceeded || reloaded.GatewayReferenceID != "pi_found_in_dashboard" {
+		t.Errorf("resolution must persist, got %s %q", reloaded.Status, reloaded.GatewayReferenceID)
+	}
+	var events int
+	_ = pg.DB.Pool().QueryRow(ctx, "SELECT count(*) FROM outbox_events WHERE aggregate_id=$1", stuck.ID).Scan(&events)
+	if events != 1 {
+		t.Errorf("a resolution must publish one terminal event, got %d", events)
+	}
+	if n, err := repo.CountPendingReview(ctx); err != nil || n != 0 {
+		t.Errorf("a resolved row is no longer pending, got %d err=%v", n, err)
+	}
+}
+
+func TestTransactionRepository_GatewayReferenceMatchesTheGatewayActuallyCalled(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "transactions", "processing_lease", "outbox_events")
+	ctx := context.Background()
+
+	txn := seedStuckTxn(t, pg, "stripe", "order_1")
+	if _, err := pg.DB.Pool().Exec(ctx, "UPDATE transactions SET actual_gateway='razorpay' WHERE id=$1", txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	repo := postgres.NewTransactionRepository(pg.DB, pg.Q)
+
+	got, err := repo.GetByGatewayReference(ctx, "razorpay", "order_1")
+	if err != nil || got == nil || got.ID != txn.ID {
+		t.Fatalf("after a fallback to razorpay, a razorpay webhook must find the payment, got %v err=%v", got, err)
+	}
+	if other, err := repo.GetByGatewayReference(ctx, "stripe", "order_1"); err != nil || other != nil {
+		t.Fatalf("the routed-but-abandoned gateway must no longer match, got %v err=%v", other, err)
+	}
+	if missing, err := repo.FindByID(ctx, uuid.New()); err != nil || missing != nil {
+		t.Fatalf("FindByID must return nil for a missing row, got %v err=%v", missing, err)
 	}
 }
 

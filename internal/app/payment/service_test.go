@@ -88,6 +88,7 @@ type fakeAdapter struct {
 	statusChecks int
 	ctxErrs      []error
 	hadDeadline  []bool
+	deadlines    []time.Time
 	onInitiate   func()
 
 	notIdempotent bool
@@ -96,8 +97,9 @@ type fakeAdapter struct {
 func (a *fakeAdapter) InitiatePayment(ctx context.Context, req ports.GatewayPaymentRequest) (*ports.GatewayPaymentResponse, error) {
 	a.initiated = append(a.initiated, req)
 	a.ctxErrs = append(a.ctxErrs, ctx.Err())
-	_, ok := ctx.Deadline()
+	deadline, ok := ctx.Deadline()
 	a.hadDeadline = append(a.hadDeadline, ok)
+	a.deadlines = append(a.deadlines, deadline)
 	if a.onInitiate != nil {
 		a.onInitiate()
 	}

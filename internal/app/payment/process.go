@@ -30,6 +30,7 @@ type cachedResponse struct {
 
 const (
 	reinitiateWindow = 23 * time.Hour
+	workMargin       = 10 * time.Second
 	leaseMargin      = 30 * time.Second
 
 	reviewReasonNotIdempotent      = "gateway_not_idempotent"
@@ -92,7 +93,7 @@ func (s *Service) ProcessPayment(ctx context.Context, transactionID uuid.UUID) (
 	work := context.WithoutCancel(ctx)
 	if budget := s.gatewayBudget(); budget > 0 {
 		var cancel context.CancelFunc
-		work, cancel = context.WithTimeout(work, budget+leaseMargin)
+		work, cancel = context.WithTimeout(work, budget+workMargin)
 		defer cancel()
 	}
 	s.enterIntent(work, txn.GatewayID, txn.ID, timeout)
@@ -293,6 +294,7 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 	for attempt := 1; ; attempt++ {
 		var gwErr *ports.GatewayError
 		resp, gwErr = s.callGateway(ctx, adapter, txn)
+		s.saveReference(ctx, txn, resp)
 		result = resolveOutcome(resp, gwErr)
 		s.recordBreaker(ctx, txn.GatewayID, gwErr)
 		tried = append(tried, txn.GatewayID)
@@ -306,9 +308,10 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 			return resp, result
 		}
 
-		prevGateway := txn.GatewayID
+		prevGateway, prevReference := txn.GatewayID, txn.GatewayReferenceID
 		txn.GatewayID = next
 		txn.ActualGateway = next
+		txn.GatewayReferenceID = ""
 		if err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
 			return s.repo.UpdateStatus(ctx, txn)
 		}); err != nil {
@@ -320,6 +323,7 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 			})
 			txn.GatewayID = prevGateway
 			txn.ActualGateway = prevGateway
+			txn.GatewayReferenceID = prevReference
 			return resp, result
 		}
 		s.log.Info(ports.LogEventGatewayFallback, map[string]any{
@@ -342,6 +346,23 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 
 func isDecline(gwErr *ports.GatewayError) bool {
 	return gwErr.Category == ports.ErrorCategoryHardDecline || gwErr.Category == ports.ErrorCategorySoftDecline
+}
+
+func (s *Service) saveReference(ctx context.Context, txn *transaction.Transaction, resp *ports.GatewayPaymentResponse) {
+	if resp == nil || resp.GatewayReferenceID == "" || resp.GatewayReferenceID == txn.GatewayReferenceID {
+		return
+	}
+	txn.GatewayReferenceID = resp.GatewayReferenceID
+	if err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
+		return s.repo.UpdateStatus(ctx, txn)
+	}); err != nil {
+		s.log.Warn(ports.LogEventGatewayResponse, map[string]any{
+			ports.FieldTransactionID: txn.ID.String(),
+			ports.FieldGatewayID:     txn.GatewayID,
+			"error":                  err.Error(),
+			"stage":                  "persist_reference",
+		})
+	}
 }
 
 func shouldFallback(gwErr *ports.GatewayError) bool {

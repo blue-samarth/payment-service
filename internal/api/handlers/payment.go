@@ -44,6 +44,7 @@ type paymentResponse struct {
 	PaymentMethod      string `json:"payment_method"`
 	Gateway            string `json:"gateway"`
 	GatewayReferenceID string `json:"gateway_reference_id,omitempty"`
+	ReviewRequired     bool   `json:"review_required,omitempty"`
 	CreatedAt          string `json:"created_at"`
 }
 
@@ -151,6 +152,7 @@ func toPaymentResponse(t *transaction.Transaction) paymentResponse {
 		PaymentMethod:      string(t.PaymentMethod),
 		Gateway:            t.GatewayID,
 		GatewayReferenceID: t.GatewayReferenceID,
+		ReviewRequired:     t.Status == transaction.StatusProcessing && t.ReviewRequiredAt != nil,
 		CreatedAt:          t.CreatedAt.Format("2006-01-02T15:04:05.999999999Z07:00"),
 	}
 }

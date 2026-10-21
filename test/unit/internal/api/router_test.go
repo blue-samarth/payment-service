@@ -79,6 +79,7 @@ func testDeps(txn *transaction.Transaction) Deps {
 		Payment: handlers.NewPaymentHandler(stubService{txn: txn}),
 		Webhook: handlers.NewWebhookHandler(noProcessor{}, unknownGateways{}, noSecrets{}, nil, logger),
 		Health:  handlers.NewHealthHandler(okPinger{}, okPinger{}, nil, logger),
+		Review:  handlers.NewReviewHandler(nil, logger),
 		Logger:  logger,
 	}
 }
@@ -103,6 +104,23 @@ func TestMerchantRouter_ServesPaymentsOnly(t *testing.T) {
 	}
 	if got := do(t, srv, http.MethodPost, "/webhooks/gateway/stripe"); got.code != http.StatusNotFound {
 		t.Errorf("webhooks must not be served on the merchant listener, got %d", got.code)
+	}
+	if got := do(t, srv, http.MethodPost, "/payments/"+txn.ID.String()+"/resolve"); got.code != http.StatusForbidden {
+		t.Errorf("the resolve route must exist on the merchant listener and fail closed without an ops principal, got %d", got.code)
+	}
+}
+
+func TestResolveRouteOnlyOnMerchantListener(t *testing.T) {
+	txn, _ := transaction.New(uuid.New(), 1000, "INR", transaction.PaymentMethodCard, "stripe", uuid.New(), "", "", nil, 30)
+	for name, h := range map[string]http.Handler{
+		"webhook": NewWebhookRouter(testDeps(txn)),
+		"health":  NewHealthRouter(testDeps(txn)),
+	} {
+		srv := httptest.NewServer(h)
+		if got := do(t, srv, http.MethodPost, "/payments/"+txn.ID.String()+"/resolve"); got.code != http.StatusNotFound && got.code != http.StatusMethodNotAllowed {
+			t.Errorf("%s listener must not serve resolve, got %d", name, got.code)
+		}
+		srv.Close()
 	}
 }
 

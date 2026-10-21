@@ -12,6 +12,7 @@ type Deps struct {
 	Payment       *handlers.PaymentHandler
 	Refund        *handlers.RefundHandler
 	Cancel        *handlers.CancelHandler
+	Review        *handlers.ReviewHandler
 	Webhook       *handlers.WebhookHandler
 	Health        *handlers.HealthHandler
 	Logger        ports.Logger
@@ -28,6 +29,9 @@ func NewMerchantRouter(deps Deps) http.Handler {
 	mux.HandleFunc("GET /payments/{id}", deps.Payment.Get)
 	mux.HandleFunc("POST /payments/{id}/refunds", deps.Refund.Create)
 	mux.HandleFunc("POST /payments/{id}/cancel", deps.Cancel.Cancel)
+	if deps.Review != nil {
+		mux.HandleFunc("POST /payments/{id}/resolve", deps.Review.Resolve)
+	}
 
 	chain := []func(http.Handler) http.Handler{
 		middleware.RequestID,

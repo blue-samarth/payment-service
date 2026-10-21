@@ -715,14 +715,141 @@ func TestProcessPayment_LeaseCoversTheGatewayBudget(t *testing.T) {
 		t.Fatalf("a lease shorter than the gateway budget lets the reaper act while the handler is still calling the gateway, got %v", got)
 	}
 	if !adapter.hadDeadline[0] {
-		t.Error("the detached gateway call needs its own deadline as a backstop")
+		t.Fatal("the detached gateway call needs its own deadline as a backstop")
+	}
+	leaseEnd := repo.snapshots[0].ProcessingStartedAt.Add(*got)
+	if gap := leaseEnd.Sub(adapter.deadlines[0]); gap < leaseMargin-workMargin-time.Second {
+		t.Errorf("the work deadline must fall well before the lease expires, gap=%s", gap)
+	}
+}
+
+func TestProcessPayment_SavesTheReferenceAsSoonAsTheGatewayAnswers(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	svc := processService(repo, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter})
+
+	if _, err := svc.ProcessPayment(context.Background(), txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(repo.snapshots) != 3 {
+		t.Fatalf("expected begin, reference and finalize writes, got %d", len(repo.snapshots))
+	}
+	if s := repo.snapshots[1]; s.Status != transaction.StatusProcessing || s.GatewayReferenceID != "pi_1" {
+		t.Errorf("the reference must be persisted before finalize, so an interruption leaves a status-checkable row, got %s %q", s.Status, s.GatewayReferenceID)
+	}
+}
+
+func TestProcessPayment_ReferenceSaveFailureDoesNotBlockFinalize(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	svc := NewService(repo, &fakeOutbox{}, &fakeRouter{}, &fakeConfig{}, &fakeTransactor{failAt: 2}, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter}, noopLogger{}, noopMetrics{})
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != transaction.StatusSucceeded || got.GatewayReferenceID != "pi_1" {
+		t.Errorf("finalize still records the outcome and reference, got %s %q", got.Status, got.GatewayReferenceID)
+	}
+}
+
+func TestProcessPayment_FallbackClearsThePreviousGatewaysReference(t *testing.T) {
+	txn := pendingTxn()
+	txn.GatewayReferenceID = "pi_from_stripe"
+	repo := seedRepo(txn)
+	first := &fakeAdapter{err: &ports.GatewayError{Category: ports.ErrorCategorySoftDecline, Code: "soft_decline"}}
+	second := &fakeAdapter{resp: &ports.GatewayPaymentResponse{Status: ports.GatewayPaymentStatusPending}}
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": first, "razorpay": second}}
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
+	svc.SetMaxGatewayAttempts(2)
+
+	if _, err := svc.ProcessPayment(context.Background(), txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if s := repo.snapshots[1]; s.ActualGateway != "razorpay" || s.GatewayReferenceID != "" {
+		t.Errorf("a stripe reference must not be left on a row now pointing at razorpay, got gateway=%q ref=%q", s.ActualGateway, s.GatewayReferenceID)
+	}
+}
+
+func reviewTxn() *transaction.Transaction {
+	t := processingExpiredTxn()
+	t.GatewayReferenceID = ""
+	marked := time.Now().UTC().Add(-time.Minute)
+	t.ReviewRequiredAt = &marked
+	t.ReviewReason = reviewReasonNotIdempotent
+	return t
+}
+
+func TestResolveReview_Succeeded(t *testing.T) {
+	txn := reviewTxn()
+	repo := seedRepo(txn)
+	outbox := &fakeOutbox{}
+	svc := recoverService(repo, &fakeRegistry{adapter: &fakeAdapter{}}, outbox)
+
+	got, err := svc.ResolveReview(context.Background(), txn.ID, ResolveInput{Status: transaction.StatusSucceeded, GatewayReferenceID: "pay_123"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != transaction.StatusSucceeded || got.GatewayReferenceID != "pay_123" {
+		t.Errorf("got %s %q", got.Status, got.GatewayReferenceID)
+	}
+	if len(outbox.events) != 1 || outbox.events[0].EventType != ports.EventTypePaymentSucceeded {
+		t.Errorf("a resolution must publish the terminal event like any settlement, got %+v", outbox.events)
+	}
+}
+
+func TestResolveReview_Failed(t *testing.T) {
+	txn := reviewTxn()
+	outbox := &fakeOutbox{}
+	svc := recoverService(seedRepo(txn), &fakeRegistry{adapter: &fakeAdapter{}}, outbox)
+
+	got, err := svc.ResolveReview(context.Background(), txn.ID, ResolveInput{Status: transaction.StatusFailed, Note: "no charge in dashboard"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != transaction.StatusFailed || got.FailureReason == nil || got.FailureReason.Category != "manual_review" || got.FailureReason.GatewayMessage != "no charge in dashboard" {
+		t.Errorf("got %s %+v", got.Status, got.FailureReason)
+	}
+	if len(outbox.events) != 1 || outbox.events[0].EventType != ports.EventTypePaymentFailed {
+		t.Errorf("expected PAYMENT_FAILED, got %+v", outbox.events)
+	}
+}
+
+func TestResolveReview_Refusals(t *testing.T) {
+	notMarked := processingExpiredTxn()
+	settled := reviewTxn()
+	settled.Status = transaction.StatusSucceeded
+	cases := map[string]struct {
+		txn  *transaction.Transaction
+		in   ResolveInput
+		want error
+	}{
+		"not marked for review": {notMarked, ResolveInput{Status: transaction.StatusFailed}, ErrNotUnderReview},
+		"already settled":       {settled, ResolveInput{Status: transaction.StatusFailed}, ErrNotUnderReview},
+		"succeeded without ref": {reviewTxn(), ResolveInput{Status: transaction.StatusSucceeded}, ErrInvalidResolution},
+		"non-terminal status":   {reviewTxn(), ResolveInput{Status: transaction.StatusProcessing}, ErrInvalidResolution},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			repo := seedRepo(tc.txn)
+			svc := recoverService(repo, &fakeRegistry{adapter: &fakeAdapter{}}, &fakeOutbox{})
+			if _, err := svc.ResolveReview(context.Background(), tc.txn.ID, tc.in); !errors.Is(err, tc.want) {
+				t.Fatalf("want %v, got %v", tc.want, err)
+			}
+			if repo.updates != 0 {
+				t.Errorf("a refused resolution must not write, updates=%d", repo.updates)
+			}
+		})
 	}
 }
 
 func TestProcessPayment_FinalizeLostToRecoveryReturnsTheRecoveredState(t *testing.T) {
 	txn := pendingTxn()
 	repo := seedRepo(txn)
-	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{Status: ports.GatewayPaymentStatusSucceeded}}
 	adapter.onInitiate = func() {
 		recovered := *repo.store[txn.ID]
 		recovered.Status = transaction.StatusSucceeded
@@ -743,7 +870,7 @@ func TestProcessPayment_FinalizeFailureStillProcessingIsAnError(t *testing.T) {
 	txn := pendingTxn()
 	repo := seedRepo(txn)
 	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
-	svc := NewService(repo, &fakeOutbox{}, &fakeRouter{}, &fakeConfig{}, &fakeTransactor{failAt: 2}, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter}, noopLogger{}, noopMetrics{})
+	svc := NewService(repo, &fakeOutbox{}, &fakeRouter{}, &fakeConfig{}, &fakeTransactor{failAt: 3}, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter}, noopLogger{}, noopMetrics{})
 
 	if _, err := svc.ProcessPayment(context.Background(), txn.ID); err == nil {
 		t.Fatal("a finalize failure with nobody else settling the payment must surface as an error")
