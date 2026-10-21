@@ -465,11 +465,15 @@ func TestManager_Reload_ExpiredKeepsLastGoodAndCountsMetric(t *testing.T) {
 	writeFile(t, mgr.cfg.CertFile, expiredCert)
 	writeFile(t, mgr.cfg.KeyFile, expiredKey)
 
+	goodNotAfter := mgr.NotAfter()
 	if err := mgr.reload(); err == nil {
 		t.Fatal("reload must reject an expired certificate")
 	}
 	if string(mgr.cert.Certificate[0]) != string(goodLeaf) {
 		t.Error("a failed reload must keep the last-known-good certificate serving")
+	}
+	if !mgr.NotAfter().Equal(goodNotAfter) {
+		t.Error("NotAfter must describe the certificate being served, not the rejected one")
 	}
 
 	// The background refresh path increments the failure counter.
@@ -480,5 +484,130 @@ func TestManager_Reload_ExpiredKeepsLastGoodAndCountsMetric(t *testing.T) {
 	cancel()
 	if metrics.count(ports.MetricTLSCertReloadFailure) == 0 {
 		t.Error("a failing background reload must increment the reload-failure metric for alerting")
+	}
+}
+
+// The webhook listener runs a Manager with no CA file: gateways present no
+// client certificate, so the handshake must complete without one.
+func TestManager_NoCA_AdmitsClientWithoutCert(t *testing.T) {
+	ca := newCA(t)
+	serverCert, serverKey := ca.issue(t, "localhost", x509.ExtKeyUsageServerAuth)
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "server.crt")
+	keyFile := filepath.Join(dir, "server.key")
+	writeFile(t, certFile, serverCert)
+	writeFile(t, keyFile, serverKey)
+
+	mgr, err := NewManager(Config{Name: "webhook", CertFile: certFile, KeyFile: keyFile}, noopLogger{}, noopMetrics{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := mgr.clientAuthType(); got != tls.NoClientCert {
+		t.Fatalf("a manager without a CA must not request client certificates, got auth type %d", got)
+	}
+
+	clientCfg := &tls.Config{ServerName: "localhost", RootCAs: poolOf(ca.certPEM)}
+	if serverErr, clientErr := handshake(t, mgr.TLSConfig(), clientCfg); serverErr != nil || clientErr != nil {
+		t.Fatalf("a client without a certificate must complete the handshake, got serverErr=%v clientErr=%v", serverErr, clientErr)
+	}
+}
+
+type gaugeRecorder struct {
+	mu   sync.Mutex
+	tags map[string]map[string]string
+}
+
+func (g *gaugeRecorder) Increment(string, map[string]string)          {}
+func (g *gaugeRecorder) Histogram(string, float64, map[string]string) {}
+func (g *gaugeRecorder) Gauge(name string, _ float64, tags map[string]string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.tags[name] = tags
+}
+
+// Two managers run side by side (merchant and webhook); without a listener
+// tag their expiry gauges would overwrite each other.
+func TestManager_NameTagsExpiryGauge(t *testing.T) {
+	ca := newCA(t)
+	serverCert, serverKey := ca.issue(t, "localhost", x509.ExtKeyUsageServerAuth)
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "server.crt")
+	keyFile := filepath.Join(dir, "server.key")
+	writeFile(t, certFile, serverCert)
+	writeFile(t, keyFile, serverKey)
+
+	rec := &gaugeRecorder{tags: map[string]map[string]string{}}
+	if _, err := NewManager(Config{Name: "webhook", CertFile: certFile, KeyFile: keyFile}, noopLogger{}, rec); err != nil {
+		t.Fatal(err)
+	}
+	if got := rec.tags[ports.MetricTLSCertExpirySeconds]["listener"]; got != "webhook" {
+		t.Errorf("expiry gauge must carry listener=webhook, got tags %v", rec.tags[ports.MetricTLSCertExpirySeconds])
+	}
+}
+
+func webhookManager(t *testing.T, ca *certAuthority, minVersion uint16) (*Manager, error) {
+	t.Helper()
+	serverCert, serverKey := ca.issue(t, "localhost", x509.ExtKeyUsageServerAuth)
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "server.crt")
+	keyFile := filepath.Join(dir, "server.key")
+	writeFile(t, certFile, serverCert)
+	writeFile(t, keyFile, serverKey)
+	return NewManager(Config{Name: "webhook", CertFile: certFile, KeyFile: keyFile, MinVersion: minVersion}, noopLogger{}, noopMetrics{})
+}
+
+func TestManager_TLS12FloorAdmitsTLS12WithAEADOnly(t *testing.T) {
+	ca := newCA(t)
+	mgr, err := webhookManager(t, ca, tls.VersionTLS12)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tls12 := &tls.Config{ServerName: "localhost", RootCAs: poolOf(ca.certPEM), MaxVersion: tls.VersionTLS12}
+	if serverErr, clientErr := handshake(t, mgr.TLSConfig(), tls12); serverErr != nil || clientErr != nil {
+		t.Fatalf("a TLS 1.2 gateway sender must be admitted, got serverErr=%v clientErr=%v", serverErr, clientErr)
+	}
+
+	cbcOnly := &tls.Config{
+		ServerName:   "localhost",
+		RootCAs:      poolOf(ca.certPEM),
+		MaxVersion:   tls.VersionTLS12,
+		CipherSuites: []uint16{tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA},
+	}
+	if serverErr, _ := handshake(t, mgr.TLSConfig(), cbcOnly); serverErr == nil {
+		t.Fatal("a TLS 1.2 client offering only CBC suites must be refused")
+	}
+
+	tls11 := &tls.Config{ServerName: "localhost", RootCAs: poolOf(ca.certPEM), MinVersion: tls.VersionTLS10, MaxVersion: tls.VersionTLS11}
+	if serverErr, _ := handshake(t, mgr.TLSConfig(), tls11); serverErr == nil {
+		t.Fatal("TLS 1.1 must be refused")
+	}
+}
+
+func TestManager_RejectsUnsupportedMinVersion(t *testing.T) {
+	if _, err := webhookManager(t, newCA(t), tls.VersionTLS11); err == nil {
+		t.Fatal("a minimum below TLS 1.2 must be rejected")
+	}
+}
+
+func TestManager_ExposesNameAndNotAfter(t *testing.T) {
+	ca := newCA(t)
+	notAfter := time.Now().Add(48 * time.Hour).Truncate(time.Second)
+	certPEM, keyPEM := issueExpiring(t, ca, time.Now().Add(-time.Hour), notAfter)
+	dir := t.TempDir()
+	certFile := filepath.Join(dir, "server.crt")
+	keyFile := filepath.Join(dir, "server.key")
+	writeFile(t, certFile, certPEM)
+	writeFile(t, keyFile, keyPEM)
+
+	mgr, err := NewManager(Config{Name: "merchant", CertFile: certFile, KeyFile: keyFile}, noopLogger{}, noopMetrics{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mgr.Name() != "merchant" {
+		t.Errorf("Name() = %q", mgr.Name())
+	}
+	if !mgr.NotAfter().Equal(notAfter) {
+		t.Errorf("NotAfter() = %v, want %v", mgr.NotAfter(), notAfter)
 	}
 }

@@ -23,6 +23,10 @@ type IdempotencySweeper interface {
 	DeleteExpired(ctx context.Context) (int64, error)
 }
 
+type ReviewCounter interface {
+	CountPendingReview(ctx context.Context) (int64, error)
+}
+
 type Config struct {
 	IdempotencyProcessingTimeout time.Duration
 }
@@ -33,6 +37,14 @@ type Reaper struct {
 	idem    IdempotencySweeper
 	log     ports.Logger
 	cfg     Config
+
+	reviews ReviewCounter
+	metrics ports.MetricRecorder
+}
+
+func (r *Reaper) SetReviewGauge(reviews ReviewCounter, metrics ports.MetricRecorder) {
+	r.reviews = reviews
+	r.metrics = metrics
 }
 
 func New(txns ExpiredLeaseLister, recover LeaseRecoverer, idem IdempotencySweeper, log ports.Logger, cfg Config) *Reaper {
@@ -44,8 +56,25 @@ func New(txns ExpiredLeaseLister, recover LeaseRecoverer, idem IdempotencySweepe
 
 func (r *Reaper) RunOnce(ctx context.Context) error {
 	r.reapLeases(ctx)
+	r.reportPendingReviews(ctx)
 	r.sweepIdempotency(ctx)
 	return nil
+}
+
+func (r *Reaper) reportPendingReviews(ctx context.Context) {
+	if r.reviews == nil || r.metrics == nil {
+		return
+	}
+	pending, err := r.reviews.CountPendingReview(ctx)
+	if err != nil {
+		r.log.Error(ports.LogEventTransactionLeaseExpired, map[string]any{
+			ports.FieldErrorCode:     "count_pending_review_failed",
+			ports.FieldTraceID:       "",
+			ports.FieldTransactionID: "",
+		}, err)
+		return
+	}
+	r.metrics.Gauge(ports.MetricTransactionReviewPending, float64(pending), nil)
 }
 
 func (r *Reaper) reapLeases(ctx context.Context) {

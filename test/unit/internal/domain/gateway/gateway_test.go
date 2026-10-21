@@ -162,3 +162,27 @@ func TestDiscrepancyMetrics_CurrentAlertLevel(t *testing.T) {
 		})
 	}
 }
+
+func TestEffectiveState(t *testing.T) {
+	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name     string
+		state    CircuitState
+		cooldown time.Time
+		want     CircuitState
+	}{
+		{"open within cooldown stays open", StateOpen, now.Add(time.Minute), StateOpen},
+		{"open past cooldown probes half-open", StateOpen, now.Add(-time.Minute), StateHalfOpen},
+		{"open at the cooldown instant probes half-open", StateOpen, now, StateHalfOpen},
+		{"open without a cooldown stays open", StateOpen, time.Time{}, StateOpen},
+		{"closed is unchanged", StateClosed, now.Add(-time.Minute), StateClosed},
+		{"half-open is unchanged", StateHalfOpen, time.Time{}, StateHalfOpen},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := EffectiveState(c.state, c.cooldown, now); got != c.want {
+				t.Errorf("EffectiveState(%s) = %s, want %s", c.state, got, c.want)
+			}
+		})
+	}
+}

@@ -14,10 +14,12 @@ import (
 )
 
 type fakeRepo struct {
-	inserted []*transaction.Transaction
-	store    map[uuid.UUID]*transaction.Transaction
-	updates  int
-	failOn   bool
+	inserted  []*transaction.Transaction
+	store     map[uuid.UUID]*transaction.Transaction
+	updates   int
+	snapshots []transaction.Transaction
+	reviewed  map[uuid.UUID]string
+	failOn    bool
 }
 
 func (r *fakeRepo) Insert(ctx context.Context, t *transaction.Transaction) error {
@@ -43,12 +45,24 @@ func (r *fakeRepo) GetByID(ctx context.Context, id uuid.UUID) (*transaction.Tran
 
 func (r *fakeRepo) UpdateStatus(ctx context.Context, t *transaction.Transaction) error {
 	r.updates++
+	r.snapshots = append(r.snapshots, *t)
 	t.Version++
 	if r.store == nil {
 		r.store = map[uuid.UUID]*transaction.Transaction{}
 	}
 	r.store[t.ID] = t
 	return nil
+}
+
+func (r *fakeRepo) MarkReviewRequired(ctx context.Context, id uuid.UUID, reason string) (bool, error) {
+	if r.reviewed == nil {
+		r.reviewed = map[uuid.UUID]string{}
+	}
+	if _, done := r.reviewed[id]; done {
+		return false, nil
+	}
+	r.reviewed[id] = reason
+	return true, nil
 }
 
 type fakeLease struct {
@@ -69,12 +83,30 @@ func (l *fakeLease) WriteCachedResponse(ctx context.Context, leaseKey uuid.UUID,
 type fakeAdapter struct {
 	resp *ports.GatewayPaymentResponse
 	err  error
+
+	initiated    []ports.GatewayPaymentRequest
+	statusChecks int
+	ctxErrs      []error
+	hadDeadline  []bool
+	deadlines    []time.Time
+	onInitiate   func()
+
+	notIdempotent bool
 }
 
 func (a *fakeAdapter) InitiatePayment(ctx context.Context, req ports.GatewayPaymentRequest) (*ports.GatewayPaymentResponse, error) {
+	a.initiated = append(a.initiated, req)
+	a.ctxErrs = append(a.ctxErrs, ctx.Err())
+	deadline, ok := ctx.Deadline()
+	a.hadDeadline = append(a.hadDeadline, ok)
+	a.deadlines = append(a.deadlines, deadline)
+	if a.onInitiate != nil {
+		a.onInitiate()
+	}
 	return a.resp, a.err
 }
 func (a *fakeAdapter) CheckStatus(ctx context.Context, req ports.GatewayStatusRequest) (*ports.GatewayPaymentResponse, error) {
+	a.statusChecks++
 	return a.resp, a.err
 }
 func (a *fakeAdapter) Refund(ctx context.Context, req ports.GatewayRefundRequest) (*ports.GatewayRefundResponse, error) {
@@ -83,7 +115,24 @@ func (a *fakeAdapter) Refund(ctx context.Context, req ports.GatewayRefundRequest
 func (a *fakeAdapter) Cancel(ctx context.Context, req ports.GatewayCancelRequest) (*ports.GatewayCancelResponse, error) {
 	return nil, nil
 }
-func (a *fakeAdapter) Capabilities() ports.GatewayCapabilities { return ports.GatewayCapabilities{} }
+func (a *fakeAdapter) Capabilities() ports.GatewayCapabilities {
+	return ports.GatewayCapabilities{IdempotencyCapable: !a.notIdempotent}
+}
+
+type countingMetrics struct {
+	noopMetrics
+	counts map[string]int
+	tags   map[string]map[string]string
+}
+
+func newCountingMetrics() *countingMetrics {
+	return &countingMetrics{counts: map[string]int{}, tags: map[string]map[string]string{}}
+}
+
+func (m *countingMetrics) Increment(name string, tags map[string]string) {
+	m.counts[name]++
+	m.tags[name] = tags
+}
 
 type fakeRegistry struct {
 	adapter ports.GatewayAdapter
@@ -125,9 +174,17 @@ func (c *fakeConfig) GetProcessingTimeout(ctx context.Context, gatewayID, paymen
 	return c.timeout, c.err
 }
 
-type fakeTransactor struct{ committed bool }
+type fakeTransactor struct {
+	committed bool
+	calls     int
+	failAt    int
+}
 
 func (t *fakeTransactor) WithinTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	t.calls++
+	if t.failAt != 0 && t.calls == t.failAt {
+		return errors.New("transaction failed")
+	}
 	if err := fn(ctx); err != nil {
 		return err
 	}

@@ -27,6 +27,8 @@ type Queries struct {
 	TransactionUpdateStatus      string
 	TransactionSetCancelIntent   string
 	TransactionListExpiredLeases string
+	TransactionMarkReview        string
+	TransactionCountReview       string
 
 	RefundInsert         string
 	RefundGetByID        string
@@ -106,6 +108,8 @@ func LoadQueries() (*Queries, error) {
 		{&q.TransactionUpdateStatus, "TransactionUpdateStatus"},
 		{&q.TransactionSetCancelIntent, "TransactionSetCancelIntent"},
 		{&q.TransactionListExpiredLeases, "TransactionListExpiredLeases"},
+		{&q.TransactionMarkReview, "TransactionMarkReviewRequired"},
+		{&q.TransactionCountReview, "TransactionCountPendingReview"},
 		{&q.RefundInsert, "RefundInsert"},
 		{&q.RefundGetByID, "RefundGetByID"},
 		{&q.RefundExists, "RefundExists"},

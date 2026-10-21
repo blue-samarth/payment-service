@@ -4,10 +4,13 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func requireEnv(key string, errs *[]string) string {
@@ -84,12 +87,32 @@ func getEnvDuration(key string, def time.Duration, errs *[]string) time.Duration
 	return d
 }
 
+const (
+	WebhookTLSModeApp = "app"
+	WebhookTLSModeLB  = "lb"
+)
+
+const MinTokenLength = 32
+
+const ShutdownTimeoutMargin = 15 * time.Second
+
 type AppConfig struct {
 	Environment    string
 	ServiceVersion string
 	Port           int
+	WebhookPort    int
+	HealthPort     int
+	WebhookTLSMode string
 	MtlsStrictMode bool
 	AllowNoAuth    bool
+
+	ShutdownDrainDelay time.Duration
+	ShutdownTimeout    time.Duration
+}
+type AuthConfig struct {
+	ServiceTokens  map[string]string
+	OpsTokens      []string
+	WebhookSecrets map[string]string
 }
 type StartupConfig struct {
 	ConnectMaxAttempts    int
@@ -153,6 +176,9 @@ type OutboxConfig struct {
 	WorkerCount                 int
 }
 type RateLimitConfig struct {
+	Capacity            int64
+	RefillPerSec        float64
+	TrustedProxies      []netip.Prefix
 	FallbackMultiplier  float64
 	LocalMaxBuckets     int
 	HealthCheckInterval time.Duration
@@ -178,6 +204,8 @@ type SecurityConfig struct {
 	TLSCertFile             string
 	TLSKeyFile              string
 	TLSCAFile               string
+	WebhookTLSCertFile      string
+	WebhookTLSKeyFile       string
 	CertRefreshIntervalSec  int
 	TokenCacheTTLSec        int
 	DEKCacheTTLSec          int
@@ -185,9 +213,15 @@ type SecurityConfig struct {
 	DEKRotationBatchSleepMs int
 }
 type GatewayConfig struct {
-	HTTPTimeout time.Duration
-	MaxAttempts int
+	HTTPTimeout                    time.Duration
+	MaxAttempts                    int
+	CircuitBreakerFailureThreshold int
 }
+
+func (g GatewayConfig) Budget() time.Duration {
+	return time.Duration(g.MaxAttempts) * g.HTTPTimeout
+}
+
 type JobsConfig struct {
 	LockRetryIntervalSec            int
 	LockTimeoutMinutes              int
@@ -206,6 +240,7 @@ type DataRetentionConfig struct {
 }
 type Config struct {
 	App            AppConfig
+	Auth           AuthConfig
 	Startup        StartupConfig
 	Database       DatabaseConfig
 	Redis          RedisConfig
@@ -230,8 +265,16 @@ func LoadConfig() (*Config, error) {
 	c.App.Environment = requireEnv("ENVIRONMENT", &errs)
 	c.App.ServiceVersion = getEnvDefault("SERVICE_VERSION", "unknown")
 	c.App.Port = getEnvInt("PORT", 8080, &errs)
+	c.App.WebhookPort = getEnvInt("WEBHOOK_PORT", 8081, &errs)
+	c.App.HealthPort = getEnvInt("HEALTH_PORT", 8082, &errs)
+	c.App.WebhookTLSMode = getEnvDefault("WEBHOOK_TLS_MODE", WebhookTLSModeApp)
 	c.App.MtlsStrictMode = getEnvBool("MTLS_STRICT_MODE", true, &errs)
 	c.App.AllowNoAuth = getEnvBool("ALLOW_NO_AUTH", false, &errs)
+	c.App.ShutdownDrainDelay = getEnvDuration("SHUTDOWN_DRAIN_DELAY", 5*time.Second, &errs)
+
+	c.Auth.ServiceTokens = parseServiceTokens(os.Getenv("SERVICE_TOKENS"), &errs)
+	c.Auth.OpsTokens = parseOpsTokens(os.Getenv("OPS_TOKENS"), &errs)
+	c.Auth.WebhookSecrets = parseWebhookSecrets(os.Getenv("WEBHOOK_SECRETS"), &errs)
 
 	c.Startup.ConnectMaxAttempts = getEnvInt("STARTUP_CONNECT_MAX_ATTEMPTS", 5, &errs)
 	c.Startup.ConnectAttemptTimeout = getEnvDuration("STARTUP_CONNECT_ATTEMPT_TIMEOUT", 15*time.Second, &errs)
@@ -310,6 +353,9 @@ func LoadConfig() (*Config, error) {
 	c.RateLimit.FallbackMultiplier = getEnvFloat64("RATE_LIMIT_FALLBACK_MULTIPLIER", 0.5, &errs)
 	c.RateLimit.LocalMaxBuckets = getEnvInt("RATE_LIMIT_LOCAL_MAX_BUCKETS", 10000, &errs)
 	c.RateLimit.HealthCheckInterval = time.Duration(healthCheckMs) * time.Millisecond
+	c.RateLimit.Capacity = getEnvInt64("RATE_LIMIT_CAPACITY", 100, &errs)
+	c.RateLimit.RefillPerSec = getEnvFloat64("RATE_LIMIT_REFILL_PER_SEC", 50, &errs)
+	c.RateLimit.TrustedProxies = parseTrustedProxies(os.Getenv("TRUSTED_PROXY_CIDRS"), &errs)
 
 	c.Routing.SnapshotTTLSeconds = getEnvInt("ROUTING_SNAPSHOT_TTL_SECONDS", 30, &errs)
 	c.Routing.FeeCacheTTLSec = getEnvInt("GATEWAY_FEE_CACHE_TTL_SEC", 3600, &errs)
@@ -317,6 +363,8 @@ func LoadConfig() (*Config, error) {
 
 	c.Gateway.HTTPTimeout = getEnvDuration("GATEWAY_HTTP_TIMEOUT", 30*time.Second, &errs)
 	c.Gateway.MaxAttempts = getEnvInt("GATEWAY_MAX_ATTEMPTS", 3, &errs)
+	c.Gateway.CircuitBreakerFailureThreshold = getEnvInt("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 5, &errs)
+	c.App.ShutdownTimeout = getEnvDuration("SHUTDOWN_TIMEOUT", c.Gateway.Budget()+ShutdownTimeoutMargin, &errs)
 
 	c.Reconciliation.RunIntervalHours = getEnvInt("RECONCILIATION_RUN_INTERVAL_HOURS", 6, &errs)
 	c.Reconciliation.ReportFetchTimeoutSeconds = getEnvInt("RECONCILIATION_REPORT_FETCH_TIMEOUT_SECONDS", 120, &errs)
@@ -331,6 +379,8 @@ func LoadConfig() (*Config, error) {
 	c.Security.TLSCertFile = requireEnv("TLS_CERT_FILE", &errs)
 	c.Security.TLSKeyFile = requireEnv("TLS_KEY_FILE", &errs)
 	c.Security.TLSCAFile = requireEnv("TLS_CA_FILE", &errs)
+	c.Security.WebhookTLSCertFile = getEnvDefault("WEBHOOK_TLS_CERT_FILE", "")
+	c.Security.WebhookTLSKeyFile = getEnvDefault("WEBHOOK_TLS_KEY_FILE", "")
 	c.Security.CertRefreshIntervalSec = getEnvInt("TLS_CERT_REFRESH_INTERVAL_SECONDS", 3600, &errs)
 	c.Security.TokenCacheTTLSec = getEnvInt("TOKEN_CACHE_TTL_SECONDS", 60, &errs)
 	c.Security.DEKCacheTTLSec = getEnvInt("DEK_CACHE_TTL_SECONDS", 3600, &errs)
@@ -369,6 +419,14 @@ func Validate(c *Config) error {
 	if !validEnvs[c.App.Environment] {
 		errs = append(errs, "ENVIRONMENT must be one of: prod, staging, dev")
 	}
+	if c.App.Environment == "prod" {
+		if c.App.AllowNoAuth {
+			errs = append(errs, "ALLOW_NO_AUTH=true is not allowed when ENVIRONMENT=prod")
+		}
+		if !c.App.MtlsStrictMode {
+			errs = append(errs, "MTLS_STRICT_MODE=false is not allowed when ENVIRONMENT=prod")
+		}
+	}
 
 	validLogLevels := map[string]bool{
 		"error": true, "warn": true, "info": true, "debug": true, "trace": true,
@@ -380,6 +438,29 @@ func Validate(c *Config) error {
 	validOTLPProtocols := map[string]bool{"http/protobuf": true, "grpc": true}
 	if c.Observability.OTLPEndpoint != "" && !validOTLPProtocols[c.Observability.OTLPProtocol] {
 		errs = append(errs, `OTLP_PROTOCOL must be "http/protobuf" or "grpc"`)
+	}
+
+	ports := map[string]int{"PORT": c.App.Port, "WEBHOOK_PORT": c.App.WebhookPort, "HEALTH_PORT": c.App.HealthPort}
+	seen := make(map[int]bool, len(ports))
+	for _, p := range ports {
+		if p < 1 || p > 65535 {
+			errs = append(errs, "PORT, WEBHOOK_PORT and HEALTH_PORT must each be between 1 and 65535")
+			break
+		}
+		seen[p] = true
+	}
+	if len(seen) != len(ports) {
+		errs = append(errs, "PORT, WEBHOOK_PORT and HEALTH_PORT must be distinct")
+	}
+
+	switch c.App.WebhookTLSMode {
+	case WebhookTLSModeApp:
+		if c.Security.WebhookTLSCertFile == "" || c.Security.WebhookTLSKeyFile == "" {
+			errs = append(errs, "WEBHOOK_TLS_CERT_FILE and WEBHOOK_TLS_KEY_FILE are required when WEBHOOK_TLS_MODE=app")
+		}
+	case WebhookTLSModeLB:
+	default:
+		errs = append(errs, "WEBHOOK_TLS_MODE must be 'app' or 'lb'")
 	}
 
 	if len(c.Redis.Addrs) > 1 {
@@ -420,7 +501,7 @@ func Validate(c *Config) error {
 	}
 
 	if c.Gateway.MaxAttempts > 0 && c.Gateway.HTTPTimeout > 0 {
-		gatewayBudget := time.Duration(c.Gateway.MaxAttempts) * c.Gateway.HTTPTimeout
+		gatewayBudget := c.Gateway.Budget()
 		idemTimeout := time.Duration(c.Jobs.IdempotencyProcessingTimeoutSec) * time.Second
 		if idemTimeout <= gatewayBudget {
 			errs = append(errs, fmt.Sprintf(
@@ -432,6 +513,27 @@ func Validate(c *Config) error {
 
 	if c.RateLimit.FallbackMultiplier <= 0 || c.RateLimit.FallbackMultiplier > 1 {
 		errs = append(errs, "RATE_LIMIT_FALLBACK_MULTIPLIER must be in (0, 1]")
+	}
+	if c.RateLimit.Capacity < 1 {
+		errs = append(errs, "RATE_LIMIT_CAPACITY must be at least 1")
+	}
+	if c.RateLimit.RefillPerSec <= 0 {
+		errs = append(errs, "RATE_LIMIT_REFILL_PER_SEC must be greater than 0")
+	}
+	if c.Gateway.CircuitBreakerFailureThreshold < 1 {
+		errs = append(errs, "CIRCUIT_BREAKER_FAILURE_THRESHOLD must be at least 1")
+	}
+	if c.App.ShutdownDrainDelay < 0 {
+		errs = append(errs, "SHUTDOWN_DRAIN_DELAY must not be negative")
+	}
+	if c.App.ShutdownTimeout <= 0 {
+		errs = append(errs, "SHUTDOWN_TIMEOUT must be greater than 0")
+	}
+	if budget := c.Gateway.Budget(); budget > 0 && c.App.ShutdownTimeout < budget {
+		errs = append(errs, fmt.Sprintf(
+			"SHUTDOWN_TIMEOUT (%s) must be at least the gateway budget GATEWAY_HTTP_TIMEOUT*GATEWAY_MAX_ATTEMPTS (%s), or a deploy can cut off a charge in flight",
+			c.App.ShutdownTimeout, budget,
+		))
 	}
 
 	if c.Routing.FXReconciliationTolerancePct < 0 || c.Routing.FXReconciliationTolerancePct > 100 {
@@ -451,6 +553,96 @@ func validHostPort(addr string) bool {
 	}
 	n, err := strconv.ParseUint(port, 10, 16)
 	return err == nil && n > 0
+}
+
+func splitList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func parseServiceTokens(raw string, errs *[]string) map[string]string {
+	out := map[string]string{}
+	for i, entry := range splitList(raw) {
+		sep := strings.LastIndex(entry, "=")
+		if sep <= 0 || sep == len(entry)-1 {
+			*errs = append(*errs, fmt.Sprintf("SERVICE_TOKENS entry %d must be token=merchantID", i+1))
+			continue
+		}
+		token := entry[:sep]
+		merchant, err := uuid.Parse(entry[sep+1:])
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("SERVICE_TOKENS entry %d: merchant ID must be a UUID", i+1))
+			continue
+		}
+		if len(token) < MinTokenLength {
+			*errs = append(*errs, fmt.Sprintf("SERVICE_TOKENS entry %d: token must be at least %d characters", i+1, MinTokenLength))
+			continue
+		}
+		if _, dup := out[token]; dup {
+			*errs = append(*errs, fmt.Sprintf("SERVICE_TOKENS entry %d repeats an earlier token", i+1))
+			continue
+		}
+		out[token] = merchant.String()
+	}
+	return out
+}
+
+func parseOpsTokens(raw string, errs *[]string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for i, token := range splitList(raw) {
+		if len(token) < MinTokenLength {
+			*errs = append(*errs, fmt.Sprintf("OPS_TOKENS entry %d: token must be at least %d characters", i+1, MinTokenLength))
+			continue
+		}
+		if seen[token] {
+			*errs = append(*errs, fmt.Sprintf("OPS_TOKENS entry %d repeats an earlier token", i+1))
+			continue
+		}
+		seen[token] = true
+		out = append(out, token)
+	}
+	return out
+}
+
+func parseWebhookSecrets(raw string, errs *[]string) map[string]string {
+	out := map[string]string{}
+	for i, entry := range splitList(raw) {
+		sep := strings.Index(entry, "=")
+		if sep <= 0 || sep == len(entry)-1 {
+			*errs = append(*errs, fmt.Sprintf("WEBHOOK_SECRETS entry %d must be gatewayID=secret", i+1))
+			continue
+		}
+		gatewayID := entry[:sep]
+		if _, dup := out[gatewayID]; dup {
+			*errs = append(*errs, fmt.Sprintf("WEBHOOK_SECRETS entry %d repeats gateway %q", i+1, gatewayID))
+			continue
+		}
+		out[gatewayID] = entry[sep+1:]
+	}
+	return out
+}
+
+func parseTrustedProxies(raw string, errs *[]string) []netip.Prefix {
+	var out []netip.Prefix
+	for i, entry := range splitList(raw) {
+		p, err := netip.ParsePrefix(entry)
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("TRUSTED_PROXY_CIDRS entry %d must be a CIDR such as 10.1.0.0/16", i+1))
+			continue
+		}
+		out = append(out, p.Masked())
+	}
+	return out
 }
 
 func quoteDSNValue(v string) string {

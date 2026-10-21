@@ -136,3 +136,52 @@ func TestReaper_HonoursConfiguredTimeout(t *testing.T) {
 		t.Errorf("expected configured 90s timeout, got %s", sweeper.staleArg)
 	}
 }
+
+type fakeReviewCounter struct {
+	pending int64
+	err     error
+}
+
+func (f fakeReviewCounter) CountPendingReview(context.Context) (int64, error) {
+	return f.pending, f.err
+}
+
+type gaugeMetrics struct {
+	gauges map[string]float64
+}
+
+func (m *gaugeMetrics) Increment(string, map[string]string)          {}
+func (m *gaugeMetrics) Histogram(string, float64, map[string]string) {}
+func (m *gaugeMetrics) Gauge(name string, v float64, _ map[string]string) {
+	m.gauges[name] = v
+}
+
+func TestReaper_ReportsPendingReviewsAsAGauge(t *testing.T) {
+	r := New(fakeLister{}, &fakeRecoverer{}, &fakeSweeper{}, noopLogger{}, Config{})
+	metrics := &gaugeMetrics{gauges: map[string]float64{}}
+	r.SetReviewGauge(fakeReviewCounter{pending: 3}, metrics)
+
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := metrics.gauges[ports.MetricTransactionReviewPending]; !ok || got != 3 {
+		t.Fatalf("expected the pending-review gauge at 3 so an alert can fire on rows awaiting ops, got %v (set=%v)", got, ok)
+	}
+}
+
+func TestReaper_PendingReviewCountFailureDoesNotStopTheSweep(t *testing.T) {
+	sweeper := &fakeSweeper{}
+	r := New(fakeLister{}, &fakeRecoverer{}, sweeper, noopLogger{}, Config{})
+	metrics := &gaugeMetrics{gauges: map[string]float64{}}
+	r.SetReviewGauge(fakeReviewCounter{err: errors.New("db down")}, metrics)
+
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := metrics.gauges[ports.MetricTransactionReviewPending]; ok {
+		t.Error("a failed count must not publish a misleading value")
+	}
+	if sweeper.sweepCalls != 1 {
+		t.Error("the idempotency sweep must still run")
+	}
+}

@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
-	"strings"
 
 	"samarth/payment-service/internal/ports"
 )
@@ -43,11 +42,6 @@ func MerchantIDFromContext(ctx context.Context) string {
 func Authenticate(provider TokenProvider, log ports.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/health" || strings.HasPrefix(r.URL.Path, "/webhooks/") {
-				next.ServeHTTP(w, r)
-				return
-			}
-
 			principal, ok := authenticate(r, provider)
 			if !ok {
 				log.Warn("auth.rejected", map[string]any{"path": r.URL.Path})

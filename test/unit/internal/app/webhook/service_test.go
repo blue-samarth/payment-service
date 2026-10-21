@@ -14,14 +14,23 @@ import (
 
 type fakeTxns struct {
 	txn     *transaction.Transaction
+	byID    *transaction.Transaction
 	updates int
+	saved   []transaction.Transaction
 }
 
 func (f *fakeTxns) GetByGatewayReference(context.Context, string, string) (*transaction.Transaction, error) {
 	return f.txn, nil
 }
+func (f *fakeTxns) FindByID(_ context.Context, id uuid.UUID) (*transaction.Transaction, error) {
+	if f.byID == nil || f.byID.ID != id {
+		return nil, nil
+	}
+	return f.byID, nil
+}
 func (f *fakeTxns) UpdateStatus(_ context.Context, t *transaction.Transaction) error {
 	f.updates++
+	f.saved = append(f.saved, *t)
 	return nil
 }
 
@@ -120,6 +129,75 @@ func TestProcess_UnknownTransaction(t *testing.T) {
 	}
 	if !out.UnknownTxn {
 		t.Errorf("expected UnknownTxn, got %+v", out)
+	}
+}
+
+func unreferencedTxn(gateway string) *transaction.Transaction {
+	t := processingTxn()
+	t.GatewayReferenceID = ""
+	t.ActualGateway = gateway
+	return t
+}
+
+func TestProcess_MatchesByTransactionIDWhenTheReferenceWasNeverSaved(t *testing.T) {
+	txn := unreferencedTxn("razorpay")
+	txns := &fakeTxns{byID: txn}
+	outbox := &fakeOutbox{}
+	s := NewService(txns, &fakeWebhooks{recorded: true}, outbox, fakeTransactor{}, noopLogger{}, noopMetrics{})
+
+	out, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_9", TransactionID: txn.ID.String(), Status: "success"}, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Resolved || out.Status != transaction.StatusSucceeded {
+		t.Fatalf("a late webhook must settle a transaction whose reference was lost, got %+v", out)
+	}
+	if len(txns.saved) != 1 || txns.saved[0].GatewayReferenceID != "order_9" {
+		t.Errorf("the recovered reference must be persisted, got %+v", txns.saved)
+	}
+}
+
+func TestProcess_NonTerminalWebhookStillRecordsTheRecoveredReference(t *testing.T) {
+	txn := unreferencedTxn("razorpay")
+	txns := &fakeTxns{byID: txn}
+	s := NewService(txns, &fakeWebhooks{recorded: true}, &fakeOutbox{}, fakeTransactor{}, noopLogger{}, noopMetrics{})
+
+	out, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_9", TransactionID: txn.ID.String(), Status: "pending"}, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.Resolved || len(txns.saved) != 1 || txns.saved[0].GatewayReferenceID != "order_9" {
+		t.Errorf("the reference must be saved so the reaper can check status, got %+v saved=%+v", out, txns.saved)
+	}
+}
+
+func TestProcess_TransactionIDFallbackRefusesMismatches(t *testing.T) {
+	cases := map[string]struct {
+		txn     *transaction.Transaction
+		gateway string
+		txID    func(*transaction.Transaction) string
+	}{
+		"other gateway's transaction": {unreferencedTxn("stripe"), "razorpay", func(t *transaction.Transaction) string { return t.ID.String() }},
+		"reference already set": {func() *transaction.Transaction {
+			t := unreferencedTxn("razorpay")
+			t.GatewayReferenceID = "order_1"
+			return t
+		}(), "razorpay", func(t *transaction.Transaction) string { return t.ID.String() }},
+		"not a UUID": {unreferencedTxn("razorpay"), "razorpay", func(*transaction.Transaction) string { return "not-a-uuid" }},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			txns := &fakeTxns{byID: tc.txn}
+			s := NewService(txns, &fakeWebhooks{recorded: true}, &fakeOutbox{}, fakeTransactor{}, noopLogger{}, noopMetrics{})
+
+			out, err := s.Process(context.Background(), tc.gateway, Event{EventID: "evt", GatewayReferenceID: "order_9", TransactionID: tc.txID(tc.txn), Status: "success"}, []byte(`{}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !out.UnknownTxn || txns.updates != 0 {
+				t.Errorf("the fallback must not attach a webhook to a transaction it does not belong to, got %+v updates=%d", out, txns.updates)
+			}
+		})
 	}
 }
 

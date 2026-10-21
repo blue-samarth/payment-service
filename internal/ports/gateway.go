@@ -19,6 +19,7 @@ var (
 type GatewayWebhookEvent struct {
 	EventID            string
 	GatewayReferenceID string
+	TransactionID      string
 	Status             GatewayPaymentStatus
 }
 

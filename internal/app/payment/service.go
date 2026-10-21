@@ -22,6 +22,7 @@ type TransactionRepo interface {
 	Insert(ctx context.Context, t *transaction.Transaction) error
 	GetByID(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error)
 	UpdateStatus(ctx context.Context, t *transaction.Transaction) error
+	MarkReviewRequired(ctx context.Context, id uuid.UUID, reason string) (bool, error)
 }
 type EventWriter interface {
 	Write(ctx context.Context, event ports.OutboxEvent) error
@@ -89,15 +90,25 @@ type Service struct {
 	intents        IntentTracker
 	idem           *idempotency.Guard
 	maxAttempts    int
+	httpTimeout    time.Duration
 	log            ports.Logger
 	metrics        ports.MetricRecorder
 }
 
-func (s *Service) SetCancelResolver(r CancelResolver)  { s.cancelResolver = r }
-func (s *Service) SetCircuitBreaker(b CircuitBreaker)  { s.breaker = b }
-func (s *Service) SetIntentTracker(t IntentTracker)    { s.intents = t }
-func (s *Service) SetMaxGatewayAttempts(n int)         { s.maxAttempts = n }
-func (s *Service) SetIdempotency(g *idempotency.Guard) { s.idem = g }
+func (s *Service) SetCancelResolver(r CancelResolver)    { s.cancelResolver = r }
+func (s *Service) SetCircuitBreaker(b CircuitBreaker)    { s.breaker = b }
+func (s *Service) SetIntentTracker(t IntentTracker)      { s.intents = t }
+func (s *Service) SetMaxGatewayAttempts(n int)           { s.maxAttempts = n }
+func (s *Service) SetGatewayHTTPTimeout(d time.Duration) { s.httpTimeout = d }
+func (s *Service) SetIdempotency(g *idempotency.Guard)   { s.idem = g }
+
+func (s *Service) gatewayBudget() time.Duration {
+	attempts := s.maxAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	return time.Duration(attempts) * s.httpTimeout
+}
 
 func NewService(
 	repo TransactionRepo,

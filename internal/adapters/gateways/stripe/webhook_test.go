@@ -35,6 +35,21 @@ func TestParseWebhook_Valid(t *testing.T) {
 	}
 }
 
+func TestParseWebhook_CarriesTransactionIDFromMetadata(t *testing.T) {
+	a := New(Config{})
+	secret := "whsec_test"
+	body := []byte(`{"id":"evt_1","type":"payment_intent.succeeded","data":{"object":{"id":"pi_1","status":"succeeded","metadata":{"transaction_id":"0b7c3a52-6a3e-4c1f-9d2e-6f1a2b3c4d5e"}}}}`)
+	headers := map[string]string{"Stripe-Signature": stripeSig(secret, time.Now().Unix(), body)}
+
+	ev, err := a.ParseWebhook(body, headers, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.TransactionID != "0b7c3a52-6a3e-4c1f-9d2e-6f1a2b3c4d5e" {
+		t.Errorf("the transaction id set as metadata at creation must come back for fallback matching, got %q", ev.TransactionID)
+	}
+}
+
 func TestParseWebhook_BadSignature(t *testing.T) {
 	a := New(Config{})
 	body := []byte(`{"id":"evt_1","data":{"object":{"id":"pi_1","status":"succeeded"}}}`)

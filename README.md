@@ -163,7 +163,8 @@ internal/
     observability/ slog logger with field redaction, no-op metrics
   api/
     handlers/      HTTP handlers (payment, refund, cancel, webhook, health)
-    middleware/    Auth, RateLimit, Idempotency, RequestID, Recover
+    middleware/    Auth, RateLimit, ClientIP, Idempotency, RequestID, Recover
+  server/          Listener lifecycle: bind, serve, drain, concurrent shutdown
   jobs/
     partition_manager/  Weekly outbox partition lifecycle
     lease_expiry/       Stuck-transaction reaper + idempotency-key sweep
@@ -288,6 +289,11 @@ Filtering (candidates are dropped before scoring, `filterReason`):
 - Currency not supported
 - Live circuit breaker `OPEN` and still within cooldown
 - 24h discrepancy rate > 20%
+
+The request-independent checks (inactive, breaker, discrepancy) live in `UnavailableReason`,
+which `filterReason` calls after the amount and currency checks. `Router.Availability` applies
+that same function, with the same live breaker lookup, to answer "is this gateway routable
+right now" for `/health-gateways` (§20), so the health view cannot disagree with routing.
 
 Scoring (each candidate gets a 0–100 sub-score per dimension, combined via configurable `Weights` that must sum to 1.0, ±0.001 tolerance, with at most 2 zero-weighted dimensions):
 
@@ -487,9 +493,12 @@ flowchart TD
     Tx --> Record[RecordEvent eventID, gatewayID]
     Record --> Dup{Already recorded?}
     Dup -->|Yes| DupOut[Outcome: Duplicate<br/>no-op, commit]
-    Dup -->|No| Lookup[GetByGatewayReference]
+    Dup -->|No| Lookup[GetByGatewayReference<br/>reference + gateway last called]
     Lookup --> Found{Transaction found?}
-    Found -->|No| UnkOut[Outcome: UnknownTxn]
+    Found -->|No| ByID{Transaction ID in payload,<br/>same gateway, no reference yet?}
+    ByID -->|No| UnkOut[Outcome: UnknownTxn]
+    ByID -->|Yes| Attach[Attach and save reference]
+    Attach --> Raw
     Found -->|Yes| Raw[InsertRawMetadata]
     Raw --> Terminal{Status maps to<br/>terminal AND txn is PROCESSING?}
     Terminal -->|No| NoopOut[No transition,<br/>return current status]
@@ -509,6 +518,8 @@ Security and correctness details:
 - **Per-gateway signature verification** is delegated to each adapter's `ParseWebhook` (`GatewayWebhookParser`): Stripe verifies an HMAC-SHA256 over `timestamp.body` and rejects payloads outside a 300-second tolerance window; Razorpay verifies an HMAC-SHA256 header signature; PayU verifies its SHA-512 "reverse hash" over form fields (including the optional `additionalCharges` field, which changes the digest if present).
 - **Duplicate delivery is a no-op, not an error**: gateways commonly redeliver webhooks; `RecordEvent` uses a unique constraint on `(event_id, gateway_id)` so a redelivery is detected and short-circuited before any transaction mutation, still returning `200 OK`.
 - **Only `PROCESSING` transactions are mutated**, and only for a status that maps to a terminal outcome (`succeeded/success/captured/paid` → `SUCCEEDED`; `failed/failure` → `FAILED`). A webhook arriving for an already-terminal or non-`PROCESSING` transaction is accepted but causes no transition — this prevents a stale or out-of-order webhook from clobbering a status that a different code path (e.g. the reaper) already resolved.
+- **Matching uses the gateway last called.** The lookup compares against `actual_gateway` (falling back to the originally routed `gateway_id`), so after a fallback from Stripe to Razorpay, Razorpay's webhook finds the payment. It used to compare against `gateway_id`, which is never updated, so such webhooks were reported as unknown.
+- **Fallback match by transaction ID.** When no row has the reference (the process died before saving it), the payload's transaction ID is used: Stripe's `metadata.transaction_id`, or Razorpay's order or payment `notes.transaction_id`. It only matches a transaction routed to the same gateway that has no reference yet, so a webhook cannot be attached to another gateway's payment or overwrite a reference. The payload is signature-verified first, and the ID is one we set when creating the payment.
 - **Timestamp/replay-window check** (`checkTimestamp`) is optional per gateway (`ConfigStore.WebhookPolicy`) and only enforced if the gateway sends an `X-Webhook-Timestamp` header.
 
 ---
@@ -584,8 +595,13 @@ flowchart TD
 
     Loop --> Recover[payment.Service.RecoverExpiredLease id]
     Recover --> LoadTxn[Load txn, check still PROCESSING<br/>and lease actually expired]
-    LoadTxn --> CheckStatus[adapter.CheckStatus at gateway]
+    LoadTxn --> HasRef{Gateway reference<br/>recorded?}
+    HasRef -->|Yes| CheckStatus[adapter.CheckStatus at gateway]
+    HasRef -->|No, idempotent gateway,<br/>within 23h| Replay[Replay InitiatePayment<br/>same request, same idempotency key]
+    HasRef -->|No, otherwise| Manual[Mark review_required_at<br/>count + log, stays PROCESSING,<br/>no longer listed]
     CheckStatus --> Outcome{Gateway status}
+    Replay --> Outcome
+    Manual --> NextTxn
 
     Outcome -->|SUCCEEDED| FinalizeOK[finalize → SUCCEEDED<br/>+ PAYMENT_SUCCEEDED event]
     Outcome -->|FAILED| FinalizeFail[finalize → FAILED<br/>+ PAYMENT_FAILED event]
@@ -600,7 +616,17 @@ flowchart TD
     DeleteExp --> End([Done])
 ```
 
-- **Status-check, never a blind retry**: `RecoverExpiredLease` calls `CheckStatus` (a read-only query against the gateway) rather than re-attempting `InitiatePayment`, so it can never create a duplicate charge — it only ever finds out what already happened and records that truth.
+- **Status check when the reference is known**: `RecoverExpiredLease` calls `CheckStatus`, a read-only query by the gateway reference, so it only finds out what already happened and records it.
+- **The reference is saved as soon as the gateway answers**, in its own write right after `InitiatePayment` returns, before fallback or `finalize`. An interruption after that point leaves a row the reaper can status-check, so the cases below only arise when the process dies during the gateway call itself or between the answer and that write.
+- **Idempotent replay when it is not**: if the process died before the reference was saved (deploy, crash, OOM), there is nothing to look up. A status check by an empty reference returns a request error, which used to finalize the payment as `FAILED` even if the card had been charged. The reaper now re-sends the original `InitiatePayment` request instead, **only to gateways whose adapter declares `IdempotencyCapable`**. Adapters derive their idempotency key from the transaction ID and attempt number, so the request carries the same key: Stripe returns the stored result of the first call rather than charging again, and PayU's initiate is a local, deterministic transaction ID. Razorpay declares itself not idempotent (its key is only an order `receipt` label, not enforced as unique), so a replay would create a second order; it is never replayed. After a replay only a definite status or a replayed decline is final; any other error, such as an idempotency conflict while the original call is still in flight, leaves the transaction `PROCESSING` for the next sweep. A replayed soft decline is final too: the live path would have fallen back to another gateway with the customer present, but opening a new charge from a background job hours later is a policy decision, not recovery, so the payment is `FAILED` with reason `soft_decline` and the merchant can retry.
+- **Manual review is a recorded state, not a log line**: with no reference and a non-idempotent gateway, or past 23 hours (Stripe keeps idempotency keys for 24), nothing is sent. The row is marked with `review_required_at` and `review_reason` (`gateway_not_idempotent` or `replay_window_passed`), counted once in `transaction.review_required` (tagged with gateway and reason, for alerting), logged as `recovery_requires_manual_review`, and dropped from the expired-lease listing so the reaper stops re-processing it. The status stays `PROCESSING`, which is true: the outcome is unknown until someone checks the gateway dashboard. `GET /payments/{id}` returns `"review_required": true` so the merchant can see why it is not moving.
+- **Review rows get resolved, two ways**:
+  - **A late webhook settles it.** Webhooks match by gateway reference, and fall back to our transaction ID, which every payment carries to Stripe (`metadata[transaction_id]`) and Razorpay (`notes.transaction_id`). The fallback only attaches to a transaction of the same gateway that has no reference yet, then saves the reference (even for a non-terminal event, so the reaper can status-check it) and settles it as usual.
+  - **Ops resolves it.** `POST /payments/{id}/resolve` (ops token only) with `{"status":"SUCCEEDED"|"FAILED","gateway_reference_id":"…","note":"…"}` settles a row under review through the same `finalize` path as live processing: terminal outbox event, cancel-intent auto-refund, metrics. `SUCCEEDED` requires the gateway reference, so the payment can be refunded later. A row not under review, or already settled, returns `409`.
+- **Pending reviews are a gauge**: the reaper publishes `transaction.review_pending` (rows `PROCESSING` and marked) on every run. Alert on it being above zero; `transaction.review_required` counts new reviews by gateway and reason.
+- **The lease covers the gateway budget**: a transaction's processing timeout is the configured gateway/method timeout or the gateway budget (`GATEWAY_HTTP_TIMEOUT × GATEWAY_MAX_ATTEMPTS`) + 30s, whichever is longer, so the reaper never acts while the live handler can still be calling the gateway. The handler's own deadline is the budget + 10s, so it always ends at least 20s before the lease does. If the reaper settles a payment anyway and the handler's own `finalize` then fails, the handler reloads the row and returns the settled state instead of an error.
+- **The gateway is recorded before it is called**: the `PROCESSING` write sets `actual_gateway`, and a fallback saves the switch to the next gateway before calling it (and skips the fallback if that write fails), so recovery always queries the gateway that may have charged.
+- **A client disconnect does not abort a charge**: the gateway calls and `finalize` run on a context detached from the request (`context.WithoutCancel`), so a merchant that drops the connection mid-request no longer cuts off a gateway call that may already have charged. The detached work has its own deadline (gateway budget + 10s) as a backstop to the per-call HTTP timeouts.
 - **One failure doesn't abort the batch**: each transaction ID is recovered independently; a single recovery error is logged and the loop continues to the rest (`TestReaper_PerItemFailureDoesNotAbortSweep`).
 - **Piggy-backed idempotency-key hygiene**: the same run also sweeps `idempotency_keys` rows — `PROCESSING` rows older than `IdempotencyProcessingTimeout` (default 5 minutes, meaning a crashed request that never called `Complete`/rolled back cleanly) are cleared so retries aren't blocked forever, and `COMPLETED` rows past their TTL are purged to bound table growth.
 
@@ -624,7 +650,10 @@ Responsibilities, all guarded by a single Postgres advisory lock (`AcquireLock`/
 
 - **Local in-memory fallback**: if Redis is unavailable for `failureThreshold` (3) consecutive calls, the limiter flips to a local, per-process token bucket sized at `capacity × FallbackMultiplier` (default 0.5 — deliberately more conservative than the Redis-backed limit), backed by an LRU (`container/list`) capped at `LocalMaxBuckets` to bound memory. A background health check restores the Redis-backed path once it recovers.
 - **Merchant bucket key comes from the authenticated principal**, never a client-supplied header — `merchantBucketID` reads from request context (set by the auth middleware), so a spoofed `X-Merchant-ID` header can't be used to attribute load to (or rate-limit) a different merchant.
+- **The IP bucket key is the TCP peer by default.** `X-Forwarded-For` is honoured only when the peer is inside `TRUSTED_PROXY_CIDRS` (empty by default). Even then the header is walked right to left and the first hop outside the trusted ranges is used, so entries a caller prepends are never chosen. With TCP passthrough on the planned NLB (TLS terminated in the process), leave `TRUSTED_PROXY_CIDRS` empty and enable client IP preservation on the target group. When the load balancer terminates TLS (`WEBHOOK_TLS_MODE=lb`), it opens its own connection to the pod, so the TCP peer of every request is the load balancer. Use one that sets `X-Forwarded-For` (an ALB) and list its subnets in `TRUSTED_PROXY_CIDRS`, or every caller shares one bucket. An NLB TLS listener adds no such header, so it cannot carry the client address this way. `cmd/api` logs `rate_limit.proxy_untrusted` at startup for `lb` mode with an empty list.
+- **IPv6 callers are bucketed per /64**, the smallest block normally assigned to one site, so rotating addresses inside it does not give a fresh bucket. IPv4 stays per address.
 - Rejections return `429` with a computed `Retry-After` header (minimum 1 second).
+- `RATE_LIMIT_CAPACITY` and `RATE_LIMIT_REFILL_PER_SEC` are validated at startup; a malformed value fails `LoadConfig` instead of silently using the default.
 
 ---
 
@@ -635,17 +664,58 @@ Responsibilities, all guarded by a single Postgres advisory lock (`AcquireLock`/
 - **Service tokens** (`X-Service-Token`) map to a specific `MerchantID` — the merchant identity is *bound to the token*, not read from any request header, which is what makes the rate-limiter merchant-key spoofing protection in §15 possible.
 - **Ops tokens** (`X-Ops-Token`) grant the `ops` role without a merchant binding (used for cancel/refund operational actions).
 
-Tokens are stored hashed (SHA-256) in memory; `/health` and `/webhooks/*` are exempt from authentication (webhooks authenticate via gateway signature instead, §11). If no tokens are configured at all, auth middleware is skipped entirely and a warning is logged — appropriate for local development, not for production.
+Tokens are stored hashed (SHA-256) in memory. Authentication runs only on the merchant listener (§17) and has no path-based exemptions: webhooks are served on their own listener and authenticate via gateway signature (§11), and health endpoints are served on an internal-only listener. If no tokens are configured, the API refuses to start unless `ALLOW_NO_AUTH=true` is set explicitly, in which case it logs a warning and serves unauthenticated — for local development only.
 
 ---
 
 ## 17. Transport Security (mTLS)
 
-`internal/adapters/security.Manager` wraps Go's `crypto/tls` to support mutual TLS with **hot certificate rotation**:
+`cmd/api` serves three listeners, so each kind of caller gets the transport it can use:
 
-- Loads the server keypair and (optionally) a client-CA pool; if `MtlsStrictMode` is enabled, unauthenticated/untrusted client certificates are rejected (`RequireAndVerifyClientCert`), otherwise client certs are verified only if presented (`VerifyClientCertIfGiven`).
+| Listener | Port (default) | Transport | Routes |
+|---|---|---|---|
+| Merchant API | `PORT` (8080) | mTLS, strict by default | payments, refunds, cancel |
+| Webhooks | `WEBHOOK_PORT` (8081) | server TLS, no client certificate | `POST /webhooks/gateway/{gateway_id}` |
+| Health | `HEALTH_PORT` (8082) | plain HTTP, never exposed through the load balancer; binds all interfaces because the kubelet probes the pod IP, so restrict it with a NetworkPolicy | health endpoints (§20) |
+
+The split exists because a TLS handshake happens before any HTTP routing: with one strict
+mTLS listener, Stripe, Razorpay, PayU and the kubelet's probes (none of which hold a
+certificate from our CA) were refused before any path-based exemption could apply.
+
+`internal/server.Run` owns the listener lifecycle:
+
+- **Startup:** every port is bound before any is served, so a port conflict fails startup at once and names the listener. Readiness (`/health-overall`) reports `starting` with `503` until all three are serving.
+- **Timeouts per listener:**
+
+  | Listener | Read header | Read | Write | Idle |
+  |---|---|---|---|---|
+  | Merchant | 10s | 30s | gateway budget (`GATEWAY_HTTP_TIMEOUT` × `GATEWAY_MAX_ATTEMPTS`) + 30s | 120s |
+  | Webhook | 10s | 15s | 30s | 60s |
+  | Health | 5s | 5s | 10s | 30s |
+
+- **Shutdown on `SIGTERM`/`SIGINT`**, or when any listener fails:
+  1. Readiness flips to `draining` (`503`) while every listener keeps serving for `SHUTDOWN_DRAIN_DELAY` (default 5s), so the load balancer deregisters the instance before connections are refused. Liveness stays `200`.
+  2. The merchant and webhook servers shut down **concurrently** within `SHUTDOWN_TIMEOUT` (default: gateway budget + 15s, 105s with the defaults; validated to be at least the budget). `Shutdown` returns as soon as the servers are idle, so the long deadline only matters when a charge is actually in flight. A server still busy at the deadline is force-closed, and the error names it.
+  3. The health server stops last, under its own 5s deadline, so probes get an answer throughout even if the others used the whole budget.
+
+  A listener failing during the drain delay ends the delay early. A second `SIGTERM`/`SIGINT` restores the default signal handling and kills the process immediately.
+
+  Set the pod's `terminationGracePeriodSeconds` above `SHUTDOWN_DRAIN_DELAY + SHUTDOWN_TIMEOUT + 5s` (115s with the defaults; the Kubernetes default of 30s is too short).
+
+  A charge is only cut off if the process is killed before `SHUTDOWN_TIMEOUT` (a crash, an OOM kill, or a grace period set too short). The transaction is then already `PROCESSING` with the gateway recorded, and the lease-expiry reaper resolves it or marks it for review (§13).
+
+`internal/adapters/security.Manager` wraps Go's `crypto/tls` with **hot certificate rotation**:
+
+- Loads the server keypair and an optional client-CA pool. With a CA and `MtlsStrictMode`, untrusted or missing client certificates are rejected (`RequireAndVerifyClientCert`); with `MTLS_STRICT_MODE=false` they are verified only if presented (`VerifyClientCertIfGiven`). Without a CA it requests no client certificate, which is how the webhook listener runs.
 - `StartRefresh(ctx)` runs a background ticker (`CertRefreshIntervalSec`) that reloads the certificate and CA pool from disk without restarting the process — new connections pick up the rotated cert immediately via `GetConfigForClient`, existing connections are unaffected.
-- If `TLS_CERT_FILE` isn't configured, the server runs plain HTTP (suitable for local dev or when TLS is terminated upstream, e.g. behind a load balancer).
+- Each manager has a name (`merchant`, `webhook`) that tags its certificate-expiry gauge and reload metrics, so the two certificates are alerted on separately.
+- A reload that finds an expired certificate is rejected and the last good certificate keeps serving. Once that certificate itself expires, `/health-overall` reports `tls_<name>: expired` and an overall `degraded`, but stays `200`. Every pod mounts the same certificate, so failing readiness would remove all of them at once, including the webhook listener, and leave the Service with no endpoints. Inside 14 days of expiry it reports `expiring`. Alert on `tls_cert_expiry_seconds` well before either.
+- The merchant listener accepts TLS 1.3 only. The webhook listener accepts TLS 1.2 and 1.3, because it serves third-party senders whose TLS 1.3 support is not guaranteed; on 1.2 it offers only forward-secret AEAD suites (ECDHE with AES-GCM or ChaCha20-Poly1305).
+
+The webhook listener needs a publicly trusted certificate, unlike the private-CA certificate on the merchant listener. `WEBHOOK_TLS_MODE` selects how it gets TLS:
+
+- `app` (default): TLS terminates in the process with `WEBHOOK_TLS_CERT_FILE`/`WEBHOOK_TLS_KEY_FILE`; startup fails if either is missing.
+- `lb`: the listener serves plain HTTP and the load balancer terminates TLS; a startup warning is logged. Plaintext is therefore always an explicit choice, never the result of a missing variable.
 
 ---
 
@@ -670,14 +740,21 @@ Tokens are stored hashed (SHA-256) in memory; `/health` and `/webhooks/*` are ex
 
 ## 20. API Reference
 
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| `GET` | `/health` | none | DB connectivity check |
-| `POST` | `/payments` | service/ops token | Create + immediately attempt a payment. Requires `Idempotency-Key`. |
-| `GET` | `/payments/{id}` | service/ops token | Fetch a transaction by ID |
-| `POST` | `/payments/{id}/refunds` | service/ops token | Initiate + immediately attempt a refund. Requires `Idempotency-Key`. |
-| `POST` | `/payments/{id}/cancel` | service/ops token | Request cancellation (idempotent; safe on already-terminal transactions) |
-| `POST` | `/webhooks/gateway/{gateway_id}` | gateway signature | Inbound gateway status callback |
+| Listener | Method | Path | Auth | Description |
+|---|---|---|---|---|
+| Merchant | `POST` | `/payments` | service/ops token | Create + immediately attempt a payment. Requires `Idempotency-Key`. |
+| Merchant | `GET` | `/payments/{id}` | service/ops token | Fetch a transaction by ID |
+| Merchant | `POST` | `/payments/{id}/refunds` | service/ops token | Initiate + immediately attempt a refund. Requires `Idempotency-Key`. |
+| Merchant | `POST` | `/payments/{id}/resolve` | ops token only | Settle a payment marked for manual review (§13): `{"status":"SUCCEEDED"\|"FAILED","gateway_reference_id":"…","note":"…"}`. `403` without an ops principal, `409` if not under review |
+| Merchant | `POST` | `/payments/{id}/cancel` | service/ops token | Request cancellation (idempotent; safe on already-terminal transactions) |
+| Webhook | `POST` | `/webhooks/gateway/{gateway_id}` | gateway signature | Inbound gateway status callback |
+| Health | `GET` | `/health` | none | Liveness: the process is serving; no dependency calls |
+| Health | `GET` | `/health-db` | none | Postgres reachability (`503` when down) |
+| Health | `GET` | `/health-cache` | none | Redis reachability (`503` when down) |
+| Health | `GET` | `/health-overall` | none | Readiness: `503` before all listeners are serving (`app: starting`), while shutting down (`app: draining`), or if the database is down. A Redis outage or an expired served certificate (`tls_<name>: expired`) reports `degraded` with `200` |
+| Health | `GET` | `/health-gateways` | none | Per-gateway availability (routable now, and why not if not), breaker state, cooldown and failure count. Always `200`; diagnostic, not a probe |
+
+Use `/health` for the liveness probe and `/health-overall` for the readiness probe and the load balancer health check. None of the health endpoints are rate-limited.
 
 Common error shape: `{"error": {"code": "...", "message": "..."}}`. Notable status codes beyond the obvious 200/201/400/404:
 
@@ -694,18 +771,43 @@ All configuration is via environment variables, loaded and validated in `config/
 
 | Area | Key variables | Notes |
 |---|---|---|
-| App | `ENVIRONMENT` (prod/staging/dev), `PORT`, `MTLS_STRICT_MODE` | |
+| App | `ENVIRONMENT` (prod/staging/dev), `PORT`, `WEBHOOK_PORT`, `HEALTH_PORT`, `WEBHOOK_TLS_MODE` (`app`\|`lb`), `MTLS_STRICT_MODE`, `SHUTDOWN_DRAIN_DELAY` (5s), `SHUTDOWN_TIMEOUT` (gateway budget + 15s) | The three ports must be distinct. `SHUTDOWN_TIMEOUT` must be at least the gateway budget. With `ENVIRONMENT=prod`, `MTLS_STRICT_MODE=false` and `ALLOW_NO_AUTH=true` fail startup; `REDIS_TLS_ENABLED=false` and `WEBHOOK_TLS_MODE=lb` stay allowed (the first logs a warning) |
 | Database | `DATABASE_PRIMARY_HOST`, `DATABASE_REPLICA_HOST`, `DATABASE_NAME/USER/PASSWORD`, `DATABASE_SSL_MODE` | Pool sizing via `DATABASE_MAX_OPEN_CONNS` etc. |
-| Redis | `REDIS_ADDRS` (comma-separated), separate DBs for rate-limit vs. cache | |
+| Redis | `REDIS_ADDRS` (single primary endpoint), `REDIS_TLS_ENABLED`, `REDIS_USERNAME`, `REDIS_PASSWORD`, separate DBs for rate-limit vs. cache | Cluster mode is unsupported: it has only database 0 |
 | Outbox | `OUTBOX_RELAY_MODE` (`cdc`\|`polling`), `OUTBOX_RELAY_BATCH_SIZE`, `OUTBOX_RELAY_MAX_ATTEMPTS`, WAL-lag alert thresholds | Shard count fixed at 64 by schema |
-| Rate limit | `RATE_LIMIT_FALLBACK_MULTIPLIER` (0,1], `RATE_LIMIT_LOCAL_MAX_BUCKETS` | |
+| Rate limit | `RATE_LIMIT_CAPACITY` (100), `RATE_LIMIT_REFILL_PER_SEC` (50), `TRUSTED_PROXY_CIDRS` (empty), `RATE_LIMIT_FALLBACK_MULTIPLIER` (0,1], `RATE_LIMIT_LOCAL_MAX_BUCKETS` | `X-Forwarded-For` is ignored unless the peer is in `TRUSTED_PROXY_CIDRS` |
 | Routing | `ROUTING_SNAPSHOT_TTL_SECONDS`, `GATEWAY_FEE_CACHE_TTL_SEC`, `FX_RECONCILIATION_TOLERANCE_PCT` | |
-| Security | `TLS_CERT_FILE/KEY_FILE/CA_FILE`, `TLS_CERT_REFRESH_INTERVAL_SECONDS`, `DEK_CACHE_TTL_SECONDS` | TLS optional; omit to run plain HTTP |
+| Security | `TLS_CERT_FILE/KEY_FILE/CA_FILE`, `WEBHOOK_TLS_CERT_FILE/KEY_FILE`, `TLS_CERT_REFRESH_INTERVAL_SECONDS`, `DEK_CACHE_TTL_SECONDS` | Merchant TLS files are required; webhook files are required when `WEBHOOK_TLS_MODE=app` |
 | Jobs | `LEASE_EXPIRY_INTERVAL_SECONDS`, `JOB_LOCK_TIMEOUT_MINUTES` | |
-| Gateways | `STRIPE_API_KEY`, `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`, `PAYU_MERCHANT_KEY`/`PAYU_MERCHANT_SALT`, plus `*_BASE_URL` overrides for testing | |
-| Auth | `SERVICE_TOKENS` (`token=merchantID,...`), `OPS_TOKENS` (comma-separated) | Omit entirely to disable auth (dev only) |
+| Gateways | `STRIPE_API_KEY`, `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`, `PAYU_MERCHANT_KEY`/`PAYU_MERCHANT_SALT`, plus `*_BASE_URL` overrides for testing, `CIRCUIT_BREAKER_FAILURE_THRESHOLD` (5) | |
+| Auth | `SERVICE_TOKENS` (`token=merchantUUID,...`), `OPS_TOKENS` (comma-separated), `WEBHOOK_SECRETS` (`gatewayID=secret,...`) | `SERVICE_TOKENS` splits each entry on its **last** `=`, so tokens may contain `=`; the merchant must be a UUID and is stored in canonical form. Service and ops tokens must be at least 32 characters. `WEBHOOK_SECRETS` splits on the **first** `=`, so secrets may contain `=`. Empty parts and duplicates fail startup; errors name the entry number, never the value. Omit all tokens and set `ALLOW_NO_AUTH=true` to run without auth (rejected when `ENVIRONMENT=prod`) |
 
 `Validate(c)` additionally enforces cross-field invariants, e.g. `OUTBOX_RELAY_WAL_LAG_ALERT_THRESHOLD_MB < OUTBOX_RELAY_WAL_LAG_CRITICAL_THRESHOLD_MB`.
+
+### Upgrading to the three-listener layout
+
+Deployments that ran the single-listener build must change the following together with the image. Each item is breaking.
+
+| What changed | Before | After | Action |
+|---|---|---|---|
+| Gateway webhook URL | `https://<host>:<PORT>/webhooks/gateway/{id}` | `https://<host>:<WEBHOOK_PORT>/webhooks/gateway/{id}` (8081) | Update the endpoint in the Stripe, Razorpay and PayU dashboards. Add a load balancer listener for `WEBHOOK_PORT`. The old URL now gets a TLS handshake failure (no client certificate), so webhooks are lost until this is done. |
+| Webhook TLS | Merchant certificate | `WEBHOOK_TLS_CERT_FILE`/`WEBHOOK_TLS_KEY_FILE`, a publicly trusted certificate | Mount the files, or set `WEBHOOK_TLS_MODE=lb` if the load balancer terminates TLS. With neither, startup fails. |
+| Liveness probe | `GET /health` on `PORT` | `GET /health` on `HEALTH_PORT` (8082), plain HTTP | Point the probe at the new port and scheme. `/health` no longer checks Postgres or Redis. |
+| Readiness probe and LB health check | `GET /health` on `PORT` | `GET /health-overall` on `HEALTH_PORT` | Point both at the new path and port. It returns `503` until every listener is serving and while draining. |
+| Health exposure | Public on `PORT` | `HEALTH_PORT`, never exposed | Do not add an LB listener for it. |
+| `SERVICE_TOKENS` | Any `token=merchant`, bad entries skipped | Merchant must be a UUID; bad entries fail startup | Fix entries before rolling out. A non-UUID merchant could never have stored a transaction (`merchant_id` is `UUID`). |
+| Numeric env vars | `RATE_LIMIT_*`, `CIRCUIT_BREAKER_FAILURE_THRESHOLD` fell back to defaults silently | Malformed values fail startup | Check these values. |
+| Client IP for rate limits | First `X-Forwarded-For` entry | TCP peer unless it is in `TRUSTED_PROXY_CIDRS` | Behind an L7 proxy that sets the header, list its CIDRs. Behind the NLB, enable client IP preservation. |
+| Pod termination | 15s shared shutdown | `SHUTDOWN_DRAIN_DELAY` + `SHUTDOWN_TIMEOUT` + 5s for health; `SHUTDOWN_TIMEOUT` defaults to the gateway budget + 15s (115s total by default) | Set `terminationGracePeriodSeconds` above the sum (e.g. 120). An explicit `SHUTDOWN_TIMEOUT` below the gateway budget fails startup. |
+| Database migration | — | `000007` adds `review_required_at` and `review_reason` to `transactions` | Run migrations before rolling out; the reaper's listing query reads the new column. |
+| Stuck charges needing review | Logged only, re-listed every tick | Marked in the row; `transaction.review_pending` gauge; `GET /payments/{id}` shows `review_required`; settled by a late webhook or `POST /payments/{id}/resolve` | Alert on `transaction.review_pending > 0`; check the gateway dashboard and resolve with an ops token. |
+| Webhook matching | `gateway_id` + reference | Gateway last called + reference, then transaction ID from the payload | None. Fixes webhooks after a fallback being reported as unknown. |
+| `WEBHOOK_TLS_MODE=lb` rate limiting | Silent | Startup warning `rate_limit.proxy_untrusted` when `TRUSTED_PROXY_CIDRS` is empty | Use an LB that sets `X-Forwarded-For` and list its subnets. |
+| Token strength | Any length | Service and ops tokens at least 32 characters | Rotate short tokens before rolling out. |
+| Production guardrails | `ALLOW_NO_AUTH=true` and `MTLS_STRICT_MODE=false` accepted everywhere | Both fail startup when `ENVIRONMENT=prod` | Remove them from production manifests. |
+| Webhook TLS | TLS 1.3 only | TLS 1.2 (AEAD suites) and 1.3 | None. Before switching dashboard URLs, send a test webhook from each gateway's sandbox to the new port. |
+
+Suggested order: add the new LB listener and probes, roll out the image, then switch the gateway dashboards and confirm deliveries arrive on the new URL.
 
 ---
 

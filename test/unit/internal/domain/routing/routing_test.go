@@ -195,3 +195,27 @@ func TestDecision_IsExpired(t *testing.T) {
 		t.Error("expected decision to be fresh")
 	}
 }
+
+func TestUnavailableReason(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(c *Candidate)
+		want   string
+	}{
+		{"available", func(c *Candidate) {}, ""},
+		{"inactive", func(c *Candidate) { c.IsActive = false }, "inactive"},
+		{"cooldown active", func(c *Candidate) { c.CooldownUntil = time.Now().UTC().Add(time.Hour) }, "circuit_breaker_cooldown"},
+		{"circuit open", func(c *Candidate) { c.CircuitBreakerState = "OPEN" }, "circuit_breaker_open"},
+		{"discrepancy too high", func(c *Candidate) { c.DiscrepancyRate24h = 0.30 }, "discrepancy_rate_exceeded_0.30"},
+		{"request-level limits are ignored", func(c *Candidate) { c.MaxAmountPaise = 1; c.SupportedCurrencies = nil }, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := baseCandidate("g")
+			tc.mutate(&c)
+			if got := UnavailableReason(c); got != tc.want {
+				t.Errorf("UnavailableReason = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

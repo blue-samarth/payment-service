@@ -10,9 +10,10 @@ type Logger interface {
 }
 
 const (
-	LogEventTransactionCreated      = "transaction.created"
-	LogEventTransactionTransition   = "transaction.state_transition"
-	LogEventTransactionLeaseExpired = "transaction.lease_expired"
+	LogEventTransactionCreated        = "transaction.created"
+	LogEventTransactionTransition     = "transaction.state_transition"
+	LogEventTransactionLeaseExpired   = "transaction.lease_expired"
+	LogEventTransactionReviewResolved = "transaction.review_resolved"
 
 	LogEventGatewayRequest       = "gateway.request"
 	LogEventGatewayResponse      = "gateway.response"
@@ -45,6 +46,13 @@ const (
 
 	LogEventIdempotencySweep = "idempotency.sweep"
 
+	LogEventHealthCheckFailed = "health.check_failed"
+
+	LogEventHTTPServerStarting     = "http.server_starting"
+	LogEventHTTPServerDraining     = "http.server_draining"
+	LogEventHTTPServerStopped      = "http.server_stopped"
+	LogEventHTTPServerForcedClosed = "http.server_forced_close"
+
 	LogEventReconciliationStart    = "reconciliation.started"
 	LogEventReconciliationComplete = "reconciliation.completed"
 	LogEventReconciliationMismatch = "reconciliation.mismatch_detected"
@@ -62,11 +70,12 @@ const (
 	LogEventRateLimitFallback = "rate_limit.fallback_activated"
 	LogEventRateLimitRestored = "rate_limit.redis_restored"
 
-	LogEventWebhookInboundReceived   = "webhook.inbound_received"
-	LogEventWebhookInboundDuplicate  = "webhook.inbound_duplicate"
-	LogEventWebhookInboundInvalid    = "webhook.inbound_invalid_signature"
-	LogEventWebhookOutboundDelivered = "webhook.outbound_delivered"
-	LogEventWebhookOutboundFailed    = "webhook.outbound_failed"
+	LogEventWebhookInboundReceived    = "webhook.inbound_received"
+	LogEventWebhookInboundDuplicate   = "webhook.inbound_duplicate"
+	LogEventWebhookReferenceRecovered = "webhook.reference_recovered"
+	LogEventWebhookInboundInvalid     = "webhook.inbound_invalid_signature"
+	LogEventWebhookOutboundDelivered  = "webhook.outbound_delivered"
+	LogEventWebhookOutboundFailed     = "webhook.outbound_failed"
 
 	LogEventPartitionCreated           = "partition.created"
 	LogEventPartitionDetached          = "partition.detached"

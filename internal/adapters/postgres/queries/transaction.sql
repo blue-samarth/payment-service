@@ -28,7 +28,7 @@ SELECT
     description, customer_id, customer_email,
     cancel_intent, cancel_requested_by, cancel_requested_at, cancel_requested_via,
     processing_started_at, EXTRACT(EPOCH FROM processing_timeout)::double precision,
-    created_at, updated_at
+    created_at, updated_at, review_required_at, review_reason
 FROM transactions
 WHERE id = $1;
 
@@ -69,4 +69,19 @@ SELECT id FROM transactions
 WHERE status = 'PROCESSING'
   AND processing_started_at IS NOT NULL
   AND processing_timeout IS NOT NULL
+  AND review_required_at IS NULL
   AND NOW() > processing_started_at + processing_timeout;
+
+-- name: TransactionCountPendingReview
+SELECT count(*) FROM transactions
+WHERE status = 'PROCESSING'
+  AND review_required_at IS NOT NULL;
+
+-- name: TransactionMarkReviewRequired
+UPDATE transactions
+SET review_required_at = NOW(),
+    review_reason      = $2,
+    updated_at         = NOW()
+WHERE id = $1
+  AND status = 'PROCESSING'
+  AND review_required_at IS NULL;

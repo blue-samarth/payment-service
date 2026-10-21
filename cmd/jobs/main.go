@@ -128,6 +128,8 @@ func buildReaper(cfg *config.Config, db *postgres.DB, queries *postgres.Queries,
 		logger,
 		metrics,
 	)
+	paymentSvc.SetMaxGatewayAttempts(cfg.Gateway.MaxAttempts)
+	paymentSvc.SetGatewayHTTPTimeout(cfg.Gateway.HTTPTimeout)
 	refundSvc := refund.NewService(txnRepo, refundRepo, outboxWriter, transactor, registry, logger, metrics)
 	paymentSvc.SetCancelResolver(refundSvc)
 
@@ -135,7 +137,9 @@ func buildReaper(cfg *config.Config, db *postgres.DB, queries *postgres.Queries,
 	paymentSvc.SetIdempotency(idemGuard)
 	refundSvc.SetIdempotency(idemGuard)
 
-	return leaseexpiry.New(txnRepo, paymentSvc, idempotencyRepo, logger, leaseexpiry.Config{
+	reaper := leaseexpiry.New(txnRepo, paymentSvc, idempotencyRepo, logger, leaseexpiry.Config{
 		IdempotencyProcessingTimeout: time.Duration(cfg.Jobs.IdempotencyProcessingTimeoutSec) * time.Second,
 	})
+	reaper.SetReviewGauge(txnRepo, metrics)
+	return reaper
 }

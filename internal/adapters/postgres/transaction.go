@@ -67,6 +67,14 @@ func (r *TransactionRepository) GetByID(ctx context.Context, id uuid.UUID) (*tra
 	return scanTransaction(row)
 }
 
+func (r *TransactionRepository) FindByID(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error) {
+	t, err := r.GetByID(ctx, id)
+	if errors.Is(err, ErrNotFound) {
+		return nil, nil
+	}
+	return t, err
+}
+
 func (r *TransactionRepository) GetByGatewayReference(ctx context.Context, gatewayID, reference string) (*transaction.Transaction, error) {
 	row := queryer(ctx, r.db.pool).QueryRow(ctx, r.q.TransactionGetByGatewayRef, gatewayID, reference)
 	t, err := scanTransaction(row)
@@ -131,6 +139,22 @@ func (r *TransactionRepository) SetCancelIntent(ctx context.Context, id uuid.UUI
 	return tag.RowsAffected() == 1, nil
 }
 
+func (r *TransactionRepository) MarkReviewRequired(ctx context.Context, id uuid.UUID, reason string) (bool, error) {
+	tag, err := queryer(ctx, r.db.pool).Exec(ctx, r.q.TransactionMarkReview, id, reason)
+	if err != nil {
+		return false, fmt.Errorf("transaction: mark review required %s: %w", id, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (r *TransactionRepository) CountPendingReview(ctx context.Context) (int64, error) {
+	var n int64
+	if err := queryer(ctx, r.db.pool).QueryRow(ctx, r.q.TransactionCountReview).Scan(&n); err != nil {
+		return 0, fmt.Errorf("transaction: count pending review: %w", err)
+	}
+	return n, nil
+}
+
 func (r *TransactionRepository) ListExpiredLeaseIDs(ctx context.Context) ([]uuid.UUID, error) {
 	rows, err := queryer(ctx, r.db.pool).Query(ctx, r.q.TransactionListExpiredLeases)
 	if err != nil {
@@ -154,7 +178,7 @@ func scanTransaction(row pgx.Row) (*transaction.Transaction, error) {
 	var failureReasonRaw []byte
 	var methodDetailsRaw []byte
 	var processingTimeoutSec *float64
-	var cancelBy, cancelVia *string
+	var cancelBy, cancelVia, reviewReason *string
 
 	err := row.Scan(
 		&t.ID, &t.MerchantID, &t.Amount, &t.Currency, &t.PaymentMethod, &t.Status, &t.Version,
@@ -164,13 +188,16 @@ func scanTransaction(row pgx.Row) (*transaction.Transaction, error) {
 		&t.Description, &t.CustomerID, &t.CustomerEmail,
 		&t.CancelIntent, &cancelBy, &t.CancelRequestedAt, &cancelVia,
 		&t.ProcessingStartedAt, &processingTimeoutSec,
-		&t.CreatedAt, &t.UpdatedAt,
+		&t.CreatedAt, &t.UpdatedAt, &t.ReviewRequiredAt, &reviewReason,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("transaction: scan: %w", err)
+	}
+	if reviewReason != nil {
+		t.ReviewReason = *reviewReason
 	}
 
 	if cancelBy != nil {

@@ -2,10 +2,9 @@ package middleware
 
 import (
 	"context"
-	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
-	"strings"
 	"time"
 
 	"samarth/payment-service/internal/ports"
@@ -25,12 +24,35 @@ type RateLimitConfig struct {
 	RefillPerSec float64
 }
 
-func RateLimit(limiter Limiter, cfg RateLimitConfig, log ports.Logger) func(http.Handler) http.Handler {
+const ipv6BucketPrefix = 64
+
+type RateLimitKeys func(r *http.Request) (userID, merchantID, ip string)
+
+func RequestKeys(clientIP *ClientIP) RateLimitKeys {
+	return func(r *http.Request) (string, string, string) {
+		return r.Header.Get("X-User-ID"), merchantBucketID(r.Context()), bucketIP(clientIP.From(r))
+	}
+}
+
+func WebhookKeys(clientIP *ClientIP) RateLimitKeys {
+	return func(r *http.Request) (string, string, string) {
+		ip := bucketIP(clientIP.From(r))
+		return "webhook:" + ip, "webhook:" + ip, ip
+	}
+}
+
+func bucketIP(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || !addr.Is6() || addr.Is4In6() {
+		return ip
+	}
+	return netip.PrefixFrom(addr, ipv6BucketPrefix).Masked().String()
+}
+
+func RateLimit(limiter Limiter, cfg RateLimitConfig, log ports.Logger, keys RateLimitKeys) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			userID := r.Header.Get("X-User-ID")
-			merchantID := merchantBucketID(r.Context())
-			ip := clientIP(r)
+			userID, merchantID, ip := keys(r)
 
 			decision := limiter.Allow(r.Context(), userID, merchantID, ip, cfg.Capacity, cfg.RefillPerSec)
 			if !decision.Allowed {
@@ -62,15 +84,4 @@ func merchantBucketID(ctx context.Context) string {
 		return "principal:" + string(p.Role)
 	}
 	return ""
-}
-
-func clientIP(r *http.Request) string {
-	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
-		return strings.TrimSpace(strings.SplitN(fwd, ",", 2)[0])
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

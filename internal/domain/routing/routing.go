@@ -204,6 +204,13 @@ func filterReason(c Candidate, ctx ScoringContext) string {
 	if !supportsCurrency(c.SupportedCurrencies, ctx.Currency) {
 		return fmt.Sprintf("currency_not_supported_%s", ctx.Currency)
 	}
+	return UnavailableReason(c)
+}
+
+func UnavailableReason(c Candidate) string {
+	if !c.IsActive {
+		return "inactive"
+	}
 	if !c.CooldownUntil.IsZero() && time.Now().UTC().Before(c.CooldownUntil) {
 		return "circuit_breaker_cooldown"
 	}

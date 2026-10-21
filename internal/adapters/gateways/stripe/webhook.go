@@ -19,9 +19,10 @@ type stripeWebhookEvent struct {
 	Type string `json:"type"`
 	Data struct {
 		Object struct {
-			ID               string       `json:"id"`
-			Status           string       `json:"status"`
-			LastPaymentError *stripeError `json:"last_payment_error"`
+			ID               string            `json:"id"`
+			Status           string            `json:"status"`
+			LastPaymentError *stripeError      `json:"last_payment_error"`
+			Metadata         map[string]string `json:"metadata"`
 		} `json:"object"`
 	} `json:"data"`
 }
@@ -56,6 +57,7 @@ func (a *Adapter) ParseWebhook(body []byte, headers map[string]string, secret st
 	return &ports.GatewayWebhookEvent{
 		EventID:            ev.ID,
 		GatewayReferenceID: ev.Data.Object.ID,
+		TransactionID:      ev.Data.Object.Metadata["transaction_id"],
 		Status:             mapStatusString(ev.Data.Object.Status, ev.Data.Object.LastPaymentError != nil),
 	}, nil
 }
