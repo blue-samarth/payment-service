@@ -46,7 +46,11 @@ func Check(log ports.Logger, metrics ports.MetricRecorder, operation string, s S
 	if transactionID != uuid.Nil {
 		fields[ports.FieldTransactionID] = transactionID.String()
 	}
-	log.Warn(ports.LogEventAuthzDenied, fields)
-	metrics.Increment(ports.MetricAuthzDenied, map[string]string{"operation": operation})
+	if log != nil {
+		log.Warn(ports.LogEventAuthzDenied, fields)
+	}
+	if metrics != nil {
+		metrics.Increment(ports.MetricAuthzDenied, map[string]string{"operation": operation})
+	}
 	return ErrDenied
 }

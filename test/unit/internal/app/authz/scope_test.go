@@ -56,6 +56,12 @@ func TestScope_MerchantAndAll(t *testing.T) {
 	}
 }
 
+func TestCheck_NilLoggerAndMetricsStillDeny(t *testing.T) {
+	if err := Check(nil, nil, "get_payment", Merchant(uuid.New()), uuid.New(), uuid.New()); !errors.Is(err, ErrDenied) {
+		t.Fatalf("a denial with no logger or recorder must still return ErrDenied, not panic; got %v", err)
+	}
+}
+
 func TestCheck_DenialIsLoggedCountedAndReadsAsNotFound(t *testing.T) {
 	log := &recordingLog{}
 	metrics := &recordingMetrics{increments: map[string]int{}}

@@ -80,9 +80,7 @@ func NewRateLimiter(c *Client, cfg config.RateLimitConfig, logger ports.Logger, 
 	return r
 }
 
-func (r *RateLimiter) Close() {
-	r.stopOnce.Do(func() { close(r.stopHealth) })
-}
+func (r *RateLimiter) Close() { r.stopOnce.Do(func() { close(r.stopHealth) }) }
 
 func (r *RateLimiter) runHealthCheck(interval time.Duration) {
 	ticker := time.NewTicker(interval)
@@ -333,9 +331,7 @@ func (r *RateLimiter) recordFallbackRestored(startedAt time.Time) {
 	}
 
 	if r.logger != nil {
-		fields := map[string]any{
-			"redis_available": true,
-		}
+		fields := map[string]any{"redis_available": true}
 		if durationSec > 0 {
 			fields["fallback_duration_sec"] = durationSec
 		}

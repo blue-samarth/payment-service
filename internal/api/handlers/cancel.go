@@ -2,9 +2,7 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -33,6 +31,11 @@ type cancelResponse struct {
 }
 
 func (h *CancelHandler) Cancel(w http.ResponseWriter, r *http.Request) {
+	c, ok := requireCaller(w, r)
+	if !ok {
+		return
+	}
+
 	transactionID, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_id", "payment id must be a valid UUID")
@@ -40,17 +43,10 @@ func (h *CancelHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req cancelRequest
-	if r.Body != nil {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-			writeError(w, http.StatusBadRequest, "invalid_request_body", "request body is not valid JSON")
-			return
-		}
-	}
-
-	c, ok := requireCaller(w, r)
-	if !ok {
+	if !decodeJSON(w, r, maxCancelBodyBytes, true, &req) {
 		return
 	}
+
 	actor, err := c.actorFor("actor", req.Actor)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_actor", err.Error())

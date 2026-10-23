@@ -184,7 +184,7 @@ func TestGet_Success(t *testing.T) {
 
 func TestGet_InvalidID(t *testing.T) {
 	h := NewPaymentHandler(&fakeService{})
-	req := httptest.NewRequest(http.MethodGet, "/payments/bad", nil)
+	req := anonymous(httptest.NewRequest(http.MethodGet, "/payments/bad", nil))
 	req.SetPathValue("id", "bad")
 	rec := httptest.NewRecorder()
 	h.Get(rec, req)

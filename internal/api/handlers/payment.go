@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -51,16 +50,16 @@ type paymentResponse struct {
 }
 
 func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
-	var req createPaymentRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_body", "request body is not valid JSON")
-		return
-	}
-
 	c, ok := requireCaller(w, r)
 	if !ok {
 		return
 	}
+
+	var req createPaymentRequest
+	if !decodeJSON(w, r, maxPaymentBodyBytes, false, &req) {
+		return
+	}
+
 	merchantID, err := c.merchantFor(req.MerchantID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_merchant_id", err.Error())
@@ -137,14 +136,14 @@ func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *PaymentHandler) Get(w http.ResponseWriter, r *http.Request) {
-	id, err := uuid.Parse(r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_id", "payment id must be a valid UUID")
+	c, ok := requireCaller(w, r)
+	if !ok {
 		return
 	}
 
-	c, ok := requireCaller(w, r)
-	if !ok {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_id", "payment id must be a valid UUID")
 		return
 	}
 

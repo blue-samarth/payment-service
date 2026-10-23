@@ -73,16 +73,47 @@ func TestCaller_CancelIsScopedToTheTokensMerchant(t *testing.T) {
 	}
 }
 
-func TestCaller_NoPrincipalFailsClosed(t *testing.T) {
+func TestCaller_NoPrincipalFailsClosedBeforeTheBodyIsRead(t *testing.T) {
 	svc := &recordingCancelService{}
-	id := uuid.NewString()
-	req := httptest.NewRequest(http.MethodPost, "/payments/"+id+"/cancel", strings.NewReader(`{}`))
-	req.SetPathValue("id", id)
-	req.Header.Set("Idempotency-Key", "k")
+	for _, body := range []string{`{}`, `{"via":`} {
+		id := uuid.NewString()
+		req := httptest.NewRequest(http.MethodPost, "/payments/"+id+"/cancel", strings.NewReader(body))
+		req.SetPathValue("id", id)
+		req.Header.Set("Idempotency-Key", "k")
+		rec := httptest.NewRecorder()
+		NewCancelHandler(svc).Cancel(rec, req)
+		if rec.Code != http.StatusForbidden || svc.calls != 0 {
+			t.Fatalf("body %q: a handler reached without any auth middleware must deny with 403, got %d with %d calls", body, rec.Code, svc.calls)
+		}
+	}
+
+	for name, call := range map[string]func(http.ResponseWriter, *http.Request){
+		"create": NewPaymentHandler(&fakeService{}).Create,
+		"refund": NewRefundHandler(&fakeRefundService{}).Create,
+	} {
+		req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(`{not json`))
+		req.SetPathValue("id", uuid.NewString())
+		rec := httptest.NewRecorder()
+		call(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("%s: no principal with a malformed body must be 403, got %d", name, rec.Code)
+		}
+	}
+}
+
+func TestDecodeJSON_BodiesAreBounded(t *testing.T) {
+	svc := &recordingCancelService{}
+	big := `{"via":"` + strings.Repeat("x", maxCancelBodyBytes) + `"}`
+	if rec := cancelAs(middleware.Principal{Role: middleware.RoleOps}, svc, big); rec.Code != http.StatusRequestEntityTooLarge || svc.calls != 0 {
+		t.Fatalf("an oversized cancel body must be 413 without a service call, got %d with %d calls", rec.Code, svc.calls)
+	}
+
+	req := anonymous(httptest.NewRequest(http.MethodPost, "/payments/x/refunds", strings.NewReader(`{"amount":1,"reason":"`+strings.Repeat("r", maxRefundBodyBytes)+`"}`)))
+	req.SetPathValue("id", uuid.NewString())
 	rec := httptest.NewRecorder()
-	NewCancelHandler(svc).Cancel(rec, req)
-	if rec.Code != http.StatusForbidden || svc.calls != 0 {
-		t.Fatalf("a handler reached without any auth middleware must deny, got %d with %d calls", rec.Code, svc.calls)
+	NewRefundHandler(&fakeRefundService{}).Create(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("an oversized refund body must be 413, got %d", rec.Code)
 	}
 }
 

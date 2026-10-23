@@ -137,12 +137,6 @@ func (w *OutboxWriter) MarkExhausted(ctx context.Context, id uuid.UUID, createdA
 	})
 }
 
-// PollPending atomically claims a batch of due events (PENDING, or a PUBLISHING
-// row whose claim has gone stale past claimTTL), transitioning them to
-// PUBLISHING and returning them. Because the claim is committed before the
-// caller publishes, a second poller no longer sees the same rows — the previous
-// FOR UPDATE SKIP LOCKED SELECT released its lock at commit, before publishing,
-// so two workers could fetch and publish the same event.
 func (w *OutboxWriter) PollPending(ctx context.Context, shards []int, batchSize int) ([]ports.PendingEvent, error) {
 	claimTTLSec := int64(w.claimTTL.Seconds())
 

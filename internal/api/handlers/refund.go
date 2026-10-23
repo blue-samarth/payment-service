@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -38,6 +37,11 @@ type refundResponse struct {
 }
 
 func (h *RefundHandler) Create(w http.ResponseWriter, r *http.Request) {
+	c, ok := requireCaller(w, r)
+	if !ok {
+		return
+	}
+
 	transactionID, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_id", "payment id must be a valid UUID")
@@ -45,8 +49,7 @@ func (h *RefundHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req createRefundRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_body", "request body is not valid JSON")
+	if !decodeJSON(w, r, maxRefundBodyBytes, false, &req) {
 		return
 	}
 	if req.Amount <= 0 {
@@ -55,10 +58,6 @@ func (h *RefundHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Reason == "" {
 		writeError(w, http.StatusBadRequest, "missing_reason", "reason is required")
-		return
-	}
-	c, ok := requireCaller(w, r)
-	if !ok {
 		return
 	}
 	initiatedBy, err := c.actorFor("initiated_by", req.InitiatedBy)
