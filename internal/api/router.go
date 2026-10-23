@@ -18,6 +18,7 @@ type Deps struct {
 	Logger       ports.Logger
 	Metrics      ports.MetricRecorder
 	Auth         middleware.TokenProvider
+	AllowNoAuth  bool
 	Limiter      middleware.Limiter
 	RateLimits   middleware.Limits
 	WebhookLimit middleware.Limit
@@ -49,6 +50,8 @@ func NewMerchantRouter(deps Deps) http.Handler {
 			}
 		}
 		chain = append(chain, middleware.Authenticate(deps.Auth, deps.Logger, deps.Metrics, throttle))
+	} else if deps.AllowNoAuth {
+		chain = append(chain, middleware.AllowAnonymous())
 	}
 	if deps.Limiter != nil {
 		chain = append(chain, middleware.RateLimit(deps.Limiter, deps.Logger, deps.Metrics, middleware.RequestKeys(deps.ClientIP, deps.RateLimits)))

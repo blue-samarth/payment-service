@@ -8,40 +8,37 @@ import (
 	"github.com/google/uuid"
 
 	"samarth/payment-service/internal/api/middleware"
+	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/domain/transaction"
 )
 
 var (
 	errMerchantRequired = errors.New("merchant_id is required")
 	errMerchantInvalid  = errors.New("merchant_id must be a valid UUID")
-	errMerchantMismatch = errors.New("merchant_id does not match the authenticated merchant")
 )
 
 type caller struct {
+	scope    authz.Scope
 	merchant uuid.UUID
 	actor    transaction.Actor
 }
 
 func requireCaller(w http.ResponseWriter, r *http.Request) (caller, bool) {
 	principal, ok := middleware.PrincipalFromContext(r.Context())
-	if !ok {
-		return caller{actor: transaction.ActorMerchant}, true
-	}
-	switch principal.Role {
-	case middleware.RoleOps:
-		return caller{actor: transaction.ActorOps}, true
-	case middleware.RoleService:
-		id, err := uuid.Parse(principal.MerchantID)
-		if err == nil && id != uuid.Nil {
-			return caller{merchant: id, actor: transaction.ActorMerchant}, true
+	if ok {
+		switch principal.Role {
+		case middleware.RoleOps:
+			return caller{scope: authz.AllMerchants(), actor: transaction.ActorOps}, true
+		case middleware.RoleAnonymous:
+			return caller{scope: authz.AllMerchants(), actor: transaction.ActorMerchant}, true
+		case middleware.RoleService:
+			if id, err := uuid.Parse(principal.MerchantID); err == nil && id != uuid.Nil {
+				return caller{scope: authz.Merchant(id), merchant: id, actor: transaction.ActorMerchant}, true
+			}
 		}
 	}
-	writeError(w, http.StatusForbidden, "forbidden", "the token is not bound to a merchant")
+	writeError(w, http.StatusForbidden, "forbidden", "the request has no principal bound to a merchant or role")
 	return caller{}, false
-}
-
-func (c caller) owns(t *transaction.Transaction) bool {
-	return c.merchant == uuid.Nil || t.MerchantID == c.merchant
 }
 
 func (c caller) merchantFor(requested string) (uuid.UUID, error) {
@@ -54,9 +51,6 @@ func (c caller) merchantFor(requested string) (uuid.UUID, error) {
 	id, err := uuid.Parse(requested)
 	if err != nil {
 		return uuid.Nil, errMerchantInvalid
-	}
-	if c.merchant != uuid.Nil && id != c.merchant {
-		return uuid.Nil, errMerchantMismatch
 	}
 	return id, nil
 }

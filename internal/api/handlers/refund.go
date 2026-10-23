@@ -75,7 +75,7 @@ func (h *RefundHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 	result, err := h.svc.InitiateRefund(r.Context(), apprefund.InitiateInput{
 		TransactionID:  transactionID,
-		MerchantID:     c.merchant,
+		Scope:          c.scope,
 		Amount:         req.Amount,
 		Reason:         req.Reason,
 		InitiatedBy:    string(initiatedBy),

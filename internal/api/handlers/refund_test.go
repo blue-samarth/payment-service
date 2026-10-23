@@ -40,7 +40,7 @@ func sampleRefund(status domainrefund.Status) *domainrefund.Refund {
 }
 
 func postRefund(h *RefundHandler, id, body string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(http.MethodPost, "/payments/"+id+"/refunds", strings.NewReader(body))
+	req := anonymous(httptest.NewRequest(http.MethodPost, "/payments/"+id+"/refunds", strings.NewReader(body)))
 	req.SetPathValue("id", id)
 	req.Header.Set("Idempotency-Key", "refund-key")
 	rec := httptest.NewRecorder()
@@ -50,7 +50,7 @@ func postRefund(h *RefundHandler, id, body string) *httptest.ResponseRecorder {
 
 func TestRefundCreate_MissingIdempotencyKey400(t *testing.T) {
 	h := NewRefundHandler(&fakeRefundService{initiated: sampleRefund(domainrefund.StatusInitiated)})
-	req := httptest.NewRequest(http.MethodPost, "/payments/"+uuid.NewString()+"/refunds", strings.NewReader(`{"amount":40000,"reason":"r"}`))
+	req := anonymous(httptest.NewRequest(http.MethodPost, "/payments/"+uuid.NewString()+"/refunds", strings.NewReader(`{"amount":40000,"reason":"r"}`)))
 	req.SetPathValue("id", uuid.NewString())
 	rec := httptest.NewRecorder()
 	h.Create(rec, req) // no Idempotency-Key

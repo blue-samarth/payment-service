@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/domain/routing"
 	"samarth/payment-service/internal/domain/transaction"
@@ -64,6 +65,7 @@ type RouteInput struct {
 	ExcludeGateways []string
 }
 type CreatePaymentInput struct {
+	Scope          authz.Scope
 	MerchantID     uuid.UUID
 	Amount         int64
 	Currency       string
@@ -146,8 +148,15 @@ type paymentCreatedPayload struct {
 	AggregateVersion int    `json:"aggregate_version"`
 }
 
-func (s *Service) GetPayment(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error) {
-	return s.repo.GetByID(ctx, id)
+func (s *Service) GetPayment(ctx context.Context, id uuid.UUID, scope authz.Scope) (*transaction.Transaction, error) {
+	txn, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := authz.Check(s.log, s.metrics, "get_payment", scope, txn.MerchantID, txn.ID); err != nil {
+		return nil, err
+	}
+	return txn, nil
 }
 
 type CreateResult struct {
@@ -160,10 +169,9 @@ type idempotencyPaymentResponse struct {
 }
 
 func (s *Service) CreatePayment(ctx context.Context, in CreatePaymentInput) (CreateResult, error) {
-	// Routing and config reads acquire their own pool connections, so they must
-	// run BEFORE (never nested inside) the reservation transaction — otherwise a
-	// burst of concurrent creates each hold a tx connection while waiting for a
-	// second one to route, and the pool deadlocks.
+	if err := authz.Check(s.log, s.metrics, "create_payment", in.Scope, in.MerchantID, uuid.Nil); err != nil {
+		return CreateResult{}, err
+	}
 	txn, event, err := s.buildTransaction(ctx, in)
 	if err != nil {
 		return CreateResult{}, err

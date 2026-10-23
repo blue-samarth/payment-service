@@ -390,7 +390,7 @@ stateDiagram-v2
 
 Idempotency is enforced in **one place**, the business layer: `app/idempotency.Guard`, used by `payment.Service.CreatePayment`, `refund.Service.InitiateRefund` and `cancel.Service.Cancel` to guard the domain operation itself (insert + outbox write), independent of how it is invoked. There is no HTTP response cache in front of it: on a replay, payment, refund and cancel all reload the current state from Postgres rather than returning a stored snapshot, so a retried payment that has since settled reports `SUCCEEDED`, not the `PENDING` it got the first time. (Cancel replays the original *outcome*, `CANCEL_REQUESTED` or `ALREADY_TERMINAL`, with the *current* status.)
 
-Composite keys are scoped per operation: create-payment by the merchant, initiate-refund by the parent transaction's merchant, cancel by the transaction ID. For a service token the merchant is always the token's own: create takes it from the token (a different `merchant_id` in the body is `403 merchant_mismatch`), and refund and cancel check the transaction's owner **before** the key is reserved, so a foreign transaction is a `404` that leaves no key, refund or intent behind. Ops tokens act across merchants. See [Docs/api/middleware.md](Docs/api/middleware.md#authorization) and `test/integration/merchant_isolation_test.go`.
+Composite keys are scoped per operation: create-payment by the merchant, initiate-refund by the parent transaction's merchant, cancel by the transaction ID. For a service token the merchant is always the token's own: create takes it from the token (a different `merchant_id` in the body is `403 merchant_mismatch`), and refund and cancel check the transaction's owner **before** the key is reserved, so a foreign transaction is a `404` that leaves no key, refund or intent behind. Ops tokens act across merchants. See §16 for the authorization rules and `test/integration/merchant_isolation_test.go` for the end-to-end tests.
 
 ```mermaid
 flowchart TD
@@ -685,9 +685,25 @@ Responsibilities, all guarded by a single Postgres advisory lock (`AcquireLock`/
 `middleware.Authenticate` supports two static, pre-shared-token principal types configured via environment variables:
 
 - **Service tokens** (`X-Service-Token`) map to a specific `MerchantID` — the merchant identity is *bound to the token*, not read from any request header, which is what makes the rate-limiter merchant-key spoofing protection in §15 possible.
-- **Ops tokens** (`X-Ops-Token`) grant the `ops` role without a merchant binding (used for cancel/refund operational actions).
+- **Ops tokens** (`X-Ops-Token`) grant the `ops` role without a merchant binding. They act on any merchant's payments (read, refund, cancel) and are the only tokens that can resolve a manual review.
 
-Tokens are stored hashed (SHA-256) in memory. Authentication runs only on the merchant listener (§17) and has no path-based exemptions: webhooks are served on their own listener and authenticate via gateway signature (§11), and health endpoints are served on an internal-only listener. If no tokens are configured, the API refuses to start unless `ALLOW_NO_AUTH=true` is set explicitly, in which case it logs a warning and serves unauthenticated — for local development only.
+Tokens are stored hashed (SHA-256) in memory. Authentication runs only on the merchant listener (§17) and has no path-based exemptions: webhooks are served on their own listener and authenticate via gateway signature (§11), and health endpoints are served on an internal-only listener. If no tokens are configured, the API refuses to start unless `ALLOW_NO_AUTH=true` is set explicitly (rejected when `ENVIRONMENT=prod`), in which case it logs a warning and serves every request as an explicit `anonymous` principal — for local development only.
+
+### Authorization
+
+**One service token is one merchant.** Every payment operation carries an `authz.Scope`, which the service checks before doing anything, including reserving the idempotency key:
+
+| Principal | Scope | Recorded actor | `merchant_id` on create |
+|---|---|---|---|
+| Service token | its own merchant | `merchant` | optional; a different value is `403 merchant_mismatch` |
+| Ops token | all merchants | `ops` | required |
+| `anonymous` (`ALLOW_NO_AUTH`) | all merchants | `merchant` | required |
+| none | — | — | every payment route returns `403` |
+
+- **Fails closed.** The zero `Scope` denies everything, so a new call site that forgets to set one is refused rather than given access. Unscoped access must be asked for explicitly (`authz.AllMerchants()`, used by ops tokens, `ALLOW_NO_AUTH` and internal jobs such as the cancel-resolution refund). Likewise a request with no principal is refused: a router built without authentication serves nothing unless `ALLOW_NO_AUTH` is set.
+- **Another merchant's payment looks missing.** `GET /payments/{id}`, refund and cancel return the same `404 not_found` for a foreign transaction as for one that does not exist, so a caller cannot probe for IDs. A database error is a `500`, never a `404`, so an outage cannot be mistaken for a missing payment.
+- **Denials are visible server-side.** Each one logs `authz.denied` (operation, caller scope, owning merchant, transaction ID) and increments the `authz.denied` metric, tagged by operation. Any sustained rate means a misconfigured integration or ID enumeration; alert on it.
+- **Audit fields come from the principal.** Cancel `actor` and refund `initiated_by` are `merchant` or `ops`, taken from the role. The body may omit them or repeat the same value; anything else is `400` (`invalid_actor`, `invalid_initiated_by`) and is never stored. Cancel `via` must be `api` (default), `dashboard` or `ops-tool`, and `ops-tool` needs an ops token (`400 invalid_via` otherwise). A cancel body that is not valid JSON is `400`.
 
 ---
 
@@ -832,6 +848,12 @@ Deployments that ran the single-listener build must change the following togethe
 | Rate-limit logs | One line per rejection | At most one line per second per event and process, with a `suppressed` count | Use the metrics for rates; logs are for identifying callers. |
 | Webhook rate limit | Merchant limits (100 / 50 per s) | Own limit, 300 / 100 per s (`RATE_LIMIT_WEBHOOK_*`) | None. |
 | Rate-limit buckets | — | New Redis keys for user and webhook buckets | None. Those counters start fresh once on deploy. |
+| Merchant scope of a service token | Any `merchant_id` in the create body was used, and any payment could be read, refunded or cancelled by ID | One token is one merchant. A different `merchant_id` is `403 merchant_mismatch`; another merchant's payment is `404` | A platform that sends many `merchant_id`s with one token must get one service token per merchant (or use an ops token, which is cross-merchant). Search the logs for `authz.denied` after rollout. |
+| Refund `initiated_by` | Free text from the body, defaulting to `api` | `merchant` or `ops`, from the token. Any other value, **including `api`**, is `400 invalid_initiated_by` | Stop sending the field or send the matching value. The column is free text, so older rows say `api` and new ones `merchant`: treat them as the same in reports, or backfill with `UPDATE refunds SET initiated_by = 'merchant' WHERE initiated_by = 'api'`. |
+| Cancel body | `actor` and `via` stored as sent; invalid JSON ignored | `actor` from the token (others `400 invalid_actor`); `via` must be `api`, `dashboard` or `ops-tool` (`ops-tool` for ops tokens only; others `400 invalid_via`); invalid JSON `400` | Send an empty body or valid values. |
+| Missing transaction on refund or cancel; database error on `GET` | Refund and cancel returned `500`; `GET` returned `404` for any error | `404` and `500` respectively | Clients must not treat a `500` from `GET` as "payment does not exist". |
+| Request without a principal | Served unscoped when the router had no authentication | `403` unless `ALLOW_NO_AUTH=true`, which serves an explicit `anonymous` principal | None for `cmd/api`; affects code that builds the router directly. |
+| `authz.denied` metric and log | — | One per request refused for scope | Alert on a sustained non-zero rate. |
 | `OUTBOX_RELAY_MODE` | A setting defaulting to `cdc`, which was never implemented; the relay polled regardless | Not a setting; unset or `polling` is accepted, anything else (including `cdc`) fails startup | Remove `OUTBOX_RELAY_MODE` from manifests. The CDC-only `OUTBOX_RELAY_WAL_LAG_*`, `_SLOT_SIZE_ALERT_MB`, `_CONSUMER_HEARTBEAT_TIMEOUT_SEC` and `_RECONNECT_INTERVAL_SEC` are ignored and can be deleted. |
 | Relay metrics | `outbox_relay_cdc_lag_mb`, `outbox_relay_consumer_healthy` defined (never emitted) | Removed | Delete any alert or dashboard referencing them; an `absent()` rule on either would fire permanently. |
 | Log and schema names | `relay.mode_switch` (with `relay_mode`), `relay.consumer_stale`, `partition.management_skipped_wal_lag`, `partition_management_log.wal_lag_mb` | `relay.started` (no `relay_mode` field), `relay.consumer_stale` removed, `partition.management_skipped`; migration `000008` drops the never-written `wal_lag_mb` column | Update any log-based alerts or dashboards using the old names. Run migrations before rollout. |

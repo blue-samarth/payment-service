@@ -15,6 +15,7 @@ import (
 
 	"samarth/payment-service/internal/adapters/observability"
 	"samarth/payment-service/internal/api/handlers"
+	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/app/payment"
 	appwebhook "samarth/payment-service/internal/app/webhook"
@@ -30,7 +31,10 @@ func (s stubService) CreatePayment(ctx context.Context, in payment.CreatePayment
 func (s stubService) ProcessPayment(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error) {
 	return s.txn, nil
 }
-func (s stubService) GetPayment(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error) {
+func (s stubService) GetPayment(ctx context.Context, id uuid.UUID, scope authz.Scope) (*transaction.Transaction, error) {
+	if !scope.Allows(s.txn.MerchantID) {
+		return nil, authz.ErrDenied
+	}
 	return s.txn, nil
 }
 
@@ -76,11 +80,24 @@ func do(t *testing.T, srv *httptest.Server, method, path string) response {
 func testDeps(txn *transaction.Transaction) Deps {
 	logger := observability.NewSlogLoggerFromHandler(slog.NewJSONHandler(io.Discard, nil))
 	return Deps{
-		Payment: handlers.NewPaymentHandler(stubService{txn: txn}),
-		Webhook: handlers.NewWebhookHandler(noProcessor{}, unknownGateways{}, noSecrets{}, nil, logger),
-		Health:  handlers.NewHealthHandler(okPinger{}, okPinger{}, nil, logger),
-		Review:  handlers.NewReviewHandler(nil, logger),
-		Logger:  logger,
+		Payment:     handlers.NewPaymentHandler(stubService{txn: txn}),
+		Webhook:     handlers.NewWebhookHandler(noProcessor{}, unknownGateways{}, noSecrets{}, nil, logger),
+		Health:      handlers.NewHealthHandler(okPinger{}, okPinger{}, nil, logger),
+		Review:      handlers.NewReviewHandler(nil, logger),
+		Logger:      logger,
+		AllowNoAuth: true,
+	}
+}
+
+func TestMerchantRouter_WithoutAuthFailsClosed(t *testing.T) {
+	txn, _ := transaction.New(uuid.New(), 1000, "INR", transaction.PaymentMethodCard, "stripe", uuid.New(), "", "", nil, 30)
+	deps := testDeps(txn)
+	deps.AllowNoAuth = false
+	srv := httptest.NewServer(NewMerchantRouter(deps))
+	defer srv.Close()
+
+	if got := do(t, srv, http.MethodGet, "/payments/"+txn.ID.String()); got.code != http.StatusForbidden {
+		t.Fatalf("a router with neither Auth nor AllowNoAuth must deny, got %d", got.code)
 	}
 }
 

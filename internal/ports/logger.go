@@ -69,6 +69,7 @@ const (
 	LogEventRateLimitRejected = "rate_limit.rejected"
 	LogEventAuthThrottled     = "auth.throttled"
 	LogEventAuthRejected      = "auth.rejected"
+	LogEventAuthzDenied       = "authz.denied"
 	LogEventRateLimitFallback = "rate_limit.fallback_activated"
 	LogEventRateLimitRestored = "rate_limit.redis_restored"
 

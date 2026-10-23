@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/domain/routing"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -213,6 +214,7 @@ func newTestService(repo *fakeRepo, outbox *fakeOutbox, router *fakeRouter, conf
 
 func validInput() CreatePaymentInput {
 	return CreatePaymentInput{
+		Scope:         authz.AllMerchants(),
 		MerchantID:    uuid.New(),
 		Amount:        150000,
 		Currency:      "INR",

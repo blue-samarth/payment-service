@@ -8,15 +8,17 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/app/payment"
 	"samarth/payment-service/internal/domain/transaction"
+	"samarth/payment-service/internal/ports"
 )
 
 type PaymentService interface {
 	CreatePayment(ctx context.Context, in payment.CreatePaymentInput) (payment.CreateResult, error)
 	ProcessPayment(ctx context.Context, transactionID uuid.UUID) (*transaction.Transaction, error)
-	GetPayment(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error)
+	GetPayment(ctx context.Context, id uuid.UUID, scope authz.Scope) (*transaction.Transaction, error)
 }
 
 type PaymentHandler struct{ svc PaymentService }
@@ -60,11 +62,7 @@ func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	merchantID, err := c.merchantFor(req.MerchantID)
-	switch {
-	case errors.Is(err, errMerchantMismatch):
-		writeError(w, http.StatusForbidden, "merchant_mismatch", err.Error())
-		return
-	case err != nil:
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_merchant_id", err.Error())
 		return
 	}
@@ -92,6 +90,7 @@ func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := h.svc.CreatePayment(r.Context(), payment.CreatePaymentInput{
+		Scope:          c.scope,
 		MerchantID:     merchantID,
 		Amount:         req.Amount,
 		Currency:       req.Currency,
@@ -106,6 +105,8 @@ func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		switch {
+		case errors.Is(err, authz.ErrDenied):
+			writeError(w, http.StatusForbidden, "merchant_mismatch", "merchant_id does not match the authenticated merchant")
 		case errors.Is(err, payment.ErrNoGateway):
 			writeError(w, http.StatusUnprocessableEntity, "no_eligible_gateway", "no gateway can process this payment")
 		case errors.Is(err, idempotency.ErrKeyRequired):
@@ -147,9 +148,13 @@ func (h *PaymentHandler) Get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	txn, err := h.svc.GetPayment(r.Context(), id)
-	if err != nil || !c.owns(txn) {
+	txn, err := h.svc.GetPayment(r.Context(), id, c.scope)
+	switch {
+	case errors.Is(err, ports.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not_found", "payment not found")
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, "lookup_failed", "could not load payment")
 		return
 	}
 

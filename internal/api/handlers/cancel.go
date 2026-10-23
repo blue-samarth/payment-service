@@ -70,7 +70,7 @@ func (h *CancelHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.svc.Cancel(r.Context(), appcancel.CancelInput{
 		TransactionID:  transactionID,
-		MerchantID:     c.merchant,
+		Scope:          c.scope,
 		By:             actor,
 		Via:            via,
 		IdempotencyKey: idemKey,

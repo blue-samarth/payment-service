@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/domain/refund"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -112,6 +113,7 @@ func (s *Service) ResolveCancelRefund(ctx context.Context, transactionID uuid.UU
 
 	res, err := s.InitiateRefund(ctx, InitiateInput{
 		TransactionID:  transactionID,
+		Scope:          authz.AllMerchants(),
 		Amount:         amount,
 		Reason:         ReasonCancelResolution,
 		InitiatedBy:    "system:cancel_resolution",

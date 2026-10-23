@@ -60,7 +60,7 @@ func TestCaller_CancelIsScopedToTheTokensMerchant(t *testing.T) {
 	if rec := cancelAs(middleware.Principal{Role: middleware.RoleService, MerchantID: merchant.String()}, svc, `{}`); rec.Code != http.StatusOK {
 		t.Fatalf("got %d", rec.Code)
 	}
-	if svc.got.MerchantID != merchant || svc.got.By != transaction.ActorMerchant || svc.got.Via != transaction.CancelViaAPI {
+	if !svc.got.Scope.Allows(merchant) || svc.got.Scope.Allows(uuid.New()) || svc.got.By != transaction.ActorMerchant || svc.got.Via != transaction.CancelViaAPI {
 		t.Fatalf("got %+v", svc.got)
 	}
 
@@ -68,8 +68,35 @@ func TestCaller_CancelIsScopedToTheTokensMerchant(t *testing.T) {
 	if rec := cancelAs(middleware.Principal{Role: middleware.RoleOps}, svc, `{"via":"ops-tool"}`); rec.Code != http.StatusOK {
 		t.Fatalf("got %d", rec.Code)
 	}
-	if svc.got.MerchantID != uuid.Nil || svc.got.By != transaction.ActorOps {
+	if !svc.got.Scope.Allows(uuid.New()) || svc.got.By != transaction.ActorOps {
 		t.Fatalf("ops must be unscoped and recorded as ops, got %+v", svc.got)
+	}
+}
+
+func TestCaller_NoPrincipalFailsClosed(t *testing.T) {
+	svc := &recordingCancelService{}
+	id := uuid.NewString()
+	req := httptest.NewRequest(http.MethodPost, "/payments/"+id+"/cancel", strings.NewReader(`{}`))
+	req.SetPathValue("id", id)
+	req.Header.Set("Idempotency-Key", "k")
+	rec := httptest.NewRecorder()
+	NewCancelHandler(svc).Cancel(rec, req)
+	if rec.Code != http.StatusForbidden || svc.calls != 0 {
+		t.Fatalf("a handler reached without any auth middleware must deny, got %d with %d calls", rec.Code, svc.calls)
+	}
+}
+
+func TestCaller_AnonymousPrincipalIsUnscopedMerchantActor(t *testing.T) {
+	svc := &recordingCancelService{}
+	h := middleware.AllowAnonymous()(http.HandlerFunc(NewCancelHandler(svc).Cancel))
+	id := uuid.NewString()
+	req := httptest.NewRequest(http.MethodPost, "/payments/"+id+"/cancel", strings.NewReader(`{}`))
+	req.SetPathValue("id", id)
+	req.Header.Set("Idempotency-Key", "k")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !svc.got.Scope.Allows(uuid.New()) || svc.got.By != transaction.ActorMerchant {
+		t.Fatalf("ALLOW_NO_AUTH must be explicit and unscoped, got %d %+v", rec.Code, svc.got)
 	}
 }
 
@@ -94,7 +121,7 @@ func TestCaller_MerchantFor(t *testing.T) {
 	}{
 		{"scoped, omitted", scoped, "", own, nil},
 		{"scoped, same", scoped, own.String(), own, nil},
-		{"scoped, other", scoped, other.String(), uuid.Nil, errMerchantMismatch},
+		{"scoped, other is left to the service's scope check", scoped, other.String(), other, nil},
 		{"scoped, garbage", scoped, "x", uuid.Nil, errMerchantInvalid},
 		{"unscoped, omitted", unscoped, "", uuid.Nil, errMerchantRequired},
 		{"unscoped, any", unscoped, other.String(), other, nil},

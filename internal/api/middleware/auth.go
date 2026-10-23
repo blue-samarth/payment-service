@@ -13,8 +13,9 @@ import (
 type Role string
 
 const (
-	RoleService Role = "service"
-	RoleOps     Role = "ops"
+	RoleService   Role = "service"
+	RoleOps       Role = "ops"
+	RoleAnonymous Role = "anonymous"
 )
 
 type Principal struct {
@@ -31,6 +32,22 @@ const merchantIDKey contextKey = "merchant_id"
 func PrincipalFromContext(ctx context.Context) (Principal, bool) {
 	p, ok := ctx.Value(principalKey).(Principal)
 	return p, ok
+}
+
+func WithPrincipal(ctx context.Context, principal Principal) context.Context {
+	ctx = context.WithValue(ctx, principalKey, principal)
+	if principal.MerchantID != "" {
+		ctx = context.WithValue(ctx, merchantIDKey, principal.MerchantID)
+	}
+	return ctx
+}
+
+func AllowAnonymous() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r.WithContext(WithPrincipal(r.Context(), Principal{Role: RoleAnonymous})))
+		})
+	}
 }
 
 func MerchantIDFromContext(ctx context.Context) string {
@@ -101,11 +118,7 @@ func Authenticate(provider TokenProvider, log ports.Logger, metrics ports.Metric
 				return
 			}
 
-			ctx := context.WithValue(r.Context(), principalKey, principal)
-			if principal.MerchantID != "" {
-				ctx = context.WithValue(ctx, merchantIDKey, principal.MerchantID)
-			}
-			next.ServeHTTP(w, r.WithContext(ctx))
+			next.ServeHTTP(w, r.WithContext(WithPrincipal(r.Context(), principal)))
 		})
 	}
 }
