@@ -45,6 +45,27 @@ SELECT id FROM transactions
 WHERE id = $1
 FOR UPDATE;
 
+-- name: RefundListRecoverable
+SELECT id FROM refunds
+WHERE status IN ('REFUND_INITIATED', 'REFUND_PROCESSING')
+  AND review_required_at IS NULL
+  AND initiated_at < NOW() - make_interval(secs => $1)
+ORDER BY initiated_at
+LIMIT $2;
+
+-- name: RefundMarkReviewRequired
+UPDATE refunds
+SET review_required_at = NOW(),
+    review_reason      = $2
+WHERE id = $1
+  AND status IN ('REFUND_INITIATED', 'REFUND_PROCESSING')
+  AND review_required_at IS NULL;
+
+-- name: RefundCountPendingReview
+SELECT count(*) FROM refunds
+WHERE review_required_at IS NOT NULL
+  AND status IN ('REFUND_INITIATED', 'REFUND_PROCESSING');
+
 -- name: RefundExistsByReason
 SELECT EXISTS(
     SELECT 1 FROM refunds WHERE transaction_id = $1 AND reason = $2

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -106,6 +107,40 @@ func (r *RefundRepository) ExistsByReason(ctx context.Context, transactionID uui
 		return false, fmt.Errorf("refund: exists by reason %s/%s: %w", transactionID, reason, err)
 	}
 	return exists, nil
+}
+
+func (r *RefundRepository) ListRecoverableRefundIDs(ctx context.Context, olderThan time.Duration, limit int) ([]uuid.UUID, error) {
+	rows, err := queryer(ctx, r.db.pool).Query(ctx, r.q.RefundListRecoverable, olderThan.Seconds(), limit)
+	if err != nil {
+		return nil, fmt.Errorf("refund: list recoverable: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("refund: scan recoverable id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+func (r *RefundRepository) MarkReviewRequired(ctx context.Context, id uuid.UUID, reason string) (bool, error) {
+	tag, err := queryer(ctx, r.db.pool).Exec(ctx, r.q.RefundMarkReview, id, reason)
+	if err != nil {
+		return false, fmt.Errorf("refund: mark review required %s: %w", id, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (r *RefundRepository) CountPendingReview(ctx context.Context) (int64, error) {
+	var n int64
+	if err := queryer(ctx, r.db.pool).QueryRow(ctx, r.q.RefundCountReview).Scan(&n); err != nil {
+		return 0, fmt.Errorf("refund: count pending review: %w", err)
+	}
+	return n, nil
 }
 
 func (r *RefundRepository) LockParentTransaction(ctx context.Context, transactionID uuid.UUID) error {

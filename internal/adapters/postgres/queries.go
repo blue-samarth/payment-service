@@ -30,13 +30,16 @@ type Queries struct {
 	TransactionMarkReview        string
 	TransactionCountReview       string
 
-	RefundInsert         string
-	RefundGetByID        string
-	RefundExists         string
-	RefundSumActive      string
-	RefundUpdateStatus   string
-	RefundLockParent     string
-	RefundExistsByReason string
+	RefundInsert          string
+	RefundGetByID         string
+	RefundExists          string
+	RefundSumActive       string
+	RefundUpdateStatus    string
+	RefundLockParent      string
+	RefundExistsByReason  string
+	RefundListRecoverable string
+	RefundMarkReview      string
+	RefundCountReview     string
 
 	LeaseAcquire     string
 	LeaseGetCached   string
@@ -117,6 +120,9 @@ func LoadQueries() (*Queries, error) {
 		{&q.RefundUpdateStatus, "RefundUpdateStatus"},
 		{&q.RefundLockParent, "RefundLockParent"},
 		{&q.RefundExistsByReason, "RefundExistsByReason"},
+		{&q.RefundListRecoverable, "RefundListRecoverable"},
+		{&q.RefundMarkReview, "RefundMarkReviewRequired"},
+		{&q.RefundCountReview, "RefundCountPendingReview"},
 		{&q.LeaseAcquire, "LeaseAcquire"},
 		{&q.LeaseGetCached, "LeaseGetCached"},
 		{&q.LeaseWriteCached, "LeaseWriteCached"},
