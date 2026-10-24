@@ -107,8 +107,13 @@ func (a *Adapter) Refund(ctx context.Context, req ports.GatewayRefundRequest) (*
 		body["notes"] = map[string]string{"reason": req.Reason}
 	}
 
+	paymentID, err := a.capturedPaymentID(ctx, req.GatewayReferenceID)
+	if err != nil {
+		return nil, err
+	}
+
 	var refund rzpRefund
-	if err := a.do(ctx, http.MethodPost, "/v1/payments/"+url.PathEscape(req.GatewayReferenceID)+"/refund", body, &refund); err != nil {
+	if err := a.do(ctx, http.MethodPost, "/v1/payments/"+url.PathEscape(paymentID)+"/refund", body, &refund); err != nil {
 		return nil, err
 	}
 	return &ports.GatewayRefundResponse{
@@ -117,6 +122,39 @@ func (a *Adapter) Refund(ctx context.Context, req ports.GatewayRefundRequest) (*
 		Amount:          refund.Amount,
 		Currency:        strings.ToUpper(refund.Currency),
 	}, nil
+}
+
+func (a *Adapter) capturedPaymentID(ctx context.Context, reference string) (string, error) {
+	if strings.HasPrefix(reference, "pay_") {
+		return reference, nil
+	}
+
+	var payments rzpPaymentList
+	if err := a.do(ctx, http.MethodGet, "/v1/orders/"+url.PathEscape(reference)+"/payments", nil, &payments); err != nil {
+		return "", err
+	}
+	var captured []string
+	for _, p := range payments.Items {
+		if p.Status == "captured" {
+			captured = append(captured, p.ID)
+		}
+	}
+	switch len(captured) {
+	case 1:
+		return captured[0], nil
+	case 0:
+		return "", &ports.GatewayError{
+			Category:       ports.ErrorCategoryHardDecline,
+			Code:           "no_captured_payment",
+			GatewayMessage: "order " + reference + " has no captured payment to refund",
+		}
+	default:
+		return "", &ports.GatewayError{
+			Category:       ports.ErrorCategoryAmbiguous,
+			Code:           "multiple_captured_payments",
+			GatewayMessage: "order " + reference + " has more than one captured payment",
+		}
+	}
 }
 
 func (a *Adapter) Cancel(ctx context.Context, req ports.GatewayCancelRequest) (*ports.GatewayCancelResponse, error) {

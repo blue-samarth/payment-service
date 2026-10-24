@@ -9,6 +9,16 @@ type rzpOrder struct {
 	Notes    map[string]string `json:"notes"`
 }
 
+type rzpPaymentList struct {
+	Items []rzpPayment `json:"items"`
+}
+
+type rzpPayment struct {
+	ID     string `json:"id"`
+	Status string `json:"status"`
+	Amount int64  `json:"amount"`
+}
+
 type rzpRefund struct {
 	ID       string `json:"id"`
 	Status   string `json:"status"`
