@@ -218,6 +218,6 @@ func TestCreate_OutOfScopeMerchantIs403(t *testing.T) {
 	h := NewPaymentHandler(&fakeService{createErr: authz.ErrDenied})
 	rec := doRequest(h, http.MethodPost, "/payments", validBody())
 	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "merchant_mismatch") {
-		t.Fatalf("expected 403 merchant_mismatch, got %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("expected 403 merchant_mismatch, got %d %s; authz.ErrDenied wraps ports.ErrNotFound, so a case matching ErrNotFound must come after the ErrDenied case", rec.Code, rec.Body.String())
 	}
 }
