@@ -106,6 +106,15 @@ func (r *TransactionRepository) UpdateStatus(ctx context.Context, t *transaction
 		return fmt.Errorf("transaction: marshal failure_reason: %w", err)
 	}
 
+	var nextAction any
+	if t.NextAction != nil {
+		raw, err := json.Marshal(t.NextAction)
+		if err != nil {
+			return fmt.Errorf("transaction: marshal next_action: %w", err)
+		}
+		nextAction = string(raw)
+	}
+
 	var newVersion int
 	err = tx.QueryRow(ctx, r.q.TransactionUpdateStatus,
 		t.Status,
@@ -119,6 +128,7 @@ func (r *TransactionRepository) UpdateStatus(ctx context.Context, t *transaction
 		t.ID,
 		t.Version,
 		t.GatewayID,
+		nextAction,
 	).Scan(&newVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var exists bool
@@ -186,6 +196,7 @@ func scanTransaction(row pgx.Row) (*transaction.Transaction, error) {
 	var methodDetailsRaw []byte
 	var processingTimeoutSec *float64
 	var cancelBy, cancelVia, reviewReason *string
+	var nextActionRaw []byte
 
 	err := row.Scan(
 		&t.ID, &t.MerchantID, &t.Amount, &t.Currency, &t.PaymentMethod, &t.Status, &t.Version,
@@ -195,13 +206,20 @@ func scanTransaction(row pgx.Row) (*transaction.Transaction, error) {
 		&t.Description, &t.CustomerID, &t.CustomerEmail,
 		&t.CancelIntent, &cancelBy, &t.CancelRequestedAt, &cancelVia,
 		&t.ProcessingStartedAt, &processingTimeoutSec,
-		&t.CreatedAt, &t.UpdatedAt, &t.ReviewRequiredAt, &reviewReason,
+		&t.CreatedAt, &t.UpdatedAt, &t.ReviewRequiredAt, &reviewReason, &nextActionRaw,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("transaction: scan: %w", err)
+	}
+	if len(nextActionRaw) > 0 && string(nextActionRaw) != "null" {
+		var na transaction.NextAction
+		if err := json.Unmarshal(nextActionRaw, &na); err != nil {
+			return nil, fmt.Errorf("transaction: unmarshal next_action: %w", err)
+		}
+		t.NextAction = &na
 	}
 	if reviewReason != nil {
 		t.ReviewReason = *reviewReason

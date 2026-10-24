@@ -28,7 +28,7 @@ SELECT
     description, customer_id, customer_email,
     cancel_intent, cancel_requested_by, cancel_requested_at, cancel_requested_via,
     processing_started_at, EXTRACT(EPOCH FROM processing_timeout)::double precision,
-    created_at, updated_at, review_required_at, review_reason
+    created_at, updated_at, review_required_at, review_reason, next_action
 FROM transactions
 WHERE id = $1;
 
@@ -38,11 +38,12 @@ SELECT EXISTS (SELECT 1 FROM transactions WHERE id = $1);
 -- name: TransactionUpdateStatus
 -- $1=status $2=actual_gateway $3=gateway_reference_id $4=failure_reason
 -- $5=method_details $6=processing_started_at $7=processing_timeout
--- $8=updated_at $9=id $10=current_version (before increment) $11=gateway_id
+-- $8=updated_at $9=id $10=current_version (before increment) $11=gateway_id $12=next_action
 UPDATE transactions SET
     status                = $1,
     version               = version + 1,
     gateway_id            = $11,
+    next_action           = $12,
     actual_gateway        = $2,
     gateway_reference_id  = $3,
     failure_reason        = $4,

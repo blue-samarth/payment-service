@@ -150,6 +150,7 @@ type GatewayPaymentResponse struct {
 	MethodResponse     GatewayMethodResponse
 	RawMetadata        map[string]any
 	GatewayFees        int64
+	NextAction         *transaction.NextAction
 }
 type GatewayRefundResponse struct {
 	GatewayRefundID string

@@ -85,6 +85,7 @@ type Transaction struct {
 	UpdatedAt               time.Time
 	ReviewRequiredAt        *time.Time
 	ReviewReason            string
+	NextAction              *NextAction
 }
 
 const (
@@ -198,6 +199,22 @@ func New(
 		CreatedAt:               now,
 		UpdatedAt:               now,
 	}, nil
+}
+
+const (
+	NextActionStripePaymentElement = "stripe_payment_element"
+	NextActionRazorpayCheckout     = "razorpay_checkout"
+	NextActionPayUForm             = "payu_form"
+)
+
+type NextAction struct {
+	Type   string            `json:"type"`
+	URL    string            `json:"url,omitempty"`
+	Params map[string]string `json:"params"`
+}
+
+func (t *Transaction) AwaitingCustomer() bool {
+	return t.Status == StatusProcessing && t.NextAction != nil
 }
 
 const MaxMetadataBytes = 4096

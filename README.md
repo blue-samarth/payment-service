@@ -279,6 +279,41 @@ Key implementation details:
 - **`EstimatedTimeoutSeconds`** comes from `ConfigStore.GetProcessingTimeout(gateway, method)` and becomes the lease TTL — it must be positive or transaction creation fails.
 - If `ProcessPayment` errors after a successful `CreatePayment` (e.g. gateway adapter unavailable), the handler returns **`202 Accepted`** with the created-but-unprocessed transaction rather than failing the whole request.
 
+### Client-side confirmation
+
+The customer completes the payment in the browser; the service never sees card details, a VPA, or a payment-method token, which keeps PCI scope minimal. `POST /payments` creates the payment at the gateway and returns what the front end needs as `next_action`. Webhooks and status checks then settle it.
+
+```json
+{
+  "id": "…", "status": "PROCESSING", "gateway": "razorpay",
+  "next_action": {
+    "type": "razorpay_checkout",
+    "params": { "key_id": "rzp_live_…", "order_id": "order_…", "amount": "150000", "currency": "INR" }
+  }
+}
+```
+
+| Gateway | `next_action.type` | What the front end does | Parameters |
+|---|---|---|---|
+| Stripe | `stripe_payment_element` | Mounts the Payment Element with `client_secret` and confirms it (`stripe.confirmPayment`). The PaymentIntent is created with `automatic_payment_methods[enabled]=true`. | `client_secret`, `payment_intent_id`, `publishable_key` (if `STRIPE_PUBLISHABLE_KEY` is set) |
+| Razorpay | `razorpay_checkout` | Opens Checkout with `key` = `key_id` and `order_id`. | `key_id`, `order_id`, `amount` (paise), `currency`, optional `prefill_email`, `description` |
+| PayU | `payu_form` | Auto-submits an HTML form with every param as a hidden field, POSTed to `next_action.url`. | `key`, `txnid`, `amount` (rupees, `1500.00`), `productinfo`, `firstname`, `email`, `udf1` (our transaction ID), `surl`/`furl` (`PAYU_RETURN_URL`), `hash` |
+
+**How it settles:**
+- **While waiting:** a payment waiting on the customer is `PROCESSING`, with `next_action` saved on the row (`transactions.next_action`). An idempotent replay of the create, or `GET /payments/{id}`, returns it again; the field disappears once the payment is final.
+- **The customer window:** the payment's processing window is `CUSTOMER_ACTION_TIMEOUT_SEC` (default 1800), so the lease reaper leaves it alone while the customer pays. After that, the reaper checks the gateway:
+  - **Nothing paid** (still `requires_payment_method`, order `created`, PayU unknown): the payment ends `FAILED` with category `customer_action_expired`.
+  - **Payment under way** (`processing`, order `attempted`): it keeps waiting.
+  - **Paid:** it settles.
+- **Paying after the window:** if the customer pays after the payment was failed, the webhook's late-capture rule (§ 11) makes it `SUCCEEDED`, with an alert.
+
+**The `client_secret` is a credential for that one PaymentIntent.** It's stored on the row and returned only to the payment's merchant (B12 scoping). Don't log it.
+
+**PayU details still to verify against the sandbox:**
+- `firstname` is sent as `Customer`, because the service doesn't collect names.
+- No `phone` is sent; PayU's hosted page is expected to ask for it.
+- A payment without `customer_email`, or with `PAYU_RETURN_URL` unset, fails before any call (`payu_requires_customer_email`, `payu_return_url_not_configured`).
+
 ---
 
 ## 6. Gateway Routing
@@ -855,7 +890,7 @@ The webhook listener needs a publicly trusted certificate, unlike the private-CA
 
 | Listener | Method | Path | Auth | Description |
 |---|---|---|---|---|
-| Merchant | `POST` | `/payments` | service/ops token | Create + immediately attempt a payment. Requires `Idempotency-Key`. |
+| Merchant | `POST` | `/payments` | service/ops token | Create the payment at the gateway. Requires `Idempotency-Key`. The response carries `next_action` while the customer must complete it in the browser (§ 5, "Client-side confirmation"). |
 | Merchant | `GET` | `/payments/{id}` | service/ops token | Fetch a transaction by ID |
 | Merchant | `POST` | `/payments/{id}/refunds` | service/ops token | Initiate + immediately attempt a refund. Requires `Idempotency-Key`. |
 | Merchant | `POST` | `/payments/{id}/resolve` | ops token only | Settle a payment marked for manual review (§13): `{"status":"SUCCEEDED"\|"FAILED","gateway_reference_id":"…","note":"…"}`. `403` without an ops principal, `409` if not under review |
@@ -892,7 +927,7 @@ All configuration is via environment variables, loaded and validated in `config/
 | Routing | `ROUTING_SNAPSHOT_TTL_SECONDS`, `GATEWAY_FEE_CACHE_TTL_SEC`, `FX_RECONCILIATION_TOLERANCE_PCT`, `MERCHANT_TIERS` (`merchantUUID=tier,…`, empty) | Picks each merchant's row in `gateway_routing_weights`; unlisted merchants and unknown tiers use `default`. Merchants are stored in canonical UUID form; a malformed entry or a repeated merchant fails startup. |
 | Security | `TLS_CERT_FILE/KEY_FILE/CA_FILE`, `WEBHOOK_TLS_CERT_FILE/KEY_FILE`, `TLS_CERT_REFRESH_INTERVAL_SECONDS`, `DEK_CACHE_TTL_SECONDS` | Merchant TLS files are required; webhook files are required when `WEBHOOK_TLS_MODE=app` |
 | Jobs | `LEASE_EXPIRY_INTERVAL_SECONDS`, `JOB_LOCK_TIMEOUT_MINUTES`, `REFUND_RECOVERY_MIN_AGE_SEC` (300), `REFUND_RECOVERY_MAX_AGE_SEC` (1209600, 14 days; keep it above your slowest gateway's normal refund time), `REFUND_RECOVERY_BATCH_SIZE` (100) | `REFUND_RECOVERY_MIN_AGE_SEC` must exceed `2 × GATEWAY_HTTP_TIMEOUT + 30s`, because a Razorpay or PayU refund makes two gateway calls (the payment-ID lookup, then the refund) and recovery must not check one still in flight. `REFUND_RECOVERY_MAX_AGE_SEC` must exceed the minimum. |
-| Gateways | `STRIPE_API_KEY`, `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`, `PAYU_MERCHANT_KEY`/`PAYU_MERCHANT_SALT`, plus `*_BASE_URL` overrides for testing, `CIRCUIT_BREAKER_FAILURE_THRESHOLD` (5) | |
+| Gateways | `STRIPE_API_KEY`, `STRIPE_PUBLISHABLE_KEY` (returned to the browser), `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` (only the key ID is returned), `PAYU_MERCHANT_KEY`/`PAYU_MERCHANT_SALT`, `PAYU_RETURN_URL` (required for PayU payments; PayU's `surl`/`furl`), `PAYU_PAYMENT_URL` (default `https://secure.payu.in/_payment`; `https://test.payu.in/_payment` for the sandbox), `CUSTOMER_ACTION_TIMEOUT_SEC` (1800; must exceed the gateway budget), plus `*_BASE_URL` overrides for testing, `CIRCUIT_BREAKER_FAILURE_THRESHOLD` (5) | |
 | Auth | `SERVICE_TOKENS` (`token=merchantUUID,...`), `OPS_TOKENS` (comma-separated), `WEBHOOK_SECRETS` (`gatewayID=secret,...`) | `SERVICE_TOKENS` splits each entry on its **last** `=`, so tokens may contain `=`; the merchant must be a UUID and is stored in canonical form. Service and ops tokens must be at least 32 characters. `WEBHOOK_SECRETS` splits on the **first** `=`, so secrets may contain `=`. Empty parts and duplicates fail startup; errors name the entry number, never the value. Omit all tokens and set `ALLOW_NO_AUTH=true` to run without auth (rejected when `ENVIRONMENT=prod`) |
 
 `Validate(c)` additionally enforces cross-field invariants, e.g. `OUTBOX_RELAY_CLAIM_TTL_SEC > OUTBOX_RELAY_POLL_INTERVAL_SEC`.
@@ -924,6 +959,7 @@ Deployments that ran the single-listener build must change the following togethe
 | Rate-limit buckets | — | New Redis keys for user and webhook buckets | None. Those counters start fresh once on deploy. |
 | Breakers latched by the old scripts | A success after a cooldown left `OPEN` with `cooldown_until: 0`, excluding the gateway for good | The scripts never write that state, but one already written stays held open | After the last old pod is gone (old pods can still latch during the rollout), connect the way the service does. With the defaults, `REDIS_TLS_ENABLED=true` plus an ACL user, that is `redis-cli -h <host> -p <port> --tls --user <REDIS_USERNAME> --askpass -n <REDIS_STATE_DB>`; add `--cacert <ca.pem>` if the server's CA isn't in the system store. With those flags: list the breakers with `--scan --pattern 'gateway:cb:*'`, check each with `GET <key>`, and `DEL <key>` any showing `"state":"OPEN"` with `"cooldown_until":0`. |
 | `gateway_id` after a fallback | Kept the first gateway; refunds went to it with the fallback gateway's reference, and `GET /payments/{id}` named it while `POST` named the fallback | Moves with the fallback | Nothing is required for correctness: refunds, lease recovery and `GET /payments/{id}` all use `actual_gateway` first (`ProcessingGateway()`), so old rows behave correctly. For data hygiene, after the last old pod is gone (old pods still save fallbacks without `gateway_id`), run `UPDATE transactions SET gateway_id = actual_gateway WHERE actual_gateway <> '' AND gateway_id <> actual_gateway`. It skips rows with an empty or NULL `actual_gateway`. It doesn't bump `version`, which is harmless because new pods write the same value. |
+| Payment confirmation | Gateways got an unconfirmed PaymentIntent, an order, or nothing (PayU), with no way for the customer to pay; every payment sat in `PROCESSING` and was status-checked forever | `POST /payments` returns `next_action` (Stripe `client_secret`, Razorpay Checkout params, PayU signed form); webhooks settle it; an unpaid payment fails as `customer_action_expired` after `CUSTOMER_ACTION_TIMEOUT_SEC` | Run migration `000010` (`transactions.next_action`) first. Set `STRIPE_PUBLISHABLE_KEY` and `PAYU_RETURN_URL` (and `PAYU_PAYMENT_URL` for the sandbox). Front ends must handle `next_action`. PayU payments now need `customer_email`. Configure each gateway's webhook to this service. |
 | Synchronous 5xx (`GatewayError`) | Finalized as `FAILED`, as was a 5xx on a reaper status check | Stays `PROCESSING`; the lease reaper resolves it | Expect fewer immediate `FAILED`s and more payments settled by the reaper. The API returns `202` with the `PROCESSING` payment instead of a final status. |
 | Webhook captures | Any signed success marked the payment `SUCCEEDED`; a capture after `FAILED` was dropped | Amount and currency must match (mismatch → review, never `SUCCEEDED`); a matching capture after `FAILED` makes it `SUCCEEDED` with an alert | Alert on `webhook.capture_mismatch` and `transaction.late_capture`. Consumers must accept `PAYMENT_SUCCEEDED` after `PAYMENT_FAILED` for the same payment. A mismatched late capture stays `FAILED`: refund or reconcile it in the dashboard. |
 | Routing inputs on `POST /payments` | `merchant_tier` and `is_domestic` read from the body; a fallback routed with no tier at all | Tier from `MERCHANT_TIERS` (else `default`), domestic from the currency; the body fields are ignored | Set `MERCHANT_TIERS` for merchants that should not use the `default` weights. Clients may keep sending the fields; they are ignored. |
