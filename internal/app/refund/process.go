@@ -88,8 +88,14 @@ func (s *Service) RecoverRefund(ctx context.Context, refundID uuid.UUID) (*refun
 		return nil, fmt.Errorf("refund: load refund %s: %w", refundID, err)
 	}
 
+	pastCutOff := s.recoveryMaxAge > 0 && time.Since(rf.InitiatedAt) > s.recoveryMaxAge
+	if pastCutOff && rf.Status == refund.StatusInitiated {
+		s.flagForReview(ctx, rf, "initiated_too_long", nil)
+		return rf, nil
+	}
+
 	got, err := s.recoverRefund(ctx, rf)
-	if s.recoveryMaxAge <= 0 || time.Since(rf.InitiatedAt) <= s.recoveryMaxAge {
+	if !pastCutOff || ctx.Err() != nil {
 		return got, err
 	}
 	if err != nil {

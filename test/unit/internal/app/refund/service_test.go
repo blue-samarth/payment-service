@@ -305,6 +305,41 @@ func TestRecoverRefund_PastTheCutOffItGoesToReview(t *testing.T) {
 	}
 }
 
+func TestRecoverRefund_OldInitiatedRefundIsFlaggedNotPosted(t *testing.T) {
+	adapter := &checkingAdapter{fakeAdapter: fakeAdapter{resp: &ports.GatewayRefundResponse{Status: ports.GatewayRefundStatusCompleted}}}
+	s, refunds, _, rf := processingRefund(t, adapter)
+	s.SetRecoveryMaxAge(14 * 24 * time.Hour)
+	rf.Status = domainrefund.StatusInitiated
+	rf.InitiatedAt = time.Now().UTC().Add(-15 * 24 * time.Hour)
+
+	got, err := s.RecoverRefund(context.Background(), rf.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.refunds != 0 {
+		t.Fatal("a refund unsent for that long may already have been refunded by hand; it must not be posted automatically")
+	}
+	if got.Status != domainrefund.StatusInitiated || refunds.reviews[rf.ID] != "initiated_too_long" {
+		t.Fatalf("expected it left INITIATED and marked initiated_too_long, got %s %v", got.Status, refunds.reviews)
+	}
+}
+
+func TestRecoverRefund_CancelledRunDoesNotMarkStalled(t *testing.T) {
+	adapter := &checkingAdapter{statusErr: context.Canceled}
+	s, refunds, _, rf := processingRefund(t, adapter)
+	s.SetRecoveryMaxAge(14 * 24 * time.Hour)
+	rf.InitiatedAt = time.Now().UTC().Add(-15 * 24 * time.Hour)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.RecoverRefund(ctx, rf.ID); err == nil {
+		t.Fatal("the cancellation must surface to the job")
+	}
+	if len(refunds.reviews) != 0 {
+		t.Fatalf("a job timeout says nothing about the refund, so it must not be marked stalled, got %v", refunds.reviews)
+	}
+}
+
 func TestRecoverRefund_TerminalRefundIsANoOp(t *testing.T) {
 	adapter := &checkingAdapter{}
 	s, _, _, rf := processingRefund(t, adapter)

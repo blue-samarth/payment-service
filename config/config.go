@@ -423,7 +423,7 @@ func LoadConfig() (*Config, error) {
 	c.Jobs.PartitionRetentionWeeks = getEnvInt("PARTITION_RETENTION_WEEKS", 2, &errs)
 	c.Jobs.PartitionDropAfterDays = getEnvInt("PARTITION_DROP_AFTER_DAYS", 14, &errs)
 	c.Jobs.RefundRecoveryMinAgeSec = getEnvInt("REFUND_RECOVERY_MIN_AGE_SEC", 300, &errs)
-	c.Jobs.RefundRecoveryMaxAgeSec = getEnvInt("REFUND_RECOVERY_MAX_AGE_SEC", 7*24*3600, &errs)
+	c.Jobs.RefundRecoveryMaxAgeSec = getEnvInt("REFUND_RECOVERY_MAX_AGE_SEC", 14*24*3600, &errs)
 	c.Jobs.RefundRecoveryBatchSize = getEnvInt("REFUND_RECOVERY_BATCH_SIZE", 100, &errs)
 
 	c.DataRetention.BatchSize = getEnvInt("DATA_RETENTION_BATCH_SIZE", 1000, &errs)

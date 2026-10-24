@@ -34,7 +34,7 @@ func validatableConfig() *Config {
 	c.App.ShutdownTimeout = 105 * time.Second
 	c.Jobs.IdempotencyProcessingTimeoutSec = 300
 	c.Jobs.RefundRecoveryMinAgeSec = 300
-	c.Jobs.RefundRecoveryMaxAgeSec = 7 * 24 * 3600
+	c.Jobs.RefundRecoveryMaxAgeSec = 14 * 24 * 3600
 	c.Jobs.RefundRecoveryBatchSize = 100
 	c.Redis.Addrs = []string{"localhost:6379"}
 	c.Redis.RateLimitDB = 0
