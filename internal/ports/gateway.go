@@ -21,6 +21,8 @@ type GatewayWebhookEvent struct {
 	GatewayReferenceID string
 	TransactionID      string
 	Status             GatewayPaymentStatus
+	Amount             int64
+	Currency           string
 }
 
 type GatewayWebhookParser interface {

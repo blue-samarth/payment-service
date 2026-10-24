@@ -35,6 +35,27 @@ func TestParseWebhook_Valid(t *testing.T) {
 	}
 }
 
+func TestParseWebhook_CarriesTheCapturedAmount(t *testing.T) {
+	a := New(Config{})
+	secret := "whsec_test"
+	for name, tc := range map[string]struct {
+		body string
+		want int64
+	}{
+		"amount_received wins": {`{"id":"evt_1","data":{"object":{"id":"pi_1","status":"succeeded","amount":150000,"amount_received":149000,"currency":"inr"}}}`, 149000},
+		"amount as a fallback": {`{"id":"evt_1","data":{"object":{"id":"pi_1","status":"succeeded","amount":150000,"currency":"inr"}}}`, 150000},
+	} {
+		body := []byte(tc.body)
+		ev, err := a.ParseWebhook(body, map[string]string{"Stripe-Signature": stripeSig(secret, time.Now().Unix(), body)}, secret)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if ev.Amount != tc.want || ev.Currency != "INR" {
+			t.Errorf("%s: got %d %q, want %d INR", name, ev.Amount, ev.Currency, tc.want)
+		}
+	}
+}
+
 func TestParseWebhook_CarriesTransactionIDFromMetadata(t *testing.T) {
 	a := New(Config{})
 	secret := "whsec_test"

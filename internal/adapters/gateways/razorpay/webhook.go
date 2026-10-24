@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 
 	"samarth/payment-service/internal/ports"
 )
@@ -14,10 +15,12 @@ type rzpWebhook struct {
 	Payload struct {
 		Payment struct {
 			Entity struct {
-				ID      string            `json:"id"`
-				OrderID string            `json:"order_id"`
-				Status  string            `json:"status"`
-				Notes   map[string]string `json:"notes"`
+				ID       string            `json:"id"`
+				OrderID  string            `json:"order_id"`
+				Status   string            `json:"status"`
+				Amount   int64             `json:"amount"`
+				Currency string            `json:"currency"`
+				Notes    map[string]string `json:"notes"`
 			} `json:"entity"`
 		} `json:"payment"`
 		Order struct {
@@ -60,6 +63,8 @@ func (a *Adapter) ParseWebhook(body []byte, headers map[string]string, secret st
 		GatewayReferenceID: payment.OrderID,
 		TransactionID:      transactionID,
 		Status:             mapWebhookPaymentStatus(payment.Status),
+		Amount:             payment.Amount,
+		Currency:           strings.ToUpper(payment.Currency),
 	}, nil
 }
 
