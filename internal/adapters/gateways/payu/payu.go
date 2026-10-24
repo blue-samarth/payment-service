@@ -118,8 +118,13 @@ func (a *Adapter) Refund(ctx context.Context, req ports.GatewayRefundRequest) (*
 	}
 	amount := fmt.Sprintf("%.2f", float64(req.Amount)/100)
 
+	mihpayid, err := a.mihpayID(ctx, req.GatewayReferenceID)
+	if err != nil {
+		return nil, err
+	}
+
 	var out payuRefundResponse
-	if err := a.postService(ctx, "cancel_refund_transaction", req.GatewayReferenceID, []string{token, amount}, &out); err != nil {
+	if err := a.postService(ctx, "cancel_refund_transaction", mihpayid, []string{token, amount}, &out); err != nil {
 		return nil, err
 	}
 
@@ -133,6 +138,45 @@ func (a *Adapter) Refund(ctx context.Context, req ports.GatewayRefundRequest) (*
 		Amount:          req.Amount,
 		Currency:        "INR",
 	}, nil
+}
+
+func (a *Adapter) mihpayID(ctx context.Context, reference string) (string, error) {
+	if isDigits(reference) {
+		return reference, nil
+	}
+
+	var out payuVerifyResponse
+	if err := a.postService(ctx, "verify_payment", reference, nil, &out); err != nil {
+		return "", err
+	}
+	detail, ok := out.TransactionDetails[reference]
+	switch {
+	case !ok || detail.MihpayID == "":
+		return "", &ports.GatewayError{
+			Category:       ports.ErrorCategoryHardDecline,
+			Code:           "payment_not_found",
+			GatewayMessage: "PayU has no payment for txnid " + reference,
+		}
+	case mapStatus(detail.Status) != ports.GatewayPaymentStatusSucceeded:
+		return "", &ports.GatewayError{
+			Category:       ports.ErrorCategoryHardDecline,
+			Code:           "payment_not_captured",
+			GatewayMessage: "PayU payment for txnid " + reference + " is " + detail.Status + ", not captured",
+		}
+	}
+	return detail.MihpayID, nil
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *Adapter) Cancel(ctx context.Context, req ports.GatewayCancelRequest) (*ports.GatewayCancelResponse, error) {

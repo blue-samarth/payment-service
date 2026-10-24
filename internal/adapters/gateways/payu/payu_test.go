@@ -2,6 +2,7 @@ package payu
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -92,6 +93,57 @@ func TestRefund_AcceptedIsProcessing(t *testing.T) {
 	}
 	if resp.GatewayRefundID != "req_99" {
 		t.Errorf("expected request_id as refund id, got %q", resp.GatewayRefundID)
+	}
+}
+
+func TestRefund_TxnIDIsResolvedToTheMihpayID(t *testing.T) {
+	var refundVar1 string
+	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		switch r.FormValue("command") {
+		case "verify_payment":
+			if r.FormValue("var1") != "ABC-1" {
+				t.Errorf("verify_payment must be asked about the stored txnid, got %q", r.FormValue("var1"))
+			}
+			_, _ = w.Write([]byte(`{"status":1,"transaction_details":{"ABC-1":{"txnid":"ABC-1","status":"success","amt":"1500.00","mihpayid":"403993"}}}`))
+		case "cancel_refund_transaction":
+			refundVar1 = r.FormValue("var1")
+			_, _ = w.Write([]byte(`{"status":1,"request_id":"req_1"}`))
+		}
+	})
+	defer srv.Close()
+
+	if _, err := a.Refund(context.Background(), ports.GatewayRefundRequest{RefundID: uuid.New(), GatewayReferenceID: "ABC-1", Amount: 150000}); err != nil {
+		t.Fatal(err)
+	}
+	if refundVar1 != "403993" {
+		t.Fatalf("cancel_refund_transaction needs the mihpayid, got %q", refundVar1)
+	}
+}
+
+func TestRefund_UncapturedOrUnknownPaymentIsNotRefunded(t *testing.T) {
+	for name, details := range map[string]string{
+		"unknown": `{}`,
+		"failed":  `{"ABC-2":{"txnid":"ABC-2","status":"failure","mihpayid":"5"}}`,
+	} {
+		refunded := false
+		a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+			_ = r.ParseForm()
+			if r.FormValue("command") == "cancel_refund_transaction" {
+				refunded = true
+			}
+			_, _ = w.Write([]byte(`{"status":1,"transaction_details":` + details + `}`))
+		})
+
+		_, err := a.Refund(context.Background(), ports.GatewayRefundRequest{RefundID: uuid.New(), GatewayReferenceID: "ABC-2", Amount: 100})
+		srv.Close()
+		var gwErr *ports.GatewayError
+		if !errors.As(err, &gwErr) || gwErr.Category != ports.ErrorCategoryHardDecline {
+			t.Errorf("%s: expected a terminal refusal, got %v", name, err)
+		}
+		if refunded {
+			t.Errorf("%s: no refund may be sent for a payment that was never captured", name)
+		}
 	}
 }
 
