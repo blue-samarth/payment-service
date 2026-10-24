@@ -12,6 +12,7 @@ import (
 
 	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/app/idempotency"
+	domaingateway "samarth/payment-service/internal/domain/gateway"
 	"samarth/payment-service/internal/domain/routing"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -52,7 +53,8 @@ type CircuitBreaker interface {
 	RecordSuccess(ctx context.Context, gatewayID string) error
 }
 type CallGate interface {
-	AdmitCall(ctx context.Context, gatewayID string, probeTTL time.Duration) (bool, error)
+	AdmitCall(ctx context.Context, gatewayID string, probeTTL time.Duration) (domaingateway.Admission, error)
+	ReleaseProbe(ctx context.Context, gatewayID string) error
 }
 type IntentTracker interface {
 	EnterProcessing(ctx context.Context, gatewayID string, txnID uuid.UUID, ttl time.Duration) error

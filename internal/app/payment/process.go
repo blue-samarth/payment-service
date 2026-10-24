@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	domaingateway "samarth/payment-service/internal/domain/gateway"
 	"samarth/payment-service/internal/domain/routing"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -32,6 +33,7 @@ type cachedResponse struct {
 const (
 	reinitiateWindow = 23 * time.Hour
 	workMargin       = 10 * time.Second
+	gateTimeout      = 500 * time.Millisecond
 	leaseMargin      = 30 * time.Second
 
 	reviewReasonNotIdempotent      = "gateway_not_idempotent"
@@ -290,16 +292,17 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 
 	tried := make([]string, 0, maxAttempts)
 
-	if !s.admitCall(ctx, txn.GatewayID) {
+	if adm := s.admitCall(ctx, txn.GatewayID); !adm.Admitted {
 		tried = append(tried, txn.GatewayID)
-		next, nextAdapter, ok := s.nextAdmitted(ctx, txn, &tried)
-		if !ok || !s.switchGateway(ctx, txn, next, "breaker_refused", 1) {
+		refusal := adm.Refusal
+		nextAdapter, ok := s.moveToNextAdmitted(ctx, txn, &tried, &refusal, "breaker_refused", 1)
+		if !ok {
 			return nil, outcome{
 				terminal:  true,
 				newStatus: transaction.StatusFailed,
 				failureReason: &transaction.FailureReason{
 					Category: "gateway_unavailable",
-					Code:     "circuit_breaker_open",
+					Code:     refusal,
 					Source:   transaction.FailureReasonSourceInternal,
 				},
 			}
@@ -318,37 +321,57 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 			return resp, result
 		}
 
-		next, nextAdapter, ok := s.nextAdmitted(ctx, txn, &tried)
-		if !ok || !s.switchGateway(ctx, txn, next, "soft_decline", calls+1) {
+		var refusal string
+		nextAdapter, ok := s.moveToNextAdmitted(ctx, txn, &tried, &refusal, "soft_decline", calls+1)
+		if !ok {
 			return resp, result
 		}
 		adapter = nextAdapter
 	}
 }
 
-func (s *Service) nextAdmitted(ctx context.Context, txn *transaction.Transaction, tried *[]string) (string, ports.GatewayAdapter, bool) {
+func (s *Service) moveToNextAdmitted(ctx context.Context, txn *transaction.Transaction, tried *[]string, refusal *string, reason string, attempt int) (ports.GatewayAdapter, bool) {
 	for {
 		next, adapter, ok := s.rerouteExcluding(ctx, txn, *tried)
 		if !ok || slices.Contains(*tried, next) {
-			return "", nil, false
+			return nil, false
 		}
-		if s.admitCall(ctx, next) {
-			return next, adapter, true
+		adm := s.admitCall(ctx, next)
+		if !adm.Admitted {
+			*tried = append(*tried, next)
+			*refusal = adm.Refusal
+			continue
 		}
-		*tried = append(*tried, next)
+		if !s.switchGateway(ctx, txn, next, reason, attempt) {
+			if adm.HoldsProbe {
+				s.releaseProbe(ctx, next)
+			}
+			return nil, false
+		}
+		return adapter, true
 	}
 }
 
-func (s *Service) admitCall(ctx context.Context, gatewayID string) bool {
+func (s *Service) admitCall(ctx context.Context, gatewayID string) domaingateway.Admission {
 	if s.gate == nil {
-		return true
+		return domaingateway.Admission{Admitted: true}
 	}
-	ok, err := s.gate.AdmitCall(ctx, gatewayID, s.httpTimeout+workMargin)
+	gctx, cancel := context.WithTimeout(ctx, gateTimeout)
+	defer cancel()
+	adm, err := s.gate.AdmitCall(gctx, gatewayID, s.httpTimeout+workMargin)
 	if err != nil {
 		s.metrics.Increment(ports.MetricGatewayProbeGateError, map[string]string{"gateway_id": gatewayID})
-		return true
+		return domaingateway.Admission{Admitted: true}
 	}
-	return ok
+	return adm
+}
+
+func (s *Service) releaseProbe(ctx context.Context, gatewayID string) {
+	gctx, cancel := context.WithTimeout(ctx, gateTimeout)
+	defer cancel()
+	if err := s.gate.ReleaseProbe(gctx, gatewayID); err != nil {
+		s.metrics.Increment(ports.MetricGatewayProbeGateError, map[string]string{"gateway_id": gatewayID})
+	}
 }
 
 func (s *Service) switchGateway(ctx context.Context, txn *transaction.Transaction, next, reason string, attempt int) bool {

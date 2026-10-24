@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	domaingateway "samarth/payment-service/internal/domain/gateway"
 	"samarth/payment-service/internal/domain/routing"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -533,16 +534,31 @@ func TestProcessPayment_FallbackRecordsNextGatewayBeforeCallingIt(t *testing.T) 
 }
 
 type fakeGate struct {
-	refuse map[string]bool
-	err    error
-	asked  []string
-	ttls   []time.Duration
+	refuse      map[string]string
+	probe       map[string]bool
+	err         error
+	ttls        []time.Duration
+	noDeadlines int
+	released    []string
 }
 
-func (g *fakeGate) AdmitCall(_ context.Context, gatewayID string, ttl time.Duration) (bool, error) {
-	g.asked = append(g.asked, gatewayID)
+func (g *fakeGate) AdmitCall(ctx context.Context, gatewayID string, ttl time.Duration) (domaingateway.Admission, error) {
 	g.ttls = append(g.ttls, ttl)
-	return !g.refuse[gatewayID], g.err
+	if _, ok := ctx.Deadline(); !ok {
+		g.noDeadlines++
+	}
+	if g.err != nil {
+		return domaingateway.Admission{}, g.err
+	}
+	if reason, ok := g.refuse[gatewayID]; ok {
+		return domaingateway.Admission{Refusal: reason}, nil
+	}
+	return domaingateway.Admission{Admitted: true, HoldsProbe: g.probe[gatewayID]}, nil
+}
+
+func (g *fakeGate) ReleaseProbe(_ context.Context, gatewayID string) error {
+	g.released = append(g.released, gatewayID)
+	return nil
 }
 
 func TestProcessPayment_RefusedGatewayIsReroutedBeforeAnyCall(t *testing.T) {
@@ -553,7 +569,7 @@ func TestProcessPayment_RefusedGatewayIsReroutedBeforeAnyCall(t *testing.T) {
 	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": first, "razorpay": second}}
 	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
 	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
-	gate := &fakeGate{refuse: map[string]bool{"stripe": true}}
+	gate := &fakeGate{refuse: map[string]string{"stripe": domaingateway.RefusalOpen}}
 	svc.SetCallGate(gate)
 	svc.SetGatewayHTTPTimeout(30 * time.Second)
 
@@ -584,7 +600,7 @@ func TestProcessPayment_SoftDeclineThenRefusalStaysOnTheDecliningGateway(t *test
 	metrics := newCountingMetrics()
 	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, metrics)
 	svc.SetMaxGatewayAttempts(2)
-	svc.SetCallGate(&fakeGate{refuse: map[string]bool{"razorpay": true}})
+	svc.SetCallGate(&fakeGate{refuse: map[string]string{"razorpay": domaingateway.RefusalOpen}})
 
 	got, err := svc.ProcessPayment(context.Background(), txn.ID)
 	if err != nil {
@@ -612,7 +628,8 @@ func TestProcessPayment_RefusedWithNoAlternativeFailsWithoutACharge(t *testing.T
 	only := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
 	router := &fakeRouter{err: routing.ErrNoCandidate{}}
 	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, &fakeRegistry{adapter: only}, noopLogger{}, noopMetrics{})
-	svc.SetCallGate(&fakeGate{refuse: map[string]bool{"stripe": true}})
+	gate := &fakeGate{refuse: map[string]string{"stripe": domaingateway.RefusalProbeInFlight}}
+	svc.SetCallGate(gate)
 
 	got, err := svc.ProcessPayment(context.Background(), txn.ID)
 	if err != nil {
@@ -623,6 +640,54 @@ func TestProcessPayment_RefusedWithNoAlternativeFailsWithoutACharge(t *testing.T
 	}
 	if got.Status != transaction.StatusFailed || got.FailureReason == nil || got.FailureReason.Category != "gateway_unavailable" {
 		t.Fatalf("with nothing to call, the payment fails as unavailable (nothing was charged), got %s %+v", got.Status, got.FailureReason)
+	}
+	if got.FailureReason.Code != domaingateway.RefusalProbeInFlight {
+		t.Fatalf("the failure must carry the real refusal reason, got %q", got.FailureReason.Code)
+	}
+	if gate.noDeadlines != 0 {
+		t.Fatal("the gate must be called with a short deadline so a dead Redis cannot stall a payment")
+	}
+}
+
+func TestProcessPayment_ProbeReleasedWhenTheSwitchCannotBePersisted(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	first := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	second := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pay_2", Status: ports.GatewayPaymentStatusSucceeded}}
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": first, "razorpay": second}}
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{failAt: 2}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
+	gate := &fakeGate{
+		refuse: map[string]string{"stripe": domaingateway.RefusalOpen},
+		probe:  map[string]bool{"razorpay": true},
+	}
+	svc.SetCallGate(gate)
+
+	if _, err := svc.ProcessPayment(context.Background(), txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.initiated)+len(second.initiated) != 0 {
+		t.Fatal("no gateway may be called when the switch is not recorded")
+	}
+	if len(gate.released) != 1 || gate.released[0] != "razorpay" {
+		t.Fatalf("a probe taken for a call that never happens must be released, not left to its TTL; released %v", gate.released)
+	}
+}
+
+func TestProcessPayment_ProbeNotReleasedWhenNoneWasTaken(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": &fakeAdapter{}, "razorpay": &fakeAdapter{}}}
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{failAt: 2}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
+	gate := &fakeGate{refuse: map[string]string{"stripe": domaingateway.RefusalOpen}}
+	svc.SetCallGate(gate)
+
+	if _, err := svc.ProcessPayment(context.Background(), txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(gate.released) != 0 {
+		t.Fatalf("razorpay was CLOSED, so its probe belongs to nobody here and must not be deleted; released %v", gate.released)
 	}
 }
 
