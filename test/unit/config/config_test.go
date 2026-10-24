@@ -135,6 +135,22 @@ func TestValidate_IdempotencyTimeoutMustExceedGatewayBudget(t *testing.T) {
 	}
 }
 
+func TestValidate_GatewayAttemptsAndTimeoutArePositive(t *testing.T) {
+	for name, tc := range map[string]struct {
+		mutate func(*Config)
+		want   string
+	}{
+		"zero attempts":    {func(c *Config) { c.Gateway.MaxAttempts = 0 }, "GATEWAY_MAX_ATTEMPTS must be at least 1"},
+		"negative timeout": {func(c *Config) { c.Gateway.HTTPTimeout = -time.Second }, "GATEWAY_HTTP_TIMEOUT must be greater than 0"},
+	} {
+		c := validatableConfig()
+		tc.mutate(c)
+		if err := Validate(c); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: a zero gateway budget gives the breaker probe lock no expiry; expected %q, got %v", name, tc.want, err)
+		}
+	}
+}
+
 func TestValidate_RejectsMultipleRedisAddrs(t *testing.T) {
 	c := validatableConfig()
 
