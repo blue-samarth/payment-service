@@ -27,10 +27,15 @@ type BreakerStateReader interface {
 type ActiveIntentsReader interface {
 	ActiveIntents(ctx context.Context, gatewayIDs []string) (map[string]int, error)
 }
+type BreakerProbe interface {
+	AcquireProbe(ctx context.Context, gatewayID string, ttl time.Duration) (bool, error)
+}
 
 type Router struct {
 	config            ConfigSource
 	breaker           BreakerStateReader
+	probe             BreakerProbe
+	probeTTL          time.Duration
 	intents           ActiveIntentsReader
 	snapshotTTLSecond int
 	p99SLAMs          int
@@ -46,6 +51,9 @@ func NewRouter(config ConfigSource) *Router {
 
 func (r *Router) SetBreakerState(b BreakerStateReader)   { r.breaker = b }
 func (r *Router) SetActiveIntents(a ActiveIntentsReader) { r.intents = a }
+func (r *Router) SetBreakerProbe(p BreakerProbe, ttl time.Duration) {
+	r.probe, r.probeTTL = p, ttl
+}
 
 func (r *Router) Route(ctx context.Context, in payment.RouteInput) (*domainrouting.Decision, error) {
 	method := string(in.PaymentMethod)
@@ -104,11 +112,34 @@ func (r *Router) Route(ctx context.Context, in payment.RouteInput) (*domainrouti
 		P99LatencySLAMs: r.p99SLAMs,
 	}
 
-	decision, _, err := domainrouting.Select(candidates, scoringCtx, toWeights(weights), r.snapshotTTLSecond)
-	if err != nil {
-		return nil, err
+	for {
+		decision, _, err := domainrouting.Select(candidates, scoringCtx, toWeights(weights), r.snapshotTTLSecond)
+		if err != nil {
+			return nil, err
+		}
+		i := candidateIndex(candidates, decision.SelectedGateway)
+		if i < 0 || candidates[i].CircuitBreakerState != string(gateway.StateHalfOpen) || r.takeProbe(ctx, decision.SelectedGateway) {
+			return decision, nil
+		}
+		candidates[i].CircuitBreakerState = string(gateway.StateOpen)
 	}
-	return decision, nil
+}
+
+func (r *Router) takeProbe(ctx context.Context, gatewayID string) bool {
+	if r.probe == nil {
+		return true
+	}
+	ok, err := r.probe.AcquireProbe(ctx, gatewayID, r.probeTTL)
+	return err != nil || ok
+}
+
+func candidateIndex(candidates []domainrouting.Candidate, gatewayID string) int {
+	for i := range candidates {
+		if candidates[i].GatewayID == gatewayID {
+			return i
+		}
+	}
+	return -1
 }
 
 func (r *Router) applyActiveIntents(ctx context.Context, candidates []domainrouting.Candidate) {

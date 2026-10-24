@@ -136,6 +136,7 @@ func run() error {
 		threshold: cfg.Gateway.CircuitBreakerFailureThreshold,
 	})
 	router.SetBreakerState(breakerStateAdapter{store: cbStore})
+	router.SetBreakerProbe(cbStore, cfg.Gateway.Budget())
 	paymentSvc.SetMaxGatewayAttempts(cfg.Gateway.MaxAttempts)
 	paymentSvc.SetGatewayHTTPTimeout(cfg.Gateway.HTTPTimeout)
 

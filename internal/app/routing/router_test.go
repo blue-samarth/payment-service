@@ -201,6 +201,83 @@ func TestRouter_ExpiredCooldownProbesHalfOpen(t *testing.T) {
 	}
 }
 
+type fakeProbe struct {
+	free  map[string]bool
+	err   error
+	calls []string
+}
+
+func (p *fakeProbe) AcquireProbe(_ context.Context, gatewayID string, _ time.Duration) (bool, error) {
+	p.calls = append(p.calls, gatewayID)
+	if p.err != nil {
+		return false, p.err
+	}
+	ok := p.free[gatewayID]
+	p.free[gatewayID] = false
+	return ok, nil
+}
+
+type halfOpenGateways map[string]bool
+
+func (h halfOpenGateways) BreakerState(_ context.Context, gatewayID string) (string, time.Time, error) {
+	if h[gatewayID] {
+		return "OPEN", time.Now().UTC().Add(-time.Minute), nil
+	}
+	return "CLOSED", time.Time{}, nil
+}
+
+func TestRouter_HalfOpenAdmitsASingleProbe(t *testing.T) {
+	cfg := &fakeConfig{gateways: []*ports.GatewayConfig{gatewayConfig("g1", 0)}, weights: equalWeights()}
+	r := NewRouter(cfg)
+	r.SetBreakerState(halfOpenGateways{"g1": true})
+	probe := &fakeProbe{free: map[string]bool{"g1": true}}
+	r.SetBreakerProbe(probe, time.Minute)
+
+	if d, err := r.Route(context.Background(), validInput()); err != nil || d.SelectedGateway != "g1" {
+		t.Fatalf("the first request after the cooldown must probe g1, got %v %v", d, err)
+	}
+	var none domainrouting.ErrNoCandidate
+	if _, err := r.Route(context.Background(), validInput()); !errors.As(err, &none) {
+		t.Fatalf("while the probe is out, a half-open gateway must not take other traffic, got %v", err)
+	}
+}
+
+func TestRouter_LosingTheProbeFallsBackToAnotherGateway(t *testing.T) {
+	healthy := gatewayConfig("healthy", 0)
+	healthy.Metrics.P99LatencyMs = 1900
+	healthy.Metrics.DiscrepancyRate24h = 0.15
+	cfg := &fakeConfig{
+		gateways: []*ports.GatewayConfig{gatewayConfig("recovering", 0), healthy},
+		weights:  equalWeights(),
+	}
+	r := NewRouter(cfg)
+	r.SetBreakerState(halfOpenGateways{"recovering": true})
+	probe := &fakeProbe{free: map[string]bool{}}
+	r.SetBreakerProbe(probe, time.Minute)
+
+	d, err := r.Route(context.Background(), validInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.SelectedGateway != "healthy" {
+		t.Fatalf("with the probe held elsewhere, routing must pick another gateway, got %s", d.SelectedGateway)
+	}
+	if len(probe.calls) != 1 || probe.calls[0] != "recovering" {
+		t.Fatalf("expected exactly one probe attempt, on the better-scored half-open gateway, got %v", probe.calls)
+	}
+}
+
+func TestRouter_ProbeStoreErrorFailsOpen(t *testing.T) {
+	cfg := &fakeConfig{gateways: []*ports.GatewayConfig{gatewayConfig("g1", 0)}, weights: equalWeights()}
+	r := NewRouter(cfg)
+	r.SetBreakerState(halfOpenGateways{"g1": true})
+	r.SetBreakerProbe(&fakeProbe{err: errors.New("redis down"), free: map[string]bool{}}, time.Minute)
+
+	if _, err := r.Route(context.Background(), validInput()); err != nil {
+		t.Fatalf("a probe-store error must not take routing down, got %v", err)
+	}
+}
+
 func TestRouter_BreakerReaderErrorFailsOpen(t *testing.T) {
 	cfg := &fakeConfig{
 		gateways: []*ports.GatewayConfig{gatewayConfig("g1", 0)},
