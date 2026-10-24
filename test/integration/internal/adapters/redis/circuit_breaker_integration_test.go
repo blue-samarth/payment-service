@@ -125,6 +125,199 @@ func TestCircuitBreaker_CooldownEscalatesOnReopen(t *testing.T) {
 	}
 }
 
+type clock struct{ now time.Time }
+
+func (c *clock) Now() time.Time          { return c.now }
+func (c *clock) Advance(d time.Duration) { c.now = c.now.Add(d) }
+func (c *clock) cooldownLeft(cb *gateway.CircuitBreaker) time.Duration {
+	return cb.CooldownUntil.Sub(c.now)
+}
+
+func newClockedStore(t *testing.T) (*redis.CircuitBreakerStore, *clock) {
+	t.Helper()
+	c := testsupport.RequireRedis(t)
+	testsupport.FlushRedis(t, c)
+	store := redis.NewCircuitBreakerStore(c)
+	clk := &clock{now: time.Unix(1_800_000_000, 0).UTC()}
+	store.SetClock(clk.Now)
+	return store, clk
+}
+
+func tripAt(t *testing.T, store *redis.CircuitBreakerStore, gw string, threshold int) {
+	t.Helper()
+	for i := 0; i < threshold; i++ {
+		if _, _, err := store.RecordFailure(context.Background(), gw, threshold); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCircuitBreaker_RecoversAfterCooldown(t *testing.T) {
+	store, clk := newClockedStore(t)
+	ctx := context.Background()
+	const gw = "recover-gw"
+	tripAt(t, store, gw, 5)
+
+	tripped, _ := store.Get(ctx, gw)
+	clk.now = tripped.CooldownUntil.Add(time.Second)
+	if err := store.RecordSuccess(ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+	cb, _ := store.Get(ctx, gw)
+	if cb.State != gateway.StateClosed || !cb.CooldownUntil.IsZero() || cb.Trips != 0 || cb.ConsecutiveFailures != 0 {
+		t.Fatalf("a success after the cooldown must close and reset the breaker, got %+v", cb)
+	}
+}
+
+func TestCircuitBreaker_SuccessDuringCooldownDoesNotLatchOpen(t *testing.T) {
+	store, _ := newClockedStore(t)
+	ctx := context.Background()
+	const gw = "latch-gw"
+	tripAt(t, store, gw, 5)
+	before, _ := store.Get(ctx, gw)
+
+	if err := store.RecordSuccess(ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+	cb, _ := store.Get(ctx, gw)
+	if cb.State != gateway.StateOpen || !cb.CooldownUntil.Equal(before.CooldownUntil) {
+		t.Fatalf("a late success from an in-flight request must leave OPEN and its cooldown alone, got %+v (cooldown was %s)", cb, before.CooldownUntil)
+	}
+	if got := gateway.EffectiveState(cb.State, cb.CooldownUntil, before.CooldownUntil); got != gateway.StateHalfOpen {
+		t.Fatalf("once the cooldown lapses the gateway must be probeable, got %s; the old script zeroed the cooldown here and latched it OPEN", got)
+	}
+}
+
+func TestCircuitBreaker_FailureAfterCooldownReTrips(t *testing.T) {
+	store, clk := newClockedStore(t)
+	ctx := context.Background()
+	const gw = "retrip-gw"
+	tripAt(t, store, gw, 5)
+
+	tripped, _ := store.Get(ctx, gw)
+	clk.now = tripped.CooldownUntil.Add(time.Second)
+	opened, _, err := store.RecordFailure(ctx, gw, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb, _ := store.Get(ctx, gw)
+	if !opened || cb.State != gateway.StateOpen || !cb.CooldownUntil.After(clk.now) {
+		t.Fatalf("a failure after the cooldown is a failed probe and must re-trip at once, got opened=%v %+v", opened, cb)
+	}
+}
+
+func TestCircuitBreaker_FailedProbesEscalateCooldown(t *testing.T) {
+	store, clk := newClockedStore(t)
+	ctx := context.Background()
+	const gw = "escalate-probe-gw"
+	tripAt(t, store, gw, 5)
+
+	cb, _ := store.Get(ctx, gw)
+	if left := clk.cooldownLeft(cb); left != gateway.CooldownBase {
+		t.Fatalf("the first trip must use the base cooldown even at threshold 5, got %s", left)
+	}
+
+	for _, want := range []time.Duration{2 * gateway.CooldownBase, gateway.CooldownMax, gateway.CooldownMax} {
+		clk.now = cb.CooldownUntil.Add(time.Second)
+		opened, _, err := store.RecordFailure(ctx, gw, 5)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !opened {
+			t.Fatal("a failed probe after the cooldown must re-open immediately, without counting to the threshold")
+		}
+		cb, _ = store.Get(ctx, gw)
+		if left := clk.cooldownLeft(cb); left != want {
+			t.Fatalf("trip %d: cooldown %s, want %s", cb.Trips, left, want)
+		}
+	}
+}
+
+func TestCircuitBreaker_FailuresDuringCooldownDoNotExtendIt(t *testing.T) {
+	store, clk := newClockedStore(t)
+	ctx := context.Background()
+	const gw = "straggler-gw"
+	tripAt(t, store, gw, 5)
+	before, _ := store.Get(ctx, gw)
+
+	clk.Advance(10 * time.Second)
+	opened, _, err := store.RecordFailure(ctx, gw, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb, _ := store.Get(ctx, gw)
+	if opened || !cb.CooldownUntil.Equal(before.CooldownUntil) || cb.Trips != before.Trips {
+		t.Fatalf("a late failure during the cooldown must not re-trip, got opened=%v %+v", opened, cb)
+	}
+}
+
+func TestCircuitBreaker_ProbeIsReleasedByTheProbeOutcome(t *testing.T) {
+	store, clk := newClockedStore(t)
+	ctx := context.Background()
+	const gw = "probe-release-gw"
+	tripAt(t, store, gw, 1)
+
+	clk.Advance(gateway.CooldownBase + time.Second)
+	if adm, _ := store.AdmitCall(ctx, gw, time.Hour); !adm.Admitted || !adm.HoldsProbe {
+		t.Fatalf("expected the first call after the cooldown to be admitted holding the probe, got %+v", adm)
+	}
+	if adm, _ := store.AdmitCall(ctx, gw, time.Hour); adm.Admitted || adm.Refusal != gateway.RefusalProbeInFlight {
+		t.Fatalf("the probe must be single-flight and the refusal must say why, got %+v", adm)
+	}
+	if held, _ := store.ProbeHeld(ctx, gw); !held {
+		t.Fatal("routing must be able to see the probe is out")
+	}
+	if _, _, err := store.RecordFailure(ctx, gw, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	cb, _ := store.Get(ctx, gw)
+	clk.now = cb.CooldownUntil.Add(time.Second)
+	if adm, _ := store.AdmitCall(ctx, gw, time.Hour); !adm.Admitted {
+		t.Fatal("a failed probe must release the lock so the next cooldown can be probed without waiting for its TTL")
+	}
+	if err := store.RecordSuccess(ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+	if held, _ := store.ProbeHeld(ctx, gw); held {
+		t.Fatal("a successful probe must release the lock")
+	}
+}
+
+func TestCircuitBreaker_AdmitCall(t *testing.T) {
+	store, clk := newClockedStore(t)
+	ctx := context.Background()
+
+	if adm, err := store.AdmitCall(ctx, "never-seen", time.Minute); err != nil || !adm.Admitted || adm.HoldsProbe {
+		t.Fatalf("a gateway with no breaker record must be admitted without a probe, got %+v %v", adm, err)
+	}
+
+	const gw = "admit-gw"
+	tripAt(t, store, gw, 1)
+	if adm, _ := store.AdmitCall(ctx, gw, time.Minute); adm.Admitted || adm.Refusal != gateway.RefusalOpen {
+		t.Fatalf("a call routed before the trip must be refused as open while the cooldown is active, got %+v", adm)
+	}
+	if held, _ := store.ProbeHeld(ctx, gw); held {
+		t.Fatal("a refused call during the cooldown must not take the probe")
+	}
+
+	clk.Advance(gateway.CooldownBase + time.Second)
+	if adm, _ := store.AdmitCall(ctx, gw, 0); !adm.HoldsProbe {
+		t.Fatal("expected the probe")
+	}
+	ttl, err := testsupport.RequireRedis(t).State.PTTL(ctx, "gateway:probe:"+gw).Result()
+	if err != nil || ttl <= 0 {
+		t.Fatalf("a zero TTL must be floored, never stored as a lock without expiry; got ttl=%s err=%v", ttl, err)
+	}
+
+	if err := store.ReleaseProbe(ctx, gw); err != nil {
+		t.Fatal(err)
+	}
+	if adm, _ := store.AdmitCall(ctx, gw, time.Minute); !adm.HoldsProbe {
+		t.Fatal("a released probe must be available to the next caller at once")
+	}
+}
+
 func TestCircuitBreaker_SetLastKnownScorePreservesState(t *testing.T) {
 	c := testsupport.RequireRedis(t)
 	testsupport.FlushRedis(t, c)

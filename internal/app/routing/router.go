@@ -27,10 +27,14 @@ type BreakerStateReader interface {
 type ActiveIntentsReader interface {
 	ActiveIntents(ctx context.Context, gatewayIDs []string) (map[string]int, error)
 }
+type ProbeReader interface {
+	ProbeHeld(ctx context.Context, gatewayID string) (bool, error)
+}
 
 type Router struct {
 	config            ConfigSource
 	breaker           BreakerStateReader
+	probes            ProbeReader
 	intents           ActiveIntentsReader
 	snapshotTTLSecond int
 	p99SLAMs          int
@@ -46,6 +50,7 @@ func NewRouter(config ConfigSource) *Router {
 
 func (r *Router) SetBreakerState(b BreakerStateReader)   { r.breaker = b }
 func (r *Router) SetActiveIntents(a ActiveIntentsReader) { r.intents = a }
+func (r *Router) SetProbeReader(p ProbeReader)           { r.probes = p }
 
 func (r *Router) Route(ctx context.Context, in payment.RouteInput) (*domainrouting.Decision, error) {
 	method := string(in.PaymentMethod)
@@ -78,7 +83,7 @@ func (r *Router) Route(ctx context.Context, in payment.RouteInput) (*domainrouti
 
 		cbState, cbCooldown, _ := r.liveBreakerState(ctx, cfg.GatewayID, cfg.CircuitBreaker)
 
-		candidate := gatewayCandidate(cfg, cbState, cbCooldown)
+		candidate := gatewayCandidate(cfg, cbState, cbCooldown, r.probeInFlight(ctx, cfg.GatewayID, cbState))
 		candidate.CalculatedFeePaise = calculatedFee
 		candidates = append(candidates, candidate)
 
@@ -111,6 +116,14 @@ func (r *Router) Route(ctx context.Context, in payment.RouteInput) (*domainrouti
 	return decision, nil
 }
 
+func (r *Router) probeInFlight(ctx context.Context, gatewayID, state string) bool {
+	if r.probes == nil || state != string(gateway.StateHalfOpen) {
+		return false
+	}
+	held, err := r.probes.ProbeHeld(ctx, gatewayID)
+	return err == nil && held
+}
+
 func (r *Router) applyActiveIntents(ctx context.Context, candidates []domainrouting.Candidate) {
 	if r.intents == nil || len(candidates) == 0 {
 		return
@@ -139,11 +152,11 @@ func (r *Router) Availability(ctx context.Context, cfg *ports.GatewayConfig) (Av
 	return Availability{
 		BreakerState:  state,
 		CooldownUntil: cooldown,
-		Reason:        domainrouting.UnavailableReason(gatewayCandidate(cfg, state, cooldown)),
+		Reason:        domainrouting.UnavailableReason(gatewayCandidate(cfg, state, cooldown, r.probeInFlight(ctx, cfg.GatewayID, state))),
 	}, err
 }
 
-func gatewayCandidate(cfg *ports.GatewayConfig, breakerState string, cooldownUntil time.Time) domainrouting.Candidate {
+func gatewayCandidate(cfg *ports.GatewayConfig, breakerState string, cooldownUntil time.Time, probeInFlight bool) domainrouting.Candidate {
 	return domainrouting.Candidate{
 		GatewayID:           cfg.GatewayID,
 		IsActive:            cfg.IsActive,
@@ -152,6 +165,7 @@ func gatewayCandidate(cfg *ports.GatewayConfig, breakerState string, cooldownUnt
 		SupportedCurrencies: cfg.SupportedCurrencies,
 		CooldownUntil:       cooldownUntil,
 		CircuitBreakerState: breakerState,
+		ProbeInFlight:       probeInFlight,
 		DiscrepancyRate24h:  cfg.Metrics.DiscrepancyRate24h,
 		P99LatencyMs:        cfg.Metrics.P99LatencyMs,
 		Volume7dPaise:       cfg.Metrics.Volume7d,

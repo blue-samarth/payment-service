@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
 
+	domaingateway "samarth/payment-service/internal/domain/gateway"
 	"samarth/payment-service/internal/domain/routing"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -31,6 +33,7 @@ type cachedResponse struct {
 const (
 	reinitiateWindow = 23 * time.Hour
 	workMargin       = 10 * time.Second
+	gateTimeout      = 500 * time.Millisecond
 	leaseMargin      = 30 * time.Second
 
 	reviewReasonNotIdempotent      = "gateway_not_idempotent"
@@ -288,60 +291,125 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 	}
 
 	tried := make([]string, 0, maxAttempts)
-	var resp *ports.GatewayPaymentResponse
-	var result outcome
 
-	for attempt := 1; ; attempt++ {
-		var gwErr *ports.GatewayError
-		resp, gwErr = s.callGateway(ctx, adapter, txn)
+	if adm := s.admitCall(ctx, txn.GatewayID); !adm.Admitted {
+		tried = append(tried, txn.GatewayID)
+		refusal := adm.Refusal
+		nextAdapter, ok := s.moveToNextAdmitted(ctx, txn, &tried, &refusal, "breaker_refused", 1)
+		if !ok {
+			return nil, outcome{
+				terminal:  true,
+				newStatus: transaction.StatusFailed,
+				failureReason: &transaction.FailureReason{
+					Category: "gateway_unavailable",
+					Code:     refusal,
+					Source:   transaction.FailureReasonSourceInternal,
+				},
+			}
+		}
+		adapter = nextAdapter
+	}
+
+	for calls := 1; ; calls++ {
+		resp, gwErr := s.callGateway(ctx, adapter, txn)
 		s.saveReference(ctx, txn, resp)
-		result = resolveOutcome(resp, gwErr)
+		result := resolveOutcome(resp, gwErr)
 		s.recordBreaker(ctx, txn.GatewayID, gwErr)
 		tried = append(tried, txn.GatewayID)
 
-		if attempt >= maxAttempts || !shouldFallback(gwErr) {
+		if calls >= maxAttempts || !shouldFallback(gwErr) {
 			return resp, result
 		}
 
-		next, nextAdapter, ok := s.rerouteExcluding(ctx, txn, tried)
+		var refusal string
+		nextAdapter, ok := s.moveToNextAdmitted(ctx, txn, &tried, &refusal, "soft_decline", calls+1)
 		if !ok {
 			return resp, result
 		}
-
-		prevGateway, prevReference := txn.GatewayID, txn.GatewayReferenceID
-		txn.GatewayID = next
-		txn.ActualGateway = next
-		txn.GatewayReferenceID = ""
-		if err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
-			return s.repo.UpdateStatus(ctx, txn)
-		}); err != nil {
-			s.log.Warn(ports.LogEventGatewayFallback, map[string]any{
-				ports.FieldTransactionID: txn.ID.String(),
-				ports.FieldGatewayID:     next,
-				"error":                  err.Error(),
-				"stage":                  "persist_fallback",
-			})
-			txn.GatewayID = prevGateway
-			txn.ActualGateway = prevGateway
-			txn.GatewayReferenceID = prevReference
-			return resp, result
-		}
-		s.log.Info(ports.LogEventGatewayFallback, map[string]any{
-			ports.FieldTransactionID: txn.ID.String(),
-			ports.FieldGatewayID:     prevGateway,
-			"fallback_gateway":       next,
-			ports.FieldAttemptNumber: attempt + 1,
-		})
-		s.metrics.Increment(ports.MetricGatewayFallbackTriggered, map[string]string{
-			"from_gateway": prevGateway,
-			"to_gateway":   next,
-		})
 		adapter = nextAdapter
-		if txn.ProcessingTimeout != nil {
-			s.exitIntent(ctx, prevGateway, txn.ID)
-			s.enterIntent(ctx, next, txn.ID, *txn.ProcessingTimeout)
-		}
 	}
+}
+
+func (s *Service) moveToNextAdmitted(ctx context.Context, txn *transaction.Transaction, tried *[]string, refusal *string, reason string, attempt int) (ports.GatewayAdapter, bool) {
+	for {
+		next, adapter, ok := s.rerouteExcluding(ctx, txn, *tried)
+		if !ok || slices.Contains(*tried, next) {
+			return nil, false
+		}
+		adm := s.admitCall(ctx, next)
+		if !adm.Admitted {
+			*tried = append(*tried, next)
+			*refusal = adm.Refusal
+			continue
+		}
+		if !s.switchGateway(ctx, txn, next, reason, attempt) {
+			if adm.HoldsProbe {
+				s.releaseProbe(ctx, next)
+			}
+			return nil, false
+		}
+		return adapter, true
+	}
+}
+
+func (s *Service) admitCall(ctx context.Context, gatewayID string) domaingateway.Admission {
+	if s.gate == nil {
+		return domaingateway.Admission{Admitted: true}
+	}
+	gctx, cancel := context.WithTimeout(ctx, gateTimeout)
+	defer cancel()
+	adm, err := s.gate.AdmitCall(gctx, gatewayID, s.httpTimeout+workMargin)
+	if err != nil {
+		s.metrics.Increment(ports.MetricGatewayProbeGateError, map[string]string{"gateway_id": gatewayID})
+		return domaingateway.Admission{Admitted: true}
+	}
+	return adm
+}
+
+func (s *Service) releaseProbe(ctx context.Context, gatewayID string) {
+	gctx, cancel := context.WithTimeout(ctx, gateTimeout)
+	defer cancel()
+	if err := s.gate.ReleaseProbe(gctx, gatewayID); err != nil {
+		s.metrics.Increment(ports.MetricGatewayProbeGateError, map[string]string{"gateway_id": gatewayID})
+	}
+}
+
+func (s *Service) switchGateway(ctx context.Context, txn *transaction.Transaction, next, reason string, attempt int) bool {
+	prevGateway, prevReference := txn.GatewayID, txn.GatewayReferenceID
+	txn.GatewayID = next
+	txn.ActualGateway = next
+	txn.GatewayReferenceID = ""
+	if err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
+		return s.repo.UpdateStatus(ctx, txn)
+	}); err != nil {
+		s.log.Warn(ports.LogEventGatewayFallback, map[string]any{
+			ports.FieldTransactionID: txn.ID.String(),
+			ports.FieldGatewayID:     next,
+			"error":                  err.Error(),
+			"stage":                  "persist_fallback",
+		})
+		txn.GatewayID = prevGateway
+		txn.ActualGateway = prevGateway
+		txn.GatewayReferenceID = prevReference
+		return false
+	}
+	s.log.Info(ports.LogEventGatewayFallback, map[string]any{
+		ports.FieldTransactionID: txn.ID.String(),
+		ports.FieldGatewayID:     prevGateway,
+		"fallback_gateway":       next,
+		"reason":                 reason,
+		ports.FieldAttemptNumber: attempt,
+	})
+	s.metrics.Increment(ports.MetricGatewayFallbackTriggered, map[string]string{
+		"from_gateway": prevGateway,
+		"to_gateway":   next,
+		"reason":       reason,
+	})
+	if txn.ProcessingTimeout != nil {
+		s.exitIntent(ctx, prevGateway, txn.ID)
+		s.enterIntent(ctx, next, txn.ID, *txn.ProcessingTimeout)
+	}
+	return true
 }
 
 func isDecline(gwErr *ports.GatewayError) bool {

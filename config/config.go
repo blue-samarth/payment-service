@@ -487,7 +487,7 @@ func Validate(c *Config) error {
 	}
 
 	if len(c.Redis.Addrs) > 1 {
-		errs = append(errs, "REDIS_ADDRS must be a single primary endpoint: multiple addresses switch the client to cluster mode, which supports only database 0 and cannot keep REDIS_RATE_LIMIT_DB and REDIS_CACHE_DB apart")
+		errs = append(errs, "REDIS_ADDRS must be a single primary endpoint: multiple addresses switch the client to cluster mode, which supports only database 0 and cannot keep REDIS_RATE_LIMIT_DB and REDIS_STATE_DB apart")
 	}
 	for _, addr := range c.Redis.Addrs {
 		if !validHostPort(addr) {
@@ -569,6 +569,12 @@ func Validate(c *Config) error {
 	}
 	if c.Gateway.CircuitBreakerFailureThreshold < 1 {
 		errs = append(errs, "CIRCUIT_BREAKER_FAILURE_THRESHOLD must be at least 1")
+	}
+	if c.Gateway.MaxAttempts < 1 {
+		errs = append(errs, "GATEWAY_MAX_ATTEMPTS must be at least 1")
+	}
+	if c.Gateway.HTTPTimeout <= 0 {
+		errs = append(errs, "GATEWAY_HTTP_TIMEOUT must be greater than 0")
 	}
 	if c.App.ShutdownDrainDelay < 0 {
 		errs = append(errs, "SHUTDOWN_DRAIN_DELAY must not be negative")

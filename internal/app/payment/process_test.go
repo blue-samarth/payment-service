@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	domaingateway "samarth/payment-service/internal/domain/gateway"
 	"samarth/payment-service/internal/domain/routing"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -529,6 +530,184 @@ func TestProcessPayment_FallbackRecordsNextGatewayBeforeCallingIt(t *testing.T) 
 	}
 	if updatesBeforeSecondCall != 2 || repo.snapshots[1].ActualGateway != "razorpay" {
 		t.Fatalf("the switch to razorpay must be persisted before razorpay is called, updates=%d snapshots=%+v", updatesBeforeSecondCall, repo.snapshots)
+	}
+}
+
+type fakeGate struct {
+	refuse      map[string]string
+	probe       map[string]bool
+	err         error
+	ttls        []time.Duration
+	noDeadlines int
+	released    []string
+}
+
+func (g *fakeGate) AdmitCall(ctx context.Context, gatewayID string, ttl time.Duration) (domaingateway.Admission, error) {
+	g.ttls = append(g.ttls, ttl)
+	if _, ok := ctx.Deadline(); !ok {
+		g.noDeadlines++
+	}
+	if g.err != nil {
+		return domaingateway.Admission{}, g.err
+	}
+	if reason, ok := g.refuse[gatewayID]; ok {
+		return domaingateway.Admission{Refusal: reason}, nil
+	}
+	return domaingateway.Admission{Admitted: true, HoldsProbe: g.probe[gatewayID]}, nil
+}
+
+func (g *fakeGate) ReleaseProbe(_ context.Context, gatewayID string) error {
+	g.released = append(g.released, gatewayID)
+	return nil
+}
+
+func TestProcessPayment_RefusedGatewayIsReroutedBeforeAnyCall(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	first := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	second := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pay_2", Status: ports.GatewayPaymentStatusSucceeded}}
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": first, "razorpay": second}}
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
+	gate := &fakeGate{refuse: map[string]string{"stripe": domaingateway.RefusalOpen}}
+	svc.SetCallGate(gate)
+	svc.SetGatewayHTTPTimeout(30 * time.Second)
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.initiated) != 0 {
+		t.Fatal("a gateway the breaker refused must not be called")
+	}
+	if got.Status != transaction.StatusSucceeded || got.ActualGateway != "razorpay" {
+		t.Fatalf("a refusal is not an attempt, so even with one attempt the payment must move to razorpay, got %s on %q", got.Status, got.ActualGateway)
+	}
+	for _, ttl := range gate.ttls {
+		if ttl < 30*time.Second {
+			t.Fatalf("the probe TTL must cover a whole gateway call, got %s", ttl)
+		}
+	}
+}
+
+func TestProcessPayment_SoftDeclineThenRefusalStaysOnTheDecliningGateway(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	first := &fakeAdapter{err: &ports.GatewayError{Category: ports.ErrorCategorySoftDecline, Code: "soft_decline"}}
+	second := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pay_2", Status: ports.GatewayPaymentStatusSucceeded}}
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": first, "razorpay": second}}
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
+	metrics := newCountingMetrics()
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, metrics)
+	svc.SetMaxGatewayAttempts(2)
+	svc.SetCallGate(&fakeGate{refuse: map[string]string{"razorpay": domaingateway.RefusalOpen}})
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.initiated) != 0 {
+		t.Fatal("the refused gateway must not be called")
+	}
+	if got.Status != transaction.StatusFailed || got.ActualGateway != "stripe" || got.GatewayID != "stripe" {
+		t.Fatalf("stripe's soft decline must be recorded against stripe, not the refused razorpay; got %s on gateway=%q actual=%q", got.Status, got.GatewayID, got.ActualGateway)
+	}
+	for _, snap := range repo.snapshots {
+		if snap.ActualGateway == "razorpay" {
+			t.Fatal("a refused gateway must never be persisted as the payment's gateway")
+		}
+	}
+	if metrics.counts[ports.MetricGatewayFallbackTriggered] != 0 {
+		t.Error("no fallback happened, so none may be counted")
+	}
+}
+
+func TestProcessPayment_RefusedWithNoAlternativeFailsWithoutACharge(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	only := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	router := &fakeRouter{err: routing.ErrNoCandidate{}}
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, &fakeRegistry{adapter: only}, noopLogger{}, noopMetrics{})
+	gate := &fakeGate{refuse: map[string]string{"stripe": domaingateway.RefusalProbeInFlight}}
+	svc.SetCallGate(gate)
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(only.initiated) != 0 {
+		t.Fatal("no gateway may be called")
+	}
+	if got.Status != transaction.StatusFailed || got.FailureReason == nil || got.FailureReason.Category != "gateway_unavailable" {
+		t.Fatalf("with nothing to call, the payment fails as unavailable (nothing was charged), got %s %+v", got.Status, got.FailureReason)
+	}
+	if got.FailureReason.Code != domaingateway.RefusalProbeInFlight {
+		t.Fatalf("the failure must carry the real refusal reason, got %q", got.FailureReason.Code)
+	}
+	if gate.noDeadlines != 0 {
+		t.Fatal("the gate must be called with a short deadline so a dead Redis cannot stall a payment")
+	}
+}
+
+func TestProcessPayment_ProbeReleasedWhenTheSwitchCannotBePersisted(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	first := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	second := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pay_2", Status: ports.GatewayPaymentStatusSucceeded}}
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": first, "razorpay": second}}
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{failAt: 2}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
+	gate := &fakeGate{
+		refuse: map[string]string{"stripe": domaingateway.RefusalOpen},
+		probe:  map[string]bool{"razorpay": true},
+	}
+	svc.SetCallGate(gate)
+
+	if _, err := svc.ProcessPayment(context.Background(), txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.initiated)+len(second.initiated) != 0 {
+		t.Fatal("no gateway may be called when the switch is not recorded")
+	}
+	if len(gate.released) != 1 || gate.released[0] != "razorpay" {
+		t.Fatalf("a probe taken for a call that never happens must be released, not left to its TTL; released %v", gate.released)
+	}
+}
+
+func TestProcessPayment_ProbeNotReleasedWhenNoneWasTaken(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": &fakeAdapter{}, "razorpay": &fakeAdapter{}}}
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{failAt: 2}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
+	gate := &fakeGate{refuse: map[string]string{"stripe": domaingateway.RefusalOpen}}
+	svc.SetCallGate(gate)
+
+	if _, err := svc.ProcessPayment(context.Background(), txn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(gate.released) != 0 {
+		t.Fatalf("razorpay was CLOSED, so its probe belongs to nobody here and must not be deleted; released %v", gate.released)
+	}
+}
+
+func TestProcessPayment_GateErrorAdmitsTheCallAndIsCounted(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusSucceeded}}
+	metrics := newCountingMetrics()
+	svc := NewService(repo, &fakeOutbox{}, &fakeRouter{}, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter}, noopLogger{}, metrics)
+	svc.SetCallGate(&fakeGate{err: errors.New("redis down")})
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != transaction.StatusSucceeded || len(adapter.initiated) != 1 {
+		t.Fatalf("a probe-store error must not block payments, got %s with %d calls", got.Status, len(adapter.initiated))
+	}
+	if metrics.counts[ports.MetricGatewayProbeGateError] != 1 {
+		t.Fatalf("the fail-open must be visible, got %v", metrics.counts)
 	}
 }
 

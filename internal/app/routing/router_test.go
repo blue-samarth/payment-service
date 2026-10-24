@@ -201,6 +201,72 @@ func TestRouter_ExpiredCooldownProbesHalfOpen(t *testing.T) {
 	}
 }
 
+type fakeProbes struct {
+	held map[string]bool
+	err  error
+}
+
+func (p fakeProbes) ProbeHeld(_ context.Context, gatewayID string) (bool, error) {
+	return p.held[gatewayID], p.err
+}
+
+type halfOpenGateways map[string]bool
+
+func (h halfOpenGateways) BreakerState(_ context.Context, gatewayID string) (string, time.Time, error) {
+	if h[gatewayID] {
+		return "OPEN", time.Now().UTC().Add(-time.Minute), nil
+	}
+	return "CLOSED", time.Time{}, nil
+}
+
+func TestRouter_HalfOpenWithAFreeProbeIsRoutable(t *testing.T) {
+	cfg := &fakeConfig{gateways: []*ports.GatewayConfig{gatewayConfig("g1", 0)}, weights: equalWeights()}
+	r := NewRouter(cfg)
+	r.SetBreakerState(halfOpenGateways{"g1": true})
+	r.SetProbeReader(fakeProbes{held: map[string]bool{}})
+
+	if d, err := r.Route(context.Background(), validInput()); err != nil || d.SelectedGateway != "g1" {
+		t.Fatalf("a half-open gateway with no probe out must be routable, got %v %v", d, err)
+	}
+}
+
+func TestRouter_HalfOpenWithAHeldProbeIsSkipped(t *testing.T) {
+	healthy := gatewayConfig("healthy", 0)
+	healthy.Metrics.P99LatencyMs = 1900
+	healthy.Metrics.DiscrepancyRate24h = 0.15
+	cfg := &fakeConfig{
+		gateways: []*ports.GatewayConfig{gatewayConfig("recovering", 0), healthy},
+		weights:  equalWeights(),
+	}
+	r := NewRouter(cfg)
+	r.SetBreakerState(halfOpenGateways{"recovering": true})
+	r.SetProbeReader(fakeProbes{held: map[string]bool{"recovering": true}})
+
+	d, err := r.Route(context.Background(), validInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.SelectedGateway != "healthy" {
+		t.Fatalf("with its probe out, the better-scored half-open gateway must be skipped, got %s", d.SelectedGateway)
+	}
+
+	avail, _ := r.Availability(context.Background(), cfg.gateways[0])
+	if avail.Reason != "circuit_breaker_probe_in_flight" {
+		t.Fatalf("/health-gateways must agree with routing, got reason %q", avail.Reason)
+	}
+}
+
+func TestRouter_ProbeReaderErrorFailsOpen(t *testing.T) {
+	cfg := &fakeConfig{gateways: []*ports.GatewayConfig{gatewayConfig("g1", 0)}, weights: equalWeights()}
+	r := NewRouter(cfg)
+	r.SetBreakerState(halfOpenGateways{"g1": true})
+	r.SetProbeReader(fakeProbes{err: errors.New("redis down")})
+
+	if _, err := r.Route(context.Background(), validInput()); err != nil {
+		t.Fatalf("a probe-store error must not take routing down, got %v", err)
+	}
+}
+
 func TestRouter_BreakerReaderErrorFailsOpen(t *testing.T) {
 	cfg := &fakeConfig{
 		gateways: []*ports.GatewayConfig{gatewayConfig("g1", 0)},
