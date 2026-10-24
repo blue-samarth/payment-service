@@ -2,6 +2,8 @@ package payu
 
 import (
 	"context"
+	"crypto/sha512"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
 )
 
@@ -18,18 +21,48 @@ func newTestAdapter(handler http.HandlerFunc) (*Adapter, *httptest.Server) {
 	return New(Config{MerchantKey: "key", MerchantSalt: "salt", BaseURL: srv.URL, HTTPClient: srv.Client()}), srv
 }
 
-func TestInitiatePayment_ReturnsPendingTxnID(t *testing.T) {
-	a := New(Config{MerchantKey: "key", MerchantSalt: "salt"})
+func TestInitiatePayment_ReturnsASignedPaymentForm(t *testing.T) {
+	a := New(Config{MerchantKey: "key", MerchantSalt: "salt", ReturnURL: "https://shop.example/payu/return"})
 	id := uuid.New()
-	resp, err := a.InitiatePayment(context.Background(), ports.GatewayPaymentRequest{TransactionID: id, Amount: 150000, Currency: "INR", AttemptNumber: 1})
+	resp, err := a.InitiatePayment(context.Background(), ports.GatewayPaymentRequest{
+		TransactionID: id, Amount: 150005, Currency: "INR", AttemptNumber: 1, CustomerEmail: "b@e.com", Description: "order 42",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Status != ports.GatewayPaymentStatusPending {
-		t.Errorf("PayU initiate should be PENDING (redirect flow), got %s", resp.Status)
+	if resp.Status != ports.GatewayPaymentStatusPending || resp.GatewayReferenceID != deriveTxnID(id, 1) {
+		t.Fatalf("expected a PENDING payment with the derived txnid, got %s %q", resp.Status, resp.GatewayReferenceID)
 	}
-	if resp.GatewayReferenceID != deriveTxnID(id, 1) {
-		t.Errorf("expected derived txnid as reference, got %q", resp.GatewayReferenceID)
+	na := resp.NextAction
+	if na == nil || na.Type != transaction.NextActionPayUForm || na.URL != defaultPaymentURL {
+		t.Fatalf("expected a PayU form posting to %s, got %+v", defaultPaymentURL, na)
+	}
+	p := na.Params
+	if p["amount"] != "1500.05" || p["udf1"] != id.String() || p["surl"] != "https://shop.example/payu/return" || p["furl"] != p["surl"] || p["email"] != "b@e.com" || p["productinfo"] != "order 42" {
+		t.Fatalf("unexpected form fields %v", p)
+	}
+
+	formula := "key|" + p["txnid"] + "|1500.05|order 42|Customer|b@e.com|" + id.String() + "||||||||||salt"
+	sum := sha512.Sum512([]byte(formula))
+	if p["hash"] != hex.EncodeToString(sum[:]) {
+		t.Fatal("the form hash must be sha512(key|txnid|amount|productinfo|firstname|email|udf1..udf10|salt), or PayU rejects the payment")
+	}
+}
+
+func TestInitiatePayment_RefusesWhatPayUCannotTake(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cfg   Config
+		email string
+		code  string
+	}{
+		"no return url": {Config{MerchantKey: "k", MerchantSalt: "s"}, "b@e.com", "payu_return_url_not_configured"},
+		"no email":      {Config{MerchantKey: "k", MerchantSalt: "s", ReturnURL: "https://r"}, "", "payu_requires_customer_email"},
+	} {
+		_, err := New(tc.cfg).InitiatePayment(context.Background(), ports.GatewayPaymentRequest{TransactionID: uuid.New(), Amount: 100, Currency: "INR", CustomerEmail: tc.email})
+		var gwErr *ports.GatewayError
+		if !errors.As(err, &gwErr) || gwErr.Code != tc.code || gwErr.Category != ports.ErrorCategoryHardDecline {
+			t.Errorf("%s: expected a terminal %s, got %v", name, tc.code, err)
+		}
 	}
 }
 

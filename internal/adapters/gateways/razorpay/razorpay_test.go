@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
 )
 
@@ -41,6 +42,33 @@ func TestInitiatePayment_CreatesOrder(t *testing.T) {
 	}
 	if gotAuth == "" {
 		t.Error("expected basic auth header")
+	}
+}
+
+func TestInitiatePayment_ReturnsCheckoutParameters(t *testing.T) {
+	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"order_5","status":"created","amount":150000,"currency":"INR"}`))
+	})
+	defer srv.Close()
+
+	resp, err := a.InitiatePayment(context.Background(), ports.GatewayPaymentRequest{
+		TransactionID: uuid.New(), Amount: 150000, Currency: "INR", AttemptNumber: 1, CustomerEmail: "b@e.com", Description: "order 42",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	na := resp.NextAction
+	if na == nil || na.Type != transaction.NextActionRazorpayCheckout {
+		t.Fatalf("expected Checkout parameters, got %+v", na)
+	}
+	want := map[string]string{"key_id": "rzp_test", "order_id": "order_5", "amount": "150000", "currency": "INR", "prefill_email": "b@e.com", "description": "order 42"}
+	for k, v := range want {
+		if na.Params[k] != v {
+			t.Errorf("param %s = %q, want %q", k, na.Params[k], v)
+		}
+	}
+	if _, leaked := na.Params["key_secret"]; leaked {
+		t.Fatal("the key secret must never reach the browser")
 	}
 }
 

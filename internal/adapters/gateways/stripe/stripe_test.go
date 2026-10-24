@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
 )
 
@@ -165,6 +166,46 @@ func TestCheckStatus(t *testing.T) {
 	}
 	if resp.Status != ports.GatewayPaymentStatusProcessing {
 		t.Errorf("expected PROCESSING, got %s", resp.Status)
+	}
+}
+
+func TestInitiatePayment_ReturnsTheClientSecretForBrowserConfirmation(t *testing.T) {
+	var automatic string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		automatic = r.PostFormValue("automatic_payment_methods[enabled]")
+		_, _ = w.Write([]byte(`{"id":"pi_9","status":"requires_payment_method","amount":150000,"currency":"inr","client_secret":"pi_9_secret_abc"}`))
+	}))
+	defer srv.Close()
+	a := New(Config{APIKey: "sk_test_x", PublishableKey: "pk_test_y", BaseURL: srv.URL, HTTPClient: srv.Client()})
+
+	resp, err := a.InitiatePayment(context.Background(), ports.GatewayPaymentRequest{TransactionID: uuid.New(), Amount: 150000, Currency: "INR", AttemptNumber: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if automatic != "true" {
+		t.Fatal("the PaymentIntent must enable automatic payment methods so the Payment Element can confirm it")
+	}
+	na := resp.NextAction
+	if resp.Status != ports.GatewayPaymentStatusPending || na == nil || na.Type != transaction.NextActionStripePaymentElement {
+		t.Fatalf("expected a pending payment with a Stripe next action, got %s %+v", resp.Status, na)
+	}
+	if na.Params["client_secret"] != "pi_9_secret_abc" || na.Params["publishable_key"] != "pk_test_y" || na.Params["payment_intent_id"] != "pi_9" {
+		t.Fatalf("unexpected params %v", na.Params)
+	}
+}
+
+func TestInitiatePayment_NoNextActionOnceSettled(t *testing.T) {
+	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"pi_1","status":"succeeded","client_secret":"pi_1_secret"}`))
+	})
+	defer srv.Close()
+	resp, err := a.InitiatePayment(context.Background(), ports.GatewayPaymentRequest{TransactionID: uuid.New(), Amount: 100, Currency: "INR", AttemptNumber: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.NextAction != nil {
+		t.Fatal("a settled PaymentIntent needs nothing from the customer")
 	}
 }
 

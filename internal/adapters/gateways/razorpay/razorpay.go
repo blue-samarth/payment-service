@@ -88,7 +88,23 @@ func (a *Adapter) InitiatePayment(ctx context.Context, req ports.GatewayPaymentR
 	if err := a.do(ctx, http.MethodPost, "/v1/orders", body, &order); err != nil {
 		return nil, err
 	}
-	return toPaymentResponse(&order), nil
+	resp := toPaymentResponse(&order)
+	if resp.Status == ports.GatewayPaymentStatusPending {
+		params := map[string]string{
+			"key_id":   a.keyID,
+			"order_id": order.ID,
+			"amount":   strconv.FormatInt(order.Amount, 10),
+			"currency": strings.ToUpper(order.Currency),
+		}
+		if req.CustomerEmail != "" {
+			params["prefill_email"] = req.CustomerEmail
+		}
+		if req.Description != "" {
+			params["description"] = req.Description
+		}
+		resp.NextAction = &transaction.NextAction{Type: transaction.NextActionRazorpayCheckout, Params: params}
+	}
+	return resp, nil
 }
 
 func (a *Adapter) CheckStatus(ctx context.Context, req ports.GatewayStatusRequest) (*ports.GatewayPaymentResponse, error) {

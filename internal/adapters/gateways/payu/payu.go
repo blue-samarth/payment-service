@@ -22,6 +22,8 @@ type Config struct {
 	MerchantKey  string
 	MerchantSalt string
 	BaseURL      string
+	PaymentURL   string
+	ReturnURL    string
 	Timeout      time.Duration
 	HTTPClient   *http.Client
 }
@@ -30,11 +32,15 @@ const maxResponseBytes = 2 << 20
 const defaultHTTPTimeout = 30 * time.Second
 
 type Adapter struct {
-	key     string
-	salt    string
-	baseURL string
-	client  *http.Client
+	key        string
+	salt       string
+	baseURL    string
+	paymentURL string
+	returnURL  string
+	client     *http.Client
 }
+
+const defaultPaymentURL = "https://secure.payu.in/_payment"
 
 func New(cfg Config) *Adapter {
 	base := cfg.BaseURL
@@ -49,11 +55,17 @@ func New(cfg Config) *Adapter {
 		}
 		client = &http.Client{Timeout: timeout}
 	}
+	paymentURL := cfg.PaymentURL
+	if paymentURL == "" {
+		paymentURL = defaultPaymentURL
+	}
 	return &Adapter{
-		key:     cfg.MerchantKey,
-		salt:    cfg.MerchantSalt,
-		baseURL: strings.TrimRight(base, "/"),
-		client:  client,
+		key:        cfg.MerchantKey,
+		salt:       cfg.MerchantSalt,
+		baseURL:    strings.TrimRight(base, "/"),
+		paymentURL: paymentURL,
+		returnURL:  cfg.ReturnURL,
+		client:     client,
 	}
 }
 
@@ -79,13 +91,58 @@ func (a *Adapter) InitiatePayment(ctx context.Context, req ports.GatewayPaymentR
 	if txnid == "" {
 		txnid = deriveTxnID(req.TransactionID, req.AttemptNumber)
 	}
+	switch {
+	case a.returnURL == "":
+		return nil, &ports.GatewayError{Category: ports.ErrorCategoryHardDecline, Code: "payu_return_url_not_configured", GatewayMessage: "PAYU_RETURN_URL must be set to take PayU payments"}
+	case req.CustomerEmail == "":
+		return nil, &ports.GatewayError{Category: ports.ErrorCategoryHardDecline, Code: "payu_requires_customer_email", GatewayMessage: "PayU's payment form needs the customer's email"}
+	}
+
+	params := map[string]string{
+		"key":         a.key,
+		"txnid":       txnid,
+		"amount":      paiseToRupees(req.Amount),
+		"productinfo": firstNonEmpty(req.Description, "Payment"),
+		"firstname":   "Customer",
+		"email":       req.CustomerEmail,
+		"udf1":        req.TransactionID.String(),
+		"surl":        a.returnURL,
+		"furl":        a.returnURL,
+	}
+	params["hash"] = a.paymentHash(params)
+
 	return &ports.GatewayPaymentResponse{
 		GatewayReferenceID: txnid,
 		Status:             ports.GatewayPaymentStatusPending,
 		Amount:             req.Amount,
 		Currency:           strings.ToUpper(req.Currency),
 		RawMetadata:        map[string]any{"txnid": txnid},
+		NextAction:         &transaction.NextAction{Type: transaction.NextActionPayUForm, URL: a.paymentURL, Params: params},
 	}, nil
+}
+
+func (a *Adapter) paymentHash(p map[string]string) string {
+	fields := []string{
+		p["key"], p["txnid"], p["amount"], p["productinfo"], p["firstname"], p["email"],
+		p["udf1"], "", "", "", "",
+		"", "", "", "", "",
+		a.salt,
+	}
+	sum := sha512.Sum512([]byte(strings.Join(fields, "|")))
+	return hex.EncodeToString(sum[:])
+}
+
+func paiseToRupees(paise int64) string {
+	return fmt.Sprintf("%d.%02d", paise/100, paise%100)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func (a *Adapter) CheckStatus(ctx context.Context, req ports.GatewayStatusRequest) (*ports.GatewayPaymentResponse, error) {
