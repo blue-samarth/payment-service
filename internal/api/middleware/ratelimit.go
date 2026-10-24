@@ -183,7 +183,7 @@ func merchantBucketID(ctx context.Context) string {
 	if m := MerchantIDFromContext(ctx); m != "" {
 		return m
 	}
-	if p, ok := PrincipalFromContext(ctx); ok {
+	if p, ok := PrincipalFromContext(ctx); ok && p.Role != RoleAnonymous {
 		return "principal:" + string(p.Role)
 	}
 	return ""

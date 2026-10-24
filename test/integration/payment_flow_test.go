@@ -16,6 +16,7 @@ import (
 	"samarth/payment-service/internal/adapters/gateways/stripe"
 	"samarth/payment-service/internal/adapters/observability"
 	"samarth/payment-service/internal/adapters/postgres"
+	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/app/payment"
 	approuting "samarth/payment-service/internal/app/routing"
 	"samarth/payment-service/internal/domain/transaction"
@@ -44,6 +45,7 @@ func buildService(pg *testsupport.PG, stripeURL string) *payment.Service {
 
 func cardInput() payment.CreatePaymentInput {
 	return payment.CreatePaymentInput{
+		Scope:         authz.AllMerchants(),
 		MerchantID:    uuid.New(),
 		Amount:        150000,
 		Currency:      "INR",

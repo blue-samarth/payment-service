@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/domain/refund"
 	"samarth/payment-service/internal/domain/transaction"
@@ -63,6 +64,7 @@ func (s *Service) SetIdempotency(g *idempotency.Guard) { s.idem = g }
 
 type InitiateInput struct {
 	TransactionID  uuid.UUID
+	Scope          authz.Scope
 	Amount         int64
 	Reason         string
 	InitiatedBy    string
@@ -90,6 +92,9 @@ func (s *Service) InitiateRefund(ctx context.Context, in InitiateInput) (Initiat
 	parent, err := s.txns.GetByID(ctx, in.TransactionID)
 	if err != nil {
 		return InitiateResult{}, fmt.Errorf("refund: load transaction %s: %w", in.TransactionID, err)
+	}
+	if err := authz.Check(s.log, s.metrics, "initiate_refund", in.Scope, parent.MerchantID, parent.ID); err != nil {
+		return InitiateResult{}, err
 	}
 	if parent.Status != transaction.StatusSucceeded {
 		return InitiateResult{}, ErrNotRefundable

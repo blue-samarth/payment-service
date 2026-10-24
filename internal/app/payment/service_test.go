@@ -8,6 +8,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/authz"
+	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/domain/routing"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -213,6 +215,7 @@ func newTestService(repo *fakeRepo, outbox *fakeOutbox, router *fakeRouter, conf
 
 func validInput() CreatePaymentInput {
 	return CreatePaymentInput{
+		Scope:         authz.AllMerchants(),
 		MerchantID:    uuid.New(),
 		Amount:        150000,
 		Currency:      "INR",
@@ -222,6 +225,66 @@ func validInput() CreatePaymentInput {
 		Description:   "order #42",
 		MerchantTier:  "standard",
 		IsDomestic:    true,
+	}
+}
+
+type trackingTx struct{ open bool }
+
+func (t *trackingTx) WithinTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	t.open = true
+	defer func() { t.open = false }()
+	return fn(ctx)
+}
+
+type outsideTxRouter struct {
+	tx       *trackingTx
+	calls    int
+	insideTx bool
+}
+
+func (r *outsideTxRouter) Route(context.Context, RouteInput) (*routing.Decision, error) {
+	r.calls++
+	r.insideTx = r.insideTx || r.tx.open
+	return &routing.Decision{SelectedGateway: "razorpay"}, nil
+}
+
+type outsideTxConfig struct {
+	tx       *trackingTx
+	calls    int
+	insideTx bool
+}
+
+func (c *outsideTxConfig) GetProcessingTimeout(context.Context, string, string) (time.Duration, error) {
+	c.calls++
+	c.insideTx = c.insideTx || c.tx.open
+	return 30 * time.Second, nil
+}
+
+type reservingStore struct{}
+
+func (reservingStore) Reserve(context.Context, string, string) (bool, error) { return true, nil }
+func (reservingStore) Lookup(context.Context, string) (bool, string, string, []byte, error) {
+	return false, "", "", nil, nil
+}
+func (reservingStore) Complete(context.Context, string, []byte) error { return nil }
+
+func TestCreatePayment_RoutingAndConfigReadsRunOutsideTheReservation(t *testing.T) {
+	tx := &trackingTx{}
+	router := &outsideTxRouter{tx: tx}
+	config := &outsideTxConfig{tx: tx}
+	svc := NewService(&fakeRepo{}, &fakeOutbox{}, router, config, tx, &fakeLease{acquired: true}, &fakeRegistry{}, noopLogger{}, noopMetrics{})
+	svc.SetIdempotency(idempotency.NewGuard(reservingStore{}, tx))
+
+	in := validInput()
+	in.IdempotencyKey = "k1"
+	if _, err := svc.CreatePayment(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if router.calls == 0 || config.calls == 0 {
+		t.Fatalf("expected routing and config reads, got %d and %d", router.calls, config.calls)
+	}
+	if router.insideTx || config.insideTx {
+		t.Fatal("routing and config reads take their own pool connections; inside the reservation transaction, concurrent creates each hold one connection while waiting for a second, and the pool deadlocks")
 	}
 }
 

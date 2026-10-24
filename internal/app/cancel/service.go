@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -45,6 +46,7 @@ func (s *Service) SetIdempotency(g *idempotency.Guard) { s.idem = g }
 
 type CancelInput struct {
 	TransactionID  uuid.UUID
+	Scope          authz.Scope
 	By             transaction.Actor
 	Via            transaction.CancelVia
 	IdempotencyKey string
@@ -56,6 +58,10 @@ type idempotencyCancelResponse struct {
 }
 
 func (s *Service) Cancel(ctx context.Context, in CancelInput) (Result, error) {
+	if err := s.checkOwner(ctx, in); err != nil {
+		return Result{}, err
+	}
+
 	if s.idem == nil {
 		outcome, status, err := s.cancel(ctx, in)
 		if err != nil {
@@ -100,6 +106,14 @@ func (s *Service) Cancel(ctx context.Context, in CancelInput) (Result, error) {
 	default:
 		return Result{Verdict: res.Verdict}, nil
 	}
+}
+
+func (s *Service) checkOwner(ctx context.Context, in CancelInput) error {
+	txn, err := s.txns.GetByID(ctx, in.TransactionID)
+	if err != nil {
+		return fmt.Errorf("cancel: load transaction %s: %w", in.TransactionID, err)
+	}
+	return authz.Check(s.log, s.metrics, "cancel_payment", in.Scope, txn.MerchantID, txn.ID)
 }
 
 func (s *Service) cancel(ctx context.Context, in CancelInput) (Outcome, transaction.Status, error) {

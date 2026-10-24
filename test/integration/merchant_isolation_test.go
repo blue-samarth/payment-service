@@ -6,7 +6,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 
@@ -22,15 +21,6 @@ import (
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/testsupport"
 )
-
-const b12 = "B12 (Docs/BACKLOG.md): handlers do not yet compare the caller's merchant with the request or the transaction; remove this skip with the fix, or set RUN_B12=1 to run it now"
-
-func skipUntilB12(t *testing.T) {
-	t.Helper()
-	if os.Getenv("RUN_B12") == "" {
-		t.Skip(b12)
-	}
-}
 
 type isolation struct {
 	pg        *testsupport.PG
@@ -124,7 +114,6 @@ func TestMerchantIsolation_OpsTokenActsAcrossMerchants(t *testing.T) {
 }
 
 func TestMerchantIsolation_CannotReadAnotherMerchantsTransaction(t *testing.T) {
-	skipUntilB12(t)
 	s := newIsolation(t)
 	if code := s.asMerchantA(http.MethodGet, "/payments/"+s.otherTxn.ID.String(), ""); code != http.StatusNotFound {
 		t.Fatalf("merchant A must get 404 on merchant B's transaction, got %d", code)
@@ -132,7 +121,6 @@ func TestMerchantIsolation_CannotReadAnotherMerchantsTransaction(t *testing.T) {
 }
 
 func TestMerchantIsolation_CannotRefundAnotherMerchantsTransaction(t *testing.T) {
-	skipUntilB12(t)
 	s := newIsolation(t)
 	if code := s.asMerchantA(http.MethodPost, "/payments/"+s.otherTxn.ID.String()+"/refunds", `{"amount":1000,"reason":"x"}`); code != http.StatusNotFound {
 		t.Fatalf("merchant A must get 404 refunding merchant B's transaction, got %d", code)
@@ -145,7 +133,6 @@ func TestMerchantIsolation_CannotRefundAnotherMerchantsTransaction(t *testing.T)
 }
 
 func TestMerchantIsolation_CannotCancelAnotherMerchantsTransaction(t *testing.T) {
-	skipUntilB12(t)
 	s := newIsolation(t)
 	other := seedFor(t, s.pg, s.merchantB, transaction.StatusProcessing)
 	if code := s.asMerchantA(http.MethodPost, "/payments/"+other.ID.String()+"/cancel", `{}`); code != http.StatusNotFound {
@@ -157,7 +144,6 @@ func TestMerchantIsolation_CannotCancelAnotherMerchantsTransaction(t *testing.T)
 }
 
 func TestMerchantIsolation_CannotCreateAPaymentForAnotherMerchant(t *testing.T) {
-	skipUntilB12(t)
 	s := newIsolation(t)
 	body := `{"merchant_id":"` + s.merchantB.String() + `","amount":1000,"currency":"INR","payment_method":"card"}`
 	if code := s.asMerchantA(http.MethodPost, "/payments", body); code < 400 {
@@ -171,7 +157,6 @@ func TestMerchantIsolation_CannotCreateAPaymentForAnotherMerchant(t *testing.T) 
 }
 
 func TestMerchantIsolation_CancelActorComesFromThePrincipal(t *testing.T) {
-	skipUntilB12(t)
 	s := newIsolation(t)
 	if code := s.asMerchantA(http.MethodPost, "/payments/"+s.ownTxn.ID.String()+"/cancel", `{"actor":"ops","via":"ops-tool"}`); code >= 500 {
 		t.Fatalf("got %d", code)
@@ -183,5 +168,84 @@ func TestMerchantIsolation_CancelActorComesFromThePrincipal(t *testing.T) {
 	fresh := seedFor(t, s.pg, s.merchantA, transaction.StatusProcessing)
 	if code := s.asMerchantA(http.MethodPost, "/payments/"+fresh.ID.String()+"/cancel", `{"actor":"anything-at-all"}`); code != http.StatusBadRequest {
 		t.Fatalf("an unknown actor value must be rejected, not written to the audit trail, got %d", code)
+	}
+}
+
+func TestMerchantIsolation_CancelViaIsValidated(t *testing.T) {
+	s := newIsolation(t)
+	for _, via := range []string{"carrier-pigeon", "ops-tool"} {
+		if code := s.asMerchantA(http.MethodPost, "/payments/"+s.ownTxn.ID.String()+"/cancel", `{"via":"`+via+`"}`); code != http.StatusBadRequest {
+			t.Fatalf("via %q from a merchant token must be rejected, got %d", via, code)
+		}
+	}
+	if s.reload(t, s.ownTxn.ID).CancelIntent {
+		t.Fatal("a rejected via must not record a cancel intent")
+	}
+
+	if code := s.asMerchantA(http.MethodPost, "/payments/"+s.ownTxn.ID.String()+"/cancel", `{"via":"dashboard"}`); code != http.StatusOK {
+		t.Fatalf("got %d", code)
+	}
+	got := s.reload(t, s.ownTxn.ID)
+	if got.CancelRequestedBy != transaction.ActorMerchant || got.CancelRequestedVia != transaction.CancelViaDashboard {
+		t.Fatalf("recorded %s via %s, want merchant via dashboard", got.CancelRequestedBy, got.CancelRequestedVia)
+	}
+}
+
+func TestMerchantIsolation_OpsCancelIsRecordedAsOps(t *testing.T) {
+	s := newIsolation(t)
+	other := seedFor(t, s.pg, s.merchantB, transaction.StatusProcessing)
+	if code := s.call(http.MethodPost, "/payments/"+other.ID.String()+"/cancel", "X-Ops-Token", tokenOps, `{"via":"ops-tool"}`); code != http.StatusOK {
+		t.Fatalf("got %d", code)
+	}
+	if got := s.reload(t, other.ID); got.CancelRequestedBy != transaction.ActorOps || got.CancelRequestedVia != transaction.CancelViaOpsTool {
+		t.Fatalf("recorded %s via %s, want ops via ops-tool", got.CancelRequestedBy, got.CancelRequestedVia)
+	}
+}
+
+func TestMerchantIsolation_RefundInitiatedByComesFromThePrincipal(t *testing.T) {
+	s := newIsolation(t)
+	own := seedFor(t, s.pg, s.merchantA, transaction.StatusSucceeded)
+	path := "/payments/" + own.ID.String() + "/refunds"
+
+	for _, by := range []string{"ops", "anything-at-all"} {
+		if code := s.asMerchantA(http.MethodPost, path, `{"amount":1000,"reason":"x","initiated_by":"`+by+`"}`); code != http.StatusBadRequest {
+			t.Fatalf("initiated_by %q from a merchant token must be rejected, got %d", by, code)
+		}
+	}
+	if code := s.asMerchantA(http.MethodPost, path, `{"amount":1000,"reason":"x"}`); code >= 400 {
+		t.Fatalf("got %d", code)
+	}
+
+	var by string
+	var refunds int
+	_ = s.pg.DB.Pool().QueryRow(context.Background(), "SELECT count(*), max(initiated_by) FROM refunds WHERE transaction_id=$1", own.ID).Scan(&refunds, &by)
+	if refunds != 1 || by != string(transaction.ActorMerchant) {
+		t.Fatalf("want one refund initiated by merchant, got %d by %q", refunds, by)
+	}
+}
+
+func TestMerchantIsolation_MissingAndForeignLookTheSame(t *testing.T) {
+	s := newIsolation(t)
+	missing := uuid.NewString()
+	for _, tc := range []struct{ method, suffix, body string }{
+		{http.MethodGet, "", ""},
+		{http.MethodPost, "/refunds", `{"amount":1000,"reason":"x"}`},
+		{http.MethodPost, "/cancel", `{}`},
+	} {
+		if code := s.asMerchantA(tc.method, "/payments/"+missing+tc.suffix, tc.body); code != http.StatusNotFound {
+			t.Fatalf("%s %s on a missing transaction: got %d, want the same 404 a foreign one gets", tc.method, tc.suffix, code)
+		}
+	}
+}
+
+func TestMerchantIsolation_CreateTakesTheMerchantFromTheToken(t *testing.T) {
+	s := newIsolation(t)
+	if code := s.asMerchantA(http.MethodPost, "/payments", `{"amount":1000,"currency":"INR","payment_method":"card"}`); code >= 400 {
+		t.Fatalf("a service token needs no merchant_id in the body, got %d", code)
+	}
+	var created int
+	_ = s.pg.DB.Pool().QueryRow(context.Background(), "SELECT count(*) FROM transactions WHERE merchant_id=$1", s.merchantA).Scan(&created)
+	if created != 2 {
+		t.Fatalf("merchant A should have its seeded transaction plus the new one, got %d", created)
 	}
 }

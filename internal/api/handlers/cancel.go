@@ -2,7 +2,6 @@ package handlers
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -10,7 +9,7 @@ import (
 
 	appcancel "samarth/payment-service/internal/app/cancel"
 	"samarth/payment-service/internal/app/idempotency"
-	"samarth/payment-service/internal/domain/transaction"
+	"samarth/payment-service/internal/ports"
 )
 
 type CancelService interface {
@@ -32,6 +31,11 @@ type cancelResponse struct {
 }
 
 func (h *CancelHandler) Cancel(w http.ResponseWriter, r *http.Request) {
+	c, ok := requireCaller(w, r)
+	if !ok {
+		return
+	}
+
 	transactionID, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_id", "payment id must be a valid UUID")
@@ -39,16 +43,19 @@ func (h *CancelHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req cancelRequest
-	if r.Body != nil {
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	if !decodeJSON(w, r, maxCancelBodyBytes, true, &req) {
+		return
 	}
-	actor := transaction.Actor(req.Actor)
-	if actor == "" {
-		actor = transaction.ActorMerchant
+
+	actor, err := c.actorFor("actor", req.Actor)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_actor", err.Error())
+		return
 	}
-	via := transaction.CancelVia(req.Via)
-	if via == "" {
-		via = transaction.CancelViaAPI
+	via, err := c.viaFor(req.Via)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_via", err.Error())
+		return
 	}
 
 	idemKey := r.Header.Get("Idempotency-Key")
@@ -59,16 +66,20 @@ func (h *CancelHandler) Cancel(w http.ResponseWriter, r *http.Request) {
 
 	res, err := h.svc.Cancel(r.Context(), appcancel.CancelInput{
 		TransactionID:  transactionID,
+		Scope:          c.scope,
 		By:             actor,
 		Via:            via,
 		IdempotencyKey: idemKey,
 	})
 	if err != nil {
-		if errors.Is(err, idempotency.ErrKeyRequired) {
+		switch {
+		case errors.Is(err, ports.ErrNotFound):
+			writeError(w, http.StatusNotFound, "not_found", "payment not found")
+		case errors.Is(err, idempotency.ErrKeyRequired):
 			writeError(w, http.StatusBadRequest, "missing_idempotency_key", "Idempotency-Key header is required")
-			return
+		default:
+			writeError(w, http.StatusInternalServerError, "cancel_failed", "could not process cancellation")
 		}
-		writeError(w, http.StatusInternalServerError, "cancel_failed", "could not process cancellation")
 		return
 	}
 

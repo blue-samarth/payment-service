@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/authz"
 	domainrefund "samarth/payment-service/internal/domain/refund"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -178,7 +179,7 @@ func TestInitiateRefund_Success(t *testing.T) {
 	s := svc(&fakeTxns{txn: parent}, refunds, outbox)
 
 	res, err := s.InitiateRefund(context.Background(), InitiateInput{
-		TransactionID: parent.ID, Amount: 40000, Reason: "customer_request", InitiatedBy: "ops:1",
+		TransactionID: parent.ID, Scope: authz.AllMerchants(), Amount: 40000, Reason: "customer_request", InitiatedBy: "ops:1",
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -195,12 +196,33 @@ func TestInitiateRefund_Success(t *testing.T) {
 	}
 }
 
+func TestInitiateRefund_AnotherMerchantsTransactionIsNotFound(t *testing.T) {
+	parent := succeededTxn(100000)
+	refunds := &fakeRefunds{}
+	outbox := &fakeOutbox{}
+	s := svc(&fakeTxns{txn: parent}, refunds, outbox)
+
+	for name, scope := range map[string]authz.Scope{"another merchant": authz.Merchant(uuid.New()), "zero scope": {}} {
+		_, err := s.InitiateRefund(context.Background(), InitiateInput{TransactionID: parent.ID, Scope: scope, Amount: 100, Reason: "r", InitiatedBy: "merchant"})
+		if !errors.Is(err, ports.ErrNotFound) || !errors.Is(err, authz.ErrDenied) {
+			t.Fatalf("%s: expected a denial that reads as not found, got %v", name, err)
+		}
+	}
+	if len(refunds.inserted) != 0 || len(outbox.events) != 0 {
+		t.Error("nothing may be written outside the caller's scope")
+	}
+
+	if _, err := s.InitiateRefund(context.Background(), InitiateInput{TransactionID: parent.ID, Scope: authz.Merchant(parent.MerchantID), Amount: 100, Reason: "r", InitiatedBy: "merchant"}); err != nil {
+		t.Fatalf("the owner must be able to refund, got %v", err)
+	}
+}
+
 func TestInitiateRefund_NotRefundable(t *testing.T) {
 	parent := succeededTxn(100000)
 	parent.Status = transaction.StatusPending
 	s := svc(&fakeTxns{txn: parent}, &fakeRefunds{}, &fakeOutbox{})
 
-	_, err := s.InitiateRefund(context.Background(), InitiateInput{TransactionID: parent.ID, Amount: 100, Reason: "r", InitiatedBy: "by"})
+	_, err := s.InitiateRefund(context.Background(), InitiateInput{TransactionID: parent.ID, Scope: authz.AllMerchants(), Amount: 100, Reason: "r", InitiatedBy: "by"})
 	if !errors.Is(err, ErrNotRefundable) {
 		t.Fatalf("expected ErrNotRefundable, got %v", err)
 	}
@@ -211,7 +233,7 @@ func TestInitiateRefund_OverRefundBlocked(t *testing.T) {
 	outbox := &fakeOutbox{}
 	s := svc(&fakeTxns{txn: parent}, &fakeRefunds{sum: 60000}, outbox)
 
-	_, err := s.InitiateRefund(context.Background(), InitiateInput{TransactionID: parent.ID, Amount: 50000, Reason: "r", InitiatedBy: "by"})
+	_, err := s.InitiateRefund(context.Background(), InitiateInput{TransactionID: parent.ID, Scope: authz.AllMerchants(), Amount: 50000, Reason: "r", InitiatedBy: "by"})
 	var over domainrefund.ErrOverRefund
 	if !errors.As(err, &over) {
 		t.Fatalf("expected ErrOverRefund, got %v", err)

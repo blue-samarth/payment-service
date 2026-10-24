@@ -15,6 +15,7 @@ import (
 	"samarth/payment-service/internal/api/middleware"
 	"samarth/payment-service/internal/app/payment"
 	"samarth/payment-service/internal/domain/transaction"
+	"samarth/payment-service/internal/ports"
 )
 
 type fakeReviewResolver struct {
@@ -108,6 +109,7 @@ func TestResolve_ErrorMapping(t *testing.T) {
 	}{
 		"invalid resolution": {fmt.Errorf("%w: x", payment.ErrInvalidResolution), `{"status":"PENDING"}`, http.StatusBadRequest},
 		"not under review":   {payment.ErrNotUnderReview, `{"status":"FAILED"}`, http.StatusConflict},
+		"missing":            {fmt.Errorf("payment: load transaction: %w", ports.ErrNotFound), `{"status":"FAILED"}`, http.StatusNotFound},
 		"internal":           {fmt.Errorf("db down"), `{"status":"FAILED"}`, http.StatusInternalServerError},
 		"bad json":           {nil, `{`, http.StatusBadRequest},
 		"note too long":      {nil, `{"status":"FAILED","note":"` + strings.Repeat("n", maxReviewNoteLength+1) + `"}`, http.StatusBadRequest},

@@ -116,6 +116,14 @@ const (
 	CancelViaOpsTool   CancelVia = "ops-tool"
 )
 
+func (v CancelVia) Valid() bool {
+	switch v {
+	case CancelViaAPI, CancelViaDashboard, CancelViaOpsTool:
+		return true
+	}
+	return false
+}
+
 const (
 	FailureReasonSourceGateway  FailureReasonSource = "gateway"
 	FailureReasonSourceInternal FailureReasonSource = "internal"

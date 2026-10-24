@@ -66,6 +66,8 @@ func (h *ReviewHandler) Resolve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, payment.ErrInvalidResolution):
 		writeError(w, http.StatusBadRequest, "invalid_resolution", err.Error())
+	case errors.Is(err, ports.ErrNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "payment not found")
 	case errors.Is(err, payment.ErrNotUnderReview):
 		writeError(w, http.StatusConflict, "not_under_review", "payment is not awaiting review")
 	case err != nil:

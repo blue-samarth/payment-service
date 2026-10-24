@@ -4,10 +4,12 @@ import . "samarth/payment-service/internal/app/cancel"
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -49,11 +51,33 @@ func txnWith(status transaction.Status, intent bool) *transaction.Transaction {
 	return t
 }
 
+func TestCancel_AnotherMerchantsTransactionIsNotFound(t *testing.T) {
+	store := &fakeStore{txn: txnWith(transaction.StatusProcessing, false), setResult: true}
+	s := NewService(store, noopLogger{}, noopMetrics{})
+
+	for name, scope := range map[string]authz.Scope{"another merchant": authz.Merchant(uuid.New()), "zero scope": {}} {
+		_, err := s.Cancel(context.Background(), CancelInput{TransactionID: store.txn.ID, Scope: scope, By: transaction.ActorMerchant, Via: transaction.CancelViaAPI})
+		if !errors.Is(err, ports.ErrNotFound) || !errors.Is(err, authz.ErrDenied) {
+			t.Fatalf("%s: expected a denial that reads as not found, got %v", name, err)
+		}
+	}
+	if store.setCalls != 0 {
+		t.Fatal("no intent may be set outside the caller's scope")
+	}
+
+	if _, err := s.Cancel(context.Background(), CancelInput{TransactionID: store.txn.ID, Scope: authz.Merchant(store.txn.MerchantID), By: transaction.ActorMerchant, Via: transaction.CancelViaAPI}); err != nil {
+		t.Fatalf("the owner must be able to cancel, got %v", err)
+	}
+	if store.setCalls != 1 {
+		t.Fatalf("expected the owner's cancel to set intent once, got %d", store.setCalls)
+	}
+}
+
 func TestCancel_AlreadyTerminal(t *testing.T) {
 	store := &fakeStore{txn: txnWith(transaction.StatusSucceeded, false)}
 	s := NewService(store, noopLogger{}, noopMetrics{})
 
-	res, err := s.Cancel(context.Background(), CancelInput{TransactionID: store.txn.ID})
+	res, err := s.Cancel(context.Background(), CancelInput{TransactionID: store.txn.ID, Scope: authz.AllMerchants()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +93,7 @@ func TestCancel_AlreadyRequested(t *testing.T) {
 	store := &fakeStore{txn: txnWith(transaction.StatusProcessing, true)}
 	s := NewService(store, noopLogger{}, noopMetrics{})
 
-	res, err := s.Cancel(context.Background(), CancelInput{TransactionID: store.txn.ID})
+	res, err := s.Cancel(context.Background(), CancelInput{TransactionID: store.txn.ID, Scope: authz.AllMerchants()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +129,7 @@ func TestCancel_ReplayReportsCurrentStatusNotTheSnapshot(t *testing.T) {
 	s.SetIdempotency(idempotency.NewGuard(completedKey{response: []byte(`{"outcome":"CANCEL_REQUESTED","status":"PROCESSING"}`)}, passThroughTx{}))
 
 	res, err := s.Cancel(context.Background(), CancelInput{
-		TransactionID: cancelTxnID, By: transaction.ActorMerchant, Via: transaction.CancelViaAPI, IdempotencyKey: "k1",
+		TransactionID: cancelTxnID, Scope: authz.AllMerchants(), By: transaction.ActorMerchant, Via: transaction.CancelViaAPI, IdempotencyKey: "k1",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -125,7 +149,7 @@ func TestCancel_SetsIntent(t *testing.T) {
 	store := &fakeStore{txn: txnWith(transaction.StatusProcessing, false), setResult: true}
 	s := NewService(store, noopLogger{}, noopMetrics{})
 
-	res, err := s.Cancel(context.Background(), CancelInput{TransactionID: store.txn.ID, By: transaction.ActorMerchant, Via: transaction.CancelViaAPI})
+	res, err := s.Cancel(context.Background(), CancelInput{TransactionID: store.txn.ID, Scope: authz.AllMerchants(), By: transaction.ActorMerchant, Via: transaction.CancelViaAPI})
 	if err != nil {
 		t.Fatal(err)
 	}

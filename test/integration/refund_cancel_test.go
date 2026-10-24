@@ -20,6 +20,7 @@ import (
 	"samarth/payment-service/internal/adapters/gateways/stripe"
 	"samarth/payment-service/internal/adapters/observability"
 	"samarth/payment-service/internal/adapters/postgres"
+	"samarth/payment-service/internal/app/authz"
 	appcancel "samarth/payment-service/internal/app/cancel"
 	apprefund "samarth/payment-service/internal/app/refund"
 	domainrefund "samarth/payment-service/internal/domain/refund"
@@ -77,7 +78,7 @@ func TestRefund_ConcurrentNoOverRefund(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			_, err := svc.InitiateRefund(ctx, apprefund.InitiateInput{
-				TransactionID: parent.ID, Amount: 60000, Reason: "customer_request", InitiatedBy: "ops:1",
+				TransactionID: parent.ID, Scope: authz.AllMerchants(), Amount: 60000, Reason: "customer_request", InitiatedBy: "ops:1",
 			})
 			var over domainrefund.ErrOverRefund
 			switch {
@@ -126,7 +127,7 @@ func TestRefund_FullFlowEndToEnd(t *testing.T) {
 	svc := refundService(pg, registry)
 
 	initiatedRes, err := svc.InitiateRefund(ctx, apprefund.InitiateInput{
-		TransactionID: parent.ID, Amount: 40000, Reason: "customer_request", InitiatedBy: "ops:1",
+		TransactionID: parent.ID, Scope: authz.AllMerchants(), Amount: 40000, Reason: "customer_request", InitiatedBy: "ops:1",
 	})
 	if err != nil {
 		t.Fatalf("InitiateRefund: %v", err)
@@ -207,7 +208,7 @@ func TestCancelService_Outcomes(t *testing.T) {
 	svc := appcancel.NewService(postgres.NewTransactionRepository(pg.DB, pg.Q), discardLogger(), observability.NewNoopMetrics())
 
 	processing := seedTransaction(t, pg, transaction.StatusProcessing, 1000)
-	res, err := svc.Cancel(ctx, appcancel.CancelInput{TransactionID: processing.ID, By: transaction.ActorOps, Via: transaction.CancelViaOpsTool})
+	res, err := svc.Cancel(ctx, appcancel.CancelInput{TransactionID: processing.ID, Scope: authz.AllMerchants(), By: transaction.ActorOps, Via: transaction.CancelViaOpsTool})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,7 +217,7 @@ func TestCancelService_Outcomes(t *testing.T) {
 	}
 
 	terminal := seedTransaction(t, pg, transaction.StatusSucceeded, 1000)
-	res, err = svc.Cancel(ctx, appcancel.CancelInput{TransactionID: terminal.ID, By: transaction.ActorOps, Via: transaction.CancelViaOpsTool})
+	res, err = svc.Cancel(ctx, appcancel.CancelInput{TransactionID: terminal.ID, Scope: authz.AllMerchants(), By: transaction.ActorOps, Via: transaction.CancelViaOpsTool})
 	if err != nil {
 		t.Fatal(err)
 	}

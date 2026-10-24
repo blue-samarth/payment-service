@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,9 +12,12 @@ import (
 
 	"github.com/google/uuid"
 
+	"samarth/payment-service/internal/api/middleware"
+	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/app/idempotency"
 	"samarth/payment-service/internal/app/payment"
 	"samarth/payment-service/internal/domain/transaction"
+	"samarth/payment-service/internal/ports"
 )
 
 type fakeService struct {
@@ -35,8 +39,12 @@ func (f *fakeService) CreatePayment(ctx context.Context, in payment.CreatePaymen
 func (f *fakeService) ProcessPayment(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error) {
 	return f.processed, f.procErr
 }
-func (f *fakeService) GetPayment(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error) {
+func (f *fakeService) GetPayment(ctx context.Context, id uuid.UUID, scope authz.Scope) (*transaction.Transaction, error) {
 	return f.fetched, f.getErr
+}
+
+func anonymous(req *http.Request) *http.Request {
+	return req.WithContext(middleware.WithPrincipal(req.Context(), middleware.Principal{Role: middleware.RoleAnonymous}))
 }
 
 func sampleTxn(status transaction.Status) *transaction.Transaction {
@@ -50,7 +58,7 @@ func validBody() string {
 }
 
 func doRequest(h *PaymentHandler, method, target, body string) *httptest.ResponseRecorder {
-	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	req := anonymous(httptest.NewRequest(method, target, strings.NewReader(body)))
 	rec := httptest.NewRecorder()
 	switch {
 	case method == http.MethodPost:
@@ -96,7 +104,7 @@ func TestCreate_NoGatewayReturns422(t *testing.T) {
 
 func TestCreate_MissingIdempotencyKey400(t *testing.T) {
 	h := NewPaymentHandler(&fakeService{created: sampleTxn(transaction.StatusPending)})
-	req := httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(validBody()))
+	req := anonymous(httptest.NewRequest(http.MethodPost, "/payments", strings.NewReader(validBody())))
 	rec := httptest.NewRecorder()
 	h.Create(rec, req) // no Idempotency-Key header
 	if rec.Code != http.StatusBadRequest {
@@ -164,7 +172,7 @@ func TestCreate_ProcessFailureReturns202(t *testing.T) {
 func TestGet_Success(t *testing.T) {
 	txn := sampleTxn(transaction.StatusSucceeded)
 	h := NewPaymentHandler(&fakeService{fetched: txn})
-	req := httptest.NewRequest(http.MethodGet, "/payments/"+txn.ID.String(), nil)
+	req := anonymous(httptest.NewRequest(http.MethodGet, "/payments/"+txn.ID.String(), nil))
 	req.SetPathValue("id", txn.ID.String())
 	rec := httptest.NewRecorder()
 	h.Get(rec, req)
@@ -176,7 +184,7 @@ func TestGet_Success(t *testing.T) {
 
 func TestGet_InvalidID(t *testing.T) {
 	h := NewPaymentHandler(&fakeService{})
-	req := httptest.NewRequest(http.MethodGet, "/payments/bad", nil)
+	req := anonymous(httptest.NewRequest(http.MethodGet, "/payments/bad", nil))
 	req.SetPathValue("id", "bad")
 	rec := httptest.NewRecorder()
 	h.Get(rec, req)
@@ -185,14 +193,31 @@ func TestGet_InvalidID(t *testing.T) {
 	}
 }
 
-func TestGet_NotFound(t *testing.T) {
-	h := NewPaymentHandler(&fakeService{getErr: errors.New("not found")})
-	id := uuid.NewString()
-	req := httptest.NewRequest(http.MethodGet, "/payments/"+id, nil)
-	req.SetPathValue("id", id)
-	rec := httptest.NewRecorder()
-	h.Get(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("expected 404, got %d", rec.Code)
+func TestGet_ErrorMapping(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err  error
+		want int
+	}{
+		"missing":       {fmt.Errorf("transaction %w", ports.ErrNotFound), http.StatusNotFound},
+		"out of scope":  {authz.ErrDenied, http.StatusNotFound},
+		"store failure": {errors.New("connection refused"), http.StatusInternalServerError},
+	} {
+		h := NewPaymentHandler(&fakeService{getErr: tc.err})
+		id := uuid.NewString()
+		req := anonymous(httptest.NewRequest(http.MethodGet, "/payments/"+id, nil))
+		req.SetPathValue("id", id)
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+		if rec.Code != tc.want {
+			t.Errorf("%s: expected %d, got %d", name, tc.want, rec.Code)
+		}
+	}
+}
+
+func TestCreate_OutOfScopeMerchantIs403(t *testing.T) {
+	h := NewPaymentHandler(&fakeService{createErr: authz.ErrDenied})
+	rec := doRequest(h, http.MethodPost, "/payments", validBody())
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "merchant_mismatch") {
+		t.Fatalf("expected 403 merchant_mismatch, got %d %s; authz.ErrDenied wraps ports.ErrNotFound, so a case matching ErrNotFound must come after the ErrDenied case", rec.Code, rec.Body.String())
 	}
 }
