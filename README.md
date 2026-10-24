@@ -287,7 +287,7 @@ Filtering (candidates are dropped before scoring, `filterReason`):
 - Inactive gateway
 - Amount outside `[MinAmount, MaxAmount]`
 - Currency not supported
-- Live circuit breaker `OPEN` and still within cooldown, or half-open with its probe already taken by another request
+- Live circuit breaker `OPEN` and still within cooldown, or half-open with its probe already out (`circuit_breaker_probe_in_flight`)
 - 24h discrepancy rate > 20%
 
 The request-independent checks (inactive, breaker, discrepancy) live in `UnavailableReason`,
@@ -307,7 +307,7 @@ Scoring (each candidate gets a 0–100 sub-score per dimension, combined via con
 
 Ties within 1 point (100 in the ×100-scaled integer score) are broken first by **fewer active payment intents**, then **lexicographically by gateway ID** — deterministic and reproducible.
 
-The router also checks the **live** circuit-breaker state from Redis (via `BreakerStateReader`), not just the config snapshot, and treats an `OPEN` breaker whose cooldown has elapsed as `HALF_OPEN`, routable only by the one request that takes the probe lock (§8), falling back to the config snapshot if Redis is unavailable ("fail open to config").
+The router also checks the **live** circuit-breaker state from Redis (via `BreakerStateReader`), not just the config snapshot, and treats an `OPEN` breaker whose cooldown has elapsed as `HALF_OPEN`, routable while no probe is out (§8), falling back to the config snapshot if Redis is unavailable ("fail open to config").
 
 ---
 
@@ -373,12 +373,18 @@ stateDiagram-v2
     end note
 ```
 
-- **Single-flight probe.** When routing selects a half-open gateway it must take the probe lock (`AcquireProbe`, a `SET NX` with a TTL of the gateway budget). If another request holds it, routing re-selects without that gateway, so after a cooldown one request tests the gateway instead of all traffic. The probe's own outcome releases the lock (a failure re-trips, a success closes); the TTL only matters if that request never reports.
+- **The probe is taken at the call, not at routing.**
+  - **The gate:** every gateway call first passes `AdmitCall`, one Lua script. It admits a `CLOSED` gateway, refuses one whose cooldown is still running, and lets exactly one caller through a half-open gateway by taking the probe lock (`SET NX`).
+  - **A refused call is rerouted before anything is sent.** Being refused is not an attempt, so it doesn't use up the fallback budget. If no other gateway is eligible and nothing has been called yet, the payment fails as `gateway_unavailable`, with nothing charged.
+  - **Only real calls hold the probe.** Routing runs before the idempotency check, so taking the probe there let replays, duplicates and early errors hold it without calling the gateway. Routing now only peeks (`ProbeHeld`) to skip a half-open gateway whose probe is out, and `/health-gateways` reports the same reason.
+  - **Release and expiry:** the probe's outcome releases the lock (a failure re-trips, a success closes). Its TTL is the HTTP timeout plus 10s, floored at 5s, so it can never be stored without expiry; the TTL only matters if the request never reports. `GATEWAY_MAX_ATTEMPTS` and `GATEWAY_HTTP_TIMEOUT` must be at least 1 and greater than 0.
 - **Escalation per trip.** The cooldown is 60s on the first trip, then 120s and 240s (cap) for each failed probe in a row, and resets once the gateway recovers. It counts trips, not failures, so the first trip is 60s even with `CIRCUIT_BREAKER_FAILURE_THRESHOLD=5`.
-- **Late results during a cooldown are ignored.** A success from a request that started before the trip used to write `OPEN` with no cooldown, which reads as held open, so the gateway was excluded until someone edited Redis. A failure in that window used to leave the expired cooldown in place, so a still-failing gateway kept taking all traffic without tripping again.
+- **Late results while the cooldown runs are ignored.**
+  - **Before this fix:** a success from a request that started before the trip used to write `OPEN` with no cooldown, which reads as held open, so the gateway was excluded until someone edited Redis. A failure after the cooldown used to leave the expired cooldown in place, so a still-failing gateway kept taking all traffic without tripping again.
+  - **The remaining window:** a pre-trip request can still finish *after* the cooldown ends, since calls run up to the HTTP timeout and the whole attempt up to the budget plus 10s. Its result then counts like a probe's: a success closes the breaker, a failure re-trips it. That's a real, recent gateway result, so it is treated as evidence rather than tracked by trip generation.
 - **Held open.** `OPEN` with no cooldown stays open; the scripts never produce it, so it only appears if set explicitly.
-- **Fail-open on Redis outage.** If the breaker store is unreachable, routing falls back to the config snapshot, and a probe-lock error admits the request rather than blocking routing.
-- **Keys.** `gateway:{<id>}:cb` and `gateway:{<id>}:probe` share a hash tag, so the scripts' two-key access works on Redis Cluster.
+- **Fail-open on Redis outage.** If the breaker store is unreachable, routing falls back to the config snapshot, and a gate error admits the call. That brings back the herd during recovery, so it is counted in `gateway.probe_gate_error` (tag `gateway_id`).
+- **No write on a plain success.** A success on a `CLOSED` breaker with no failures returns without writing, so a healthy gateway costs one `GET` per payment.
 
 ---
 
@@ -844,7 +850,9 @@ Deployments that ran the single-listener build must change the following togethe
 | Rate-limit logs | One line per rejection | At most one line per second per event and process, with a `suppressed` count | Use the metrics for rates; logs are for identifying callers. |
 | Webhook rate limit | Merchant limits (100 / 50 per s) | Own limit, 300 / 100 per s (`RATE_LIMIT_WEBHOOK_*`) | None. |
 | Rate-limit buckets | — | New Redis keys for user and webhook buckets | None. Those counters start fresh once on deploy. |
-| Circuit-breaker Redis keys | `gateway:cb:<id>`, `gateway:probe:<id>` | `gateway:{<id>}:cb`, `gateway:{<id>}:probe` | None. Breaker state starts fresh (`CLOSED`) once on deploy; delete the old keys afterwards. A breaker latched `OPEN` by the old scripts is cleared by this. |
+| Breakers latched by the old scripts | A success after a cooldown left `OPEN` with `cooldown_until: 0`, excluding the gateway for good | The scripts never write that state, but one already written stays held open | After the rollout, list the breakers with `redis-cli -n <REDIS_STATE_DB> --scan --pattern 'gateway:cb:*'` and check each with `redis-cli -n <REDIS_STATE_DB> GET <key>`. Delete any showing `"state":"OPEN"` with `"cooldown_until":0` using `redis-cli -n <REDIS_STATE_DB> DEL <key>`. Run it after the last old pod is gone, since old pods can still latch during the rollout. |
+| `GATEWAY_MAX_ATTEMPTS`, `GATEWAY_HTTP_TIMEOUT` | `0` accepted (the service treated it as 1) | `GATEWAY_MAX_ATTEMPTS` < 1 or `GATEWAY_HTTP_TIMEOUT` ≤ 0 fails startup | Set them to positive values. |
+| Payment with no eligible gateway at call time | Called a gateway the breaker had just tripped | Rerouted before the call; `FAILED` with category `gateway_unavailable` if there is no alternative and nothing was called | None. Watch `gateway.probe_gate_error` for probe-store errors. |
 | Merchant scope of a service token | Any `merchant_id` in the create body was used, and any payment could be read, refunded or cancelled by ID | One token is one merchant. A different `merchant_id` is `403 merchant_mismatch`; another merchant's payment is `404` | A platform that sends many `merchant_id`s with one token must get one service token per merchant (or use an ops token, which is cross-merchant). Search the logs for `authz.denied` after rollout. |
 | Refund `initiated_by` | Free text from the body, defaulting to `api` | `merchant` or `ops`, from the token. Any other value, **including `api`**, is `400 invalid_initiated_by` | Stop sending the field or send the matching value. The column is free text, so older rows say `api` and new ones `merchant`: treat them as the same in reports, or backfill with `UPDATE refunds SET initiated_by = 'merchant' WHERE initiated_by = 'api'`. |
 | Cancel body | `actor` and `via` stored as sent; invalid JSON ignored | `actor` from the token (others `400 invalid_actor`); `via` must be `api`, `dashboard` or `ops-tool` (`ops-tool` for ops tokens only; others `400 invalid_via`); invalid JSON `400` | Send an empty body or valid values. |
