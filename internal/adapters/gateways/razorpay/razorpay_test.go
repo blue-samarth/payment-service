@@ -129,6 +129,49 @@ func TestRefund_OrderWithoutExactlyOneCapturedPaymentIsNotRefunded(t *testing.T)
 	}
 }
 
+func TestRefund_LookupFailureIsTerminalAndPostsNothing(t *testing.T) {
+	for name, status := range map[string]int{"4xx": http.StatusBadRequest, "5xx": http.StatusInternalServerError, "no connection": 0} {
+		posted := false
+		a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				posted = true
+			}
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":{"code":"BAD_REQUEST_ERROR","description":"The id provided does not exist"}}`))
+		})
+		if status == 0 {
+			srv.Close()
+		}
+
+		_, err := a.Refund(context.Background(), ports.GatewayRefundRequest{GatewayReferenceID: "order_9", Amount: 100})
+		srv.Close()
+		var gwErr *ports.GatewayError
+		if !errors.As(err, &gwErr) || gwErr.Category != ports.ErrorCategoryHardDecline || gwErr.Code != "refund_lookup_failed" {
+			t.Errorf("%s: nothing was sent, so the refund must end terminally, got %v", name, err)
+		}
+		if posted {
+			t.Errorf("%s: no refund may be posted when the lookup fails", name)
+		}
+	}
+}
+
+func TestRefund_AmountAboveCapturedIsRefused(t *testing.T) {
+	posted := false
+	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posted = true
+		}
+		_, _ = w.Write([]byte(`{"items":[{"id":"pay_1","status":"captured","amount":1000}]}`))
+	})
+	defer srv.Close()
+
+	_, err := a.Refund(context.Background(), ports.GatewayRefundRequest{GatewayReferenceID: "order_10", Amount: 1001})
+	var gwErr *ports.GatewayError
+	if !errors.As(err, &gwErr) || gwErr.Code != "refund_exceeds_captured" || posted {
+		t.Fatalf("expected refund_exceeds_captured with nothing posted, got %v posted=%v", err, posted)
+	}
+}
+
 func TestCancel_NotSupported(t *testing.T) {
 	a := New(Config{})
 	resp, _ := a.Cancel(context.Background(), ports.GatewayCancelRequest{})

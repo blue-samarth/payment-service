@@ -147,6 +147,50 @@ func TestRefund_UncapturedOrUnknownPaymentIsNotRefunded(t *testing.T) {
 	}
 }
 
+func TestRefund_LookupFailureIsTerminalAndPostsNothing(t *testing.T) {
+	for name, status := range map[string]int{"4xx": http.StatusBadRequest, "5xx": http.StatusBadGateway, "no connection": 0} {
+		posted := false
+		a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+			_ = r.ParseForm()
+			if r.FormValue("command") == "cancel_refund_transaction" {
+				posted = true
+			}
+			w.WriteHeader(status)
+		})
+		if status == 0 {
+			srv.Close()
+		}
+
+		_, err := a.Refund(context.Background(), ports.GatewayRefundRequest{RefundID: uuid.New(), GatewayReferenceID: "ABC-3", Amount: 100})
+		srv.Close()
+		var gwErr *ports.GatewayError
+		if !errors.As(err, &gwErr) || gwErr.Category != ports.ErrorCategoryHardDecline || gwErr.Code != "refund_lookup_failed" {
+			t.Errorf("%s: nothing was sent, so the refund must end terminally, got %v", name, err)
+		}
+		if posted {
+			t.Errorf("%s: no refund may be sent when the lookup fails", name)
+		}
+	}
+}
+
+func TestRefund_AmountAboveCapturedIsRefused(t *testing.T) {
+	posted := false
+	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		if r.FormValue("command") == "cancel_refund_transaction" {
+			posted = true
+		}
+		_, _ = w.Write([]byte(`{"status":1,"transaction_details":{"ABC-4":{"txnid":"ABC-4","status":"success","amt":"10.00","mihpayid":"77"}}}`))
+	})
+	defer srv.Close()
+
+	_, err := a.Refund(context.Background(), ports.GatewayRefundRequest{RefundID: uuid.New(), GatewayReferenceID: "ABC-4", Amount: 1001})
+	var gwErr *ports.GatewayError
+	if !errors.As(err, &gwErr) || gwErr.Code != "refund_exceeds_captured" || posted {
+		t.Fatalf("expected refund_exceeds_captured with nothing sent, got %v posted=%v", err, posted)
+	}
+}
+
 func TestHash_IsDeterministicSHA512(t *testing.T) {
 	a := New(Config{MerchantKey: "key", MerchantSalt: "salt"})
 	h1 := a.hash("verify_payment", "TXN-1")

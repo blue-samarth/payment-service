@@ -169,6 +169,21 @@ func (e *GatewayError) Error() string {
 
 func (e *GatewayError) Unwrap() error { return e.Underlying }
 
+func RefundLookupFailed(err error) *GatewayError {
+	out := &GatewayError{
+		Category:       ErrorCategoryHardDecline,
+		Code:           "refund_lookup_failed",
+		GatewayMessage: err.Error(),
+		Underlying:     err,
+	}
+	var gwErr *GatewayError
+	if errors.As(err, &gwErr) {
+		out.GatewayCode = gwErr.GatewayCode
+		out.GatewayMessage = gwErr.GatewayMessage
+	}
+	return out
+}
+
 type SettlementReport struct {
 	GatewayID   string
 	PeriodStart time.Time

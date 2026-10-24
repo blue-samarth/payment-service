@@ -118,7 +118,7 @@ func (a *Adapter) Refund(ctx context.Context, req ports.GatewayRefundRequest) (*
 	}
 	amount := fmt.Sprintf("%.2f", float64(req.Amount)/100)
 
-	mihpayid, err := a.mihpayID(ctx, req.GatewayReferenceID)
+	mihpayid, err := a.mihpayID(ctx, req.GatewayReferenceID, req.Amount)
 	if err != nil {
 		return nil, err
 	}
@@ -140,14 +140,14 @@ func (a *Adapter) Refund(ctx context.Context, req ports.GatewayRefundRequest) (*
 	}, nil
 }
 
-func (a *Adapter) mihpayID(ctx context.Context, reference string) (string, error) {
+func (a *Adapter) mihpayID(ctx context.Context, reference string, amount int64) (string, error) {
 	if isDigits(reference) {
 		return reference, nil
 	}
 
 	var out payuVerifyResponse
 	if err := a.postService(ctx, "verify_payment", reference, nil, &out); err != nil {
-		return "", err
+		return "", ports.RefundLookupFailed(err)
 	}
 	detail, ok := out.TransactionDetails[reference]
 	switch {
@@ -162,6 +162,12 @@ func (a *Adapter) mihpayID(ctx context.Context, reference string) (string, error
 			Category:       ports.ErrorCategoryHardDecline,
 			Code:           "payment_not_captured",
 			GatewayMessage: "PayU payment for txnid " + reference + " is " + detail.Status + ", not captured",
+		}
+	case detail.Amount != "" && amount > rupeesToPaise(detail.Amount):
+		return "", &ports.GatewayError{
+			Category:       ports.ErrorCategoryHardDecline,
+			Code:           "refund_exceeds_captured",
+			GatewayMessage: fmt.Sprintf("refund of %d exceeds the %s captured for txnid %s", amount, detail.Amount, reference),
 		}
 	}
 	return detail.MihpayID, nil
