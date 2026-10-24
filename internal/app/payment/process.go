@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -288,33 +289,28 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 	}
 
 	tried := make([]string, 0, maxAttempts)
-	var resp *ports.GatewayPaymentResponse
-	result := outcome{
-		terminal:  true,
-		newStatus: transaction.StatusFailed,
-		failureReason: &transaction.FailureReason{
-			Category: "gateway_unavailable",
-			Code:     "circuit_breaker_open",
-			Source:   transaction.FailureReasonSourceInternal,
-		},
+
+	if !s.admitCall(ctx, txn.GatewayID) {
+		tried = append(tried, txn.GatewayID)
+		next, nextAdapter, ok := s.nextAdmitted(ctx, txn, &tried)
+		if !ok || !s.switchGateway(ctx, txn, next, "breaker_refused", 1) {
+			return nil, outcome{
+				terminal:  true,
+				newStatus: transaction.StatusFailed,
+				failureReason: &transaction.FailureReason{
+					Category: "gateway_unavailable",
+					Code:     "circuit_breaker_open",
+					Source:   transaction.FailureReasonSourceInternal,
+				},
+			}
+		}
+		adapter = nextAdapter
 	}
 
-	for calls := 0; ; {
-		if !s.admitCall(ctx, txn.GatewayID) {
-			tried = append(tried, txn.GatewayID)
-			next, nextAdapter, ok := s.rerouteExcluding(ctx, txn, tried)
-			if !ok || !s.switchGateway(ctx, txn, next, "breaker_refused", calls+1) {
-				return resp, result
-			}
-			adapter = nextAdapter
-			continue
-		}
-
-		var gwErr *ports.GatewayError
-		resp, gwErr = s.callGateway(ctx, adapter, txn)
-		calls++
+	for calls := 1; ; calls++ {
+		resp, gwErr := s.callGateway(ctx, adapter, txn)
 		s.saveReference(ctx, txn, resp)
-		result = resolveOutcome(resp, gwErr)
+		result := resolveOutcome(resp, gwErr)
 		s.recordBreaker(ctx, txn.GatewayID, gwErr)
 		tried = append(tried, txn.GatewayID)
 
@@ -322,11 +318,24 @@ func (s *Service) attemptGateways(ctx context.Context, adapter ports.GatewayAdap
 			return resp, result
 		}
 
-		next, nextAdapter, ok := s.rerouteExcluding(ctx, txn, tried)
+		next, nextAdapter, ok := s.nextAdmitted(ctx, txn, &tried)
 		if !ok || !s.switchGateway(ctx, txn, next, "soft_decline", calls+1) {
 			return resp, result
 		}
 		adapter = nextAdapter
+	}
+}
+
+func (s *Service) nextAdmitted(ctx context.Context, txn *transaction.Transaction, tried *[]string) (string, ports.GatewayAdapter, bool) {
+	for {
+		next, adapter, ok := s.rerouteExcluding(ctx, txn, *tried)
+		if !ok || slices.Contains(*tried, next) {
+			return "", nil, false
+		}
+		if s.admitCall(ctx, next) {
+			return next, adapter, true
+		}
+		*tried = append(*tried, next)
 	}
 }
 

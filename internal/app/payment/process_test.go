@@ -574,6 +574,38 @@ func TestProcessPayment_RefusedGatewayIsReroutedBeforeAnyCall(t *testing.T) {
 	}
 }
 
+func TestProcessPayment_SoftDeclineThenRefusalStaysOnTheDecliningGateway(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	first := &fakeAdapter{err: &ports.GatewayError{Category: ports.ErrorCategorySoftDecline, Code: "soft_decline"}}
+	second := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pay_2", Status: ports.GatewayPaymentStatusSucceeded}}
+	reg := &multiRegistry{adapters: map[string]ports.GatewayAdapter{"stripe": first, "razorpay": second}}
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "razorpay"}}
+	metrics := newCountingMetrics()
+	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, metrics)
+	svc.SetMaxGatewayAttempts(2)
+	svc.SetCallGate(&fakeGate{refuse: map[string]bool{"razorpay": true}})
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.initiated) != 0 {
+		t.Fatal("the refused gateway must not be called")
+	}
+	if got.Status != transaction.StatusFailed || got.ActualGateway != "stripe" || got.GatewayID != "stripe" {
+		t.Fatalf("stripe's soft decline must be recorded against stripe, not the refused razorpay; got %s on gateway=%q actual=%q", got.Status, got.GatewayID, got.ActualGateway)
+	}
+	for _, snap := range repo.snapshots {
+		if snap.ActualGateway == "razorpay" {
+			t.Fatal("a refused gateway must never be persisted as the payment's gateway")
+		}
+	}
+	if metrics.counts[ports.MetricGatewayFallbackTriggered] != 0 {
+		t.Error("no fallback happened, so none may be counted")
+	}
+}
+
 func TestProcessPayment_RefusedWithNoAlternativeFailsWithoutACharge(t *testing.T) {
 	txn := pendingTxn()
 	repo := seedRepo(txn)
