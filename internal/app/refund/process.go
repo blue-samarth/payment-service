@@ -72,6 +72,9 @@ func (s *Service) ProcessRefund(ctx context.Context, refundID uuid.UUID) (*refun
 		}); err != nil {
 			return nil, fmt.Errorf("refund: persist in-flight %s: %w", refundID, err)
 		}
+		if gwErr != nil && gwErr.Category == ports.ErrorCategoryAmbiguous {
+			s.flagForReview(rf, gwErr)
+		}
 		return rf, nil
 	}
 
@@ -100,6 +103,20 @@ func (s *Service) ProcessRefund(ctx context.Context, refundID uuid.UUID) (*refun
 		s.metrics.Increment(ports.MetricRefundFailed, map[string]string{"gateway_id": rf.ActualGateway})
 	}
 	return rf, nil
+}
+
+func (s *Service) flagForReview(rf *refund.Refund, gwErr *ports.GatewayError) {
+	s.metrics.Increment(ports.MetricRefundReviewRequired, map[string]string{
+		"gateway_id": rf.AttemptedGateway,
+		"code":       gwErr.Code,
+	})
+	s.log.Error(ports.LogEventRefundReviewRequired, map[string]any{
+		ports.FieldErrorCode:     gwErr.Code,
+		ports.FieldTraceID:       "",
+		ports.FieldTransactionID: rf.TransactionID.String(),
+		ports.FieldRefundID:      rf.ID.String(),
+		ports.FieldGatewayID:     rf.AttemptedGateway,
+	}, gwErr)
 }
 
 func (s *Service) ResolveCancelRefund(ctx context.Context, transactionID uuid.UUID, amount int64) error {

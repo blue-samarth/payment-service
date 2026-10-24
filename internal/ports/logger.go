@@ -39,6 +39,7 @@ const (
 	LogEventRefundFailed            = "refund.failed"
 	LogEventRefundRetry             = "refund.retry"
 	LogEventRefundOverRefundBlocked = "refund.over_refund_blocked"
+	LogEventRefundReviewRequired    = "refund.review_required"
 
 	LogEventCancelIntent     = "cancel.intent_set"
 	LogEventCancelResolution = "cancel.resolution"
