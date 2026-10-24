@@ -417,6 +417,23 @@ func TestProcessPayment_NoFallbackOnGatewayError(t *testing.T) {
 	if got.GatewayReferenceID == "pi_fb" {
 		t.Error("the second gateway must not have been called after a GatewayError")
 	}
+	if got.Status != transaction.StatusProcessing {
+		t.Errorf("a 5xx may have charged the customer, so it must stay PROCESSING for the reaper rather than end FAILED, got %s", got.Status)
+	}
+}
+
+func TestRecoverExpiredLease_StatusCheck5xxStaysProcessing(t *testing.T) {
+	txn := processingExpiredTxn()
+	repo := seedRepo(txn)
+	svc := recoverService(repo, &fakeRegistry{adapter: &fakeAdapter{err: &ports.GatewayError{Category: ports.ErrorCategoryGatewayError, Code: "api_error"}}}, &fakeOutbox{})
+
+	got, err := svc.RecoverExpiredLease(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != transaction.StatusProcessing {
+		t.Fatalf("a 5xx on a status check says nothing about the payment; it used to finalize FAILED, got %s", got.Status)
+	}
 }
 
 func recoverService(repo *fakeRepo, reg *fakeRegistry, outbox *fakeOutbox) *Service {

@@ -561,7 +561,8 @@ func (s *Service) callGateway(ctx context.Context, adapter ports.GatewayAdapter,
 
 func resolveOutcome(resp *ports.GatewayPaymentResponse, gwErr *ports.GatewayError) outcome {
 	if gwErr != nil {
-		if gwErr.Category == ports.ErrorCategoryAmbiguous || gwErr.Category == ports.ErrorCategoryNetworkTimeout {
+		switch gwErr.Category {
+		case ports.ErrorCategoryAmbiguous, ports.ErrorCategoryNetworkTimeout, ports.ErrorCategoryGatewayError:
 			return outcome{terminal: false}
 		}
 		return outcome{
