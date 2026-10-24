@@ -218,6 +218,7 @@ type GatewayConfig struct {
 	HTTPTimeout                    time.Duration
 	MaxAttempts                    int
 	CircuitBreakerFailureThreshold int
+	MerchantTiers                  map[string]string
 }
 
 func (g GatewayConfig) Budget() time.Duration {
@@ -389,6 +390,7 @@ func LoadConfig() (*Config, error) {
 
 	c.Gateway.HTTPTimeout = getEnvDuration("GATEWAY_HTTP_TIMEOUT", 30*time.Second, &errs)
 	c.Gateway.MaxAttempts = getEnvInt("GATEWAY_MAX_ATTEMPTS", 3, &errs)
+	c.Gateway.MerchantTiers = parseMerchantTiers(os.Getenv("MERCHANT_TIERS"), &errs)
 	c.Gateway.CircuitBreakerFailureThreshold = getEnvInt("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 5, &errs)
 	c.App.ShutdownTimeout = getEnvDuration("SHUTDOWN_TIMEOUT", c.Gateway.Budget()+ShutdownTimeoutMargin, &errs)
 
@@ -661,6 +663,28 @@ func parseServiceTokens(raw string, errs *[]string) map[string]string {
 			continue
 		}
 		out[token] = merchant.String()
+	}
+	return out
+}
+
+func parseMerchantTiers(raw string, errs *[]string) map[string]string {
+	out := map[string]string{}
+	for i, entry := range splitList(raw) {
+		sep := strings.Index(entry, "=")
+		if sep <= 0 || sep == len(entry)-1 {
+			*errs = append(*errs, fmt.Sprintf("MERCHANT_TIERS entry %d must be merchantID=tier", i+1))
+			continue
+		}
+		merchant, err := uuid.Parse(entry[:sep])
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("MERCHANT_TIERS entry %d: merchant ID must be a UUID", i+1))
+			continue
+		}
+		if _, dup := out[merchant.String()]; dup {
+			*errs = append(*errs, fmt.Sprintf("MERCHANT_TIERS entry %d repeats an earlier merchant", i+1))
+			continue
+		}
+		out[merchant.String()] = entry[sep+1:]
 	}
 	return out
 }

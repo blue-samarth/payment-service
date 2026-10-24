@@ -331,6 +331,7 @@ func TestProcessPayment_FallsBackToSecondGatewayOnSoftDecline(t *testing.T) {
 
 	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
 	svc.SetMaxGatewayAttempts(2)
+	svc.SetMerchantTiers(StaticMerchantTiers{txn.MerchantID.String(): "enterprise"})
 
 	got, err := svc.ProcessPayment(context.Background(), txn.ID)
 	if err != nil {
@@ -341,6 +342,9 @@ func TestProcessPayment_FallsBackToSecondGatewayOnSoftDecline(t *testing.T) {
 	}
 	if got.ActualGateway != "razorpay" || got.GatewayReferenceID != "pi_fb" {
 		t.Errorf("expected the second gateway to settle the payment, got gateway=%q ref=%q", got.ActualGateway, got.GatewayReferenceID)
+	}
+	if len(router.inputs) != 1 || router.inputs[0].MerchantTier != "enterprise" {
+		t.Errorf("the fallback must route with the merchant's tier too, got %+v", router.inputs)
 	}
 }
 

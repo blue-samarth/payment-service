@@ -445,6 +445,7 @@ func (s *Service) rerouteExcluding(ctx context.Context, txn *transaction.Transac
 		Amount:          txn.Amount,
 		Currency:        txn.Currency,
 		PaymentMethod:   txn.PaymentMethod,
+		MerchantTier:    s.merchantTier(txn.MerchantID),
 		IsDomestic:      isDomesticCurrency(txn.Currency),
 		ExcludeGateways: exclude,
 	})

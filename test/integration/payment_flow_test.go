@@ -52,8 +52,6 @@ func cardInput() payment.CreatePaymentInput {
 		PaymentMethod: transaction.PaymentMethodCard,
 		CustomerEmail: "buyer@example.com",
 		Description:   "integration order",
-		MerchantTier:  "standard",
-		IsDomestic:    true,
 	}
 }
 

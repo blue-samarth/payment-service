@@ -52,6 +52,14 @@ type CircuitBreaker interface {
 	RecordFailure(ctx context.Context, gatewayID string) error
 	RecordSuccess(ctx context.Context, gatewayID string) error
 }
+type MerchantTiers interface {
+	TierFor(merchantID uuid.UUID) string
+}
+
+type StaticMerchantTiers map[string]string
+
+func (t StaticMerchantTiers) TierFor(merchantID uuid.UUID) string { return t[merchantID.String()] }
+
 type CallGate interface {
 	AdmitCall(ctx context.Context, gatewayID string, probeTTL time.Duration) (domaingateway.Admission, error)
 	ReleaseProbe(ctx context.Context, gatewayID string) error
@@ -79,8 +87,6 @@ type CreatePaymentInput struct {
 	CustomerEmail  string
 	Description    string
 	Metadata       map[string]any
-	MerchantTier   string
-	IsDomestic     bool
 	IdempotencyKey string
 }
 
@@ -95,6 +101,7 @@ type Service struct {
 	cancelResolver CancelResolver
 	breaker        CircuitBreaker
 	gate           CallGate
+	tiers          MerchantTiers
 	intents        IntentTracker
 	idem           *idempotency.Guard
 	maxAttempts    int
@@ -103,9 +110,17 @@ type Service struct {
 	metrics        ports.MetricRecorder
 }
 
-func (s *Service) SetCancelResolver(r CancelResolver)    { s.cancelResolver = r }
-func (s *Service) SetCircuitBreaker(b CircuitBreaker)    { s.breaker = b }
-func (s *Service) SetCallGate(g CallGate)                { s.gate = g }
+func (s *Service) SetCancelResolver(r CancelResolver) { s.cancelResolver = r }
+func (s *Service) SetCircuitBreaker(b CircuitBreaker) { s.breaker = b }
+func (s *Service) SetCallGate(g CallGate)             { s.gate = g }
+func (s *Service) SetMerchantTiers(t MerchantTiers)   { s.tiers = t }
+
+func (s *Service) merchantTier(merchantID uuid.UUID) string {
+	if s.tiers == nil {
+		return ""
+	}
+	return s.tiers.TierFor(merchantID)
+}
 func (s *Service) SetIntentTracker(t IntentTracker)      { s.intents = t }
 func (s *Service) SetMaxGatewayAttempts(n int)           { s.maxAttempts = n }
 func (s *Service) SetGatewayHTTPTimeout(d time.Duration) { s.httpTimeout = d }
@@ -238,8 +253,8 @@ func (s *Service) buildTransaction(ctx context.Context, in CreatePaymentInput) (
 		Amount:        in.Amount,
 		Currency:      in.Currency,
 		PaymentMethod: in.PaymentMethod,
-		MerchantTier:  in.MerchantTier,
-		IsDomestic:    in.IsDomestic,
+		MerchantTier:  s.merchantTier(in.MerchantID),
+		IsDomestic:    isDomesticCurrency(in.Currency),
 	})
 	if err != nil {
 		var noCandidate routing.ErrNoCandidate
