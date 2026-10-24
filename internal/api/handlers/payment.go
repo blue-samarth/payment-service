@@ -33,8 +33,6 @@ type createPaymentRequest struct {
 	CustomerEmail string         `json:"customer_email"`
 	Description   string         `json:"description"`
 	Metadata      map[string]any `json:"metadata"`
-	MerchantTier  string         `json:"merchant_tier"`
-	IsDomestic    bool           `json:"is_domestic"`
 }
 
 type paymentResponse struct {
@@ -73,6 +71,10 @@ func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_fields", "currency and payment_method are required")
 		return
 	}
+	if err := transaction.ValidateMetadata(req.Metadata); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
+		return
+	}
 
 	var customerID uuid.UUID
 	if req.CustomerID != "" {
@@ -98,12 +100,12 @@ func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		CustomerEmail:  req.CustomerEmail,
 		Description:    req.Description,
 		Metadata:       req.Metadata,
-		MerchantTier:   req.MerchantTier,
-		IsDomestic:     req.IsDomestic,
 		IdempotencyKey: idemKey,
 	})
 	if err != nil {
 		switch {
+		case errors.Is(err, transaction.ErrMetadataTooLarge):
+			writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
 		case errors.Is(err, authz.ErrDenied):
 			writeError(w, http.StatusForbidden, "merchant_mismatch", "merchant_id does not match the authenticated merchant")
 		case errors.Is(err, payment.ErrNoGateway):

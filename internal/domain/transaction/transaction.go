@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -175,6 +176,9 @@ func New(
 	if estimatedTimeoutSec <= 0 {
 		return nil, fmt.Errorf("estimatedTimeoutSec must be positive, got %d", estimatedTimeoutSec)
 	}
+	if err := ValidateMetadata(metadata); err != nil {
+		return nil, err
+	}
 
 	now := time.Now().UTC()
 	return &Transaction{
@@ -194,6 +198,24 @@ func New(
 		CreatedAt:               now,
 		UpdatedAt:               now,
 	}, nil
+}
+
+const MaxMetadataBytes = 4096
+
+var ErrMetadataTooLarge = fmt.Errorf("metadata must be at most %d bytes of JSON", MaxMetadataBytes)
+
+func ValidateMetadata(metadata map[string]any) error {
+	if len(metadata) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("metadata is not valid JSON: %w", err)
+	}
+	if len(encoded) > MaxMetadataBytes {
+		return ErrMetadataTooLarge
+	}
+	return nil
 }
 
 func (t *Transaction) SetCancelIntent(by Actor, via CancelVia) {

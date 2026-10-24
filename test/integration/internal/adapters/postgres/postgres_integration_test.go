@@ -4,6 +4,8 @@ package postgres_test
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -459,6 +461,27 @@ func TestTransaction_ProcessingTimeoutRoundTrips(t *testing.T) {
 		if got.ProcessingTimeout == nil || *got.ProcessingTimeout != d {
 			t.Errorf("processing_timeout %s did not round-trip, got %v", d, got.ProcessingTimeout)
 		}
+	}
+}
+
+func TestInsert_MetadataSizeViolationIsTyped(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "transactions")
+	ctx := context.Background()
+
+	repo := postgres.NewTransactionRepository(pg.DB, pg.Q)
+	tr := postgres.NewTransactor(pg.DB)
+
+	noise := make([]byte, 9000)
+	if _, err := rand.Read(noise); err != nil {
+		t.Fatal(err)
+	}
+	txn := newTxn(t)
+	txn.Metadata = map[string]any{"blob": base64.StdEncoding.EncodeToString(noise)}
+
+	err := tr.WithinTx(ctx, func(ctx context.Context) error { return repo.Insert(ctx, txn) })
+	if !errors.Is(err, transaction.ErrMetadataTooLarge) {
+		t.Fatalf("the metadata_size check must surface as ErrMetadataTooLarge (a 400), not a generic error, got %v", err)
 	}
 }
 

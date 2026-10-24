@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
@@ -57,6 +58,10 @@ func (r *TransactionRepository) Insert(ctx context.Context, t *transaction.Trans
 		t.ProcessingStartedAt, t.ProcessingTimeout,
 		t.CreatedAt, t.UpdatedAt,
 	)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23514" && pgErr.ConstraintName == "metadata_size" {
+		return fmt.Errorf("transaction: insert %s: %w", t.ID, transaction.ErrMetadataTooLarge)
+	}
 	if err != nil {
 		return fmt.Errorf("transaction: insert %s: %w", t.ID, err)
 	}
