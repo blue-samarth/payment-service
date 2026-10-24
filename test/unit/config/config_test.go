@@ -33,6 +33,8 @@ func validatableConfig() *Config {
 	c.App.ShutdownDrainDelay = 5 * time.Second
 	c.App.ShutdownTimeout = 105 * time.Second
 	c.Jobs.IdempotencyProcessingTimeoutSec = 300
+	c.Jobs.RefundRecoveryMinAgeSec = 300
+	c.Jobs.RefundRecoveryBatchSize = 100
 	c.Redis.Addrs = []string{"localhost:6379"}
 	c.Redis.RateLimitDB = 0
 	c.Redis.StateDB = 1
@@ -148,6 +150,18 @@ func TestValidate_GatewayAttemptsAndTimeoutArePositive(t *testing.T) {
 		if err := Validate(c); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: a zero gateway budget gives the breaker probe lock no expiry; expected %q, got %v", name, tc.want, err)
 		}
+	}
+}
+
+func TestValidate_RefundRecoveryMinAgeMustExceedTheHTTPTimeout(t *testing.T) {
+	c := validatableConfig()
+	c.Jobs.RefundRecoveryMinAgeSec = 30
+	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "REFUND_RECOVERY_MIN_AGE_SEC") {
+		t.Fatalf("recovery must not act on a refund whose first call may still be in flight, got %v", err)
+	}
+	c.Jobs.RefundRecoveryMinAgeSec = 31
+	if err := Validate(c); err != nil {
+		t.Fatalf("31s > 30s timeout should validate, got %v", err)
 	}
 }
 

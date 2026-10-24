@@ -234,6 +234,8 @@ type JobsConfig struct {
 	PartitionWeeksAhead             int
 	PartitionRetentionWeeks         int
 	PartitionDropAfterDays          int
+	RefundRecoveryMinAgeSec         int
+	RefundRecoveryBatchSize         int
 }
 type DataRetentionConfig struct {
 	BatchSize      int
@@ -419,6 +421,8 @@ func LoadConfig() (*Config, error) {
 	c.Jobs.PartitionWeeksAhead = getEnvInt("PARTITION_WEEKS_AHEAD", 2, &errs)
 	c.Jobs.PartitionRetentionWeeks = getEnvInt("PARTITION_RETENTION_WEEKS", 2, &errs)
 	c.Jobs.PartitionDropAfterDays = getEnvInt("PARTITION_DROP_AFTER_DAYS", 14, &errs)
+	c.Jobs.RefundRecoveryMinAgeSec = getEnvInt("REFUND_RECOVERY_MIN_AGE_SEC", 300, &errs)
+	c.Jobs.RefundRecoveryBatchSize = getEnvInt("REFUND_RECOVERY_BATCH_SIZE", 100, &errs)
 
 	c.DataRetention.BatchSize = getEnvInt("DATA_RETENTION_BATCH_SIZE", 1000, &errs)
 	c.DataRetention.BatchSleepMs = getEnvInt("DATA_RETENTION_BATCH_SLEEP_MS", 100, &errs)
@@ -575,6 +579,12 @@ func Validate(c *Config) error {
 	}
 	if c.Gateway.HTTPTimeout <= 0 {
 		errs = append(errs, "GATEWAY_HTTP_TIMEOUT must be greater than 0")
+	}
+	if minAge := time.Duration(c.Jobs.RefundRecoveryMinAgeSec) * time.Second; minAge <= c.Gateway.HTTPTimeout {
+		errs = append(errs, fmt.Sprintf("REFUND_RECOVERY_MIN_AGE_SEC (%s) must exceed GATEWAY_HTTP_TIMEOUT (%s), or recovery can act on a refund whose first call is still in flight", minAge, c.Gateway.HTTPTimeout))
+	}
+	if c.Jobs.RefundRecoveryBatchSize < 1 {
+		errs = append(errs, "REFUND_RECOVERY_BATCH_SIZE must be at least 1")
 	}
 	if c.App.ShutdownDrainDelay < 0 {
 		errs = append(errs, "SHUTDOWN_DRAIN_DELAY must not be negative")
