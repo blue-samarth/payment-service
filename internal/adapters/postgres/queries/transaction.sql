@@ -38,10 +38,11 @@ SELECT EXISTS (SELECT 1 FROM transactions WHERE id = $1);
 -- name: TransactionUpdateStatus
 -- $1=status $2=actual_gateway $3=gateway_reference_id $4=failure_reason
 -- $5=method_details $6=processing_started_at $7=processing_timeout
--- $8=updated_at $9=id $10=current_version (before increment)
+-- $8=updated_at $9=id $10=current_version (before increment) $11=gateway_id
 UPDATE transactions SET
     status                = $1,
     version               = version + 1,
+    gateway_id            = $11,
     actual_gateway        = $2,
     gateway_reference_id  = $3,
     failure_reason        = $4,

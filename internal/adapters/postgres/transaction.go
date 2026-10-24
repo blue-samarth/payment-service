@@ -113,6 +113,7 @@ func (r *TransactionRepository) UpdateStatus(ctx context.Context, t *transaction
 		time.Now().UTC(),
 		t.ID,
 		t.Version,
+		t.GatewayID,
 	).Scan(&newVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		var exists bool
