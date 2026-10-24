@@ -29,6 +29,7 @@ type RefundRepo interface {
 	GetByID(ctx context.Context, id uuid.UUID) (*refund.Refund, error)
 	UpdateStatus(ctx context.Context, rf *refund.Refund) error
 	ExistsByReason(ctx context.Context, transactionID uuid.UUID, reason string) (bool, error)
+	MarkReviewRequired(ctx context.Context, id uuid.UUID, reason string) (bool, error)
 }
 
 const ReasonCancelResolution = "cancel_resolution"

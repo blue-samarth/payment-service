@@ -73,11 +73,77 @@ func (s *Service) ProcessRefund(ctx context.Context, refundID uuid.UUID) (*refun
 			return nil, fmt.Errorf("refund: persist in-flight %s: %w", refundID, err)
 		}
 		if gwErr != nil && gwErr.Category == ports.ErrorCategoryAmbiguous {
-			s.flagForReview(rf, gwErr)
+			s.flagForReview(ctx, rf, gwErr.Code, gwErr)
 		}
 		return rf, nil
 	}
 
+	return s.finalize(ctx, rf, outcome)
+}
+
+func (s *Service) RecoverRefund(ctx context.Context, refundID uuid.UUID) (*refund.Refund, error) {
+	rf, err := s.refunds.GetByID(ctx, refundID)
+	if err != nil {
+		return nil, fmt.Errorf("refund: load refund %s: %w", refundID, err)
+	}
+	switch rf.Status {
+	case refund.StatusInitiated:
+		return s.ProcessRefund(ctx, refundID)
+	case refund.StatusProcessing:
+	default:
+		return rf, nil
+	}
+
+	adapter, err := s.gateways.Get(rf.AttemptedGateway)
+	if err != nil {
+		return nil, fmt.Errorf("refund: resolve adapter for %s: %w", rf.AttemptedGateway, err)
+	}
+	checker, ok := adapter.(ports.RefundStatusChecker)
+	if !ok {
+		s.flagForReview(ctx, rf, "status_check_unsupported", nil)
+		return rf, nil
+	}
+	parent, err := s.txns.GetByID(ctx, rf.TransactionID)
+	if err != nil {
+		return nil, fmt.Errorf("refund: load parent %s: %w", rf.TransactionID, err)
+	}
+
+	resp, err := checker.RefundStatus(ctx, ports.GatewayRefundStatusRequest{
+		RefundID:           rf.ID,
+		GatewayRefundID:    rf.GatewayRefundID,
+		GatewayReferenceID: parent.GatewayReferenceID,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("refund: status check %s: %w", refundID, err)
+	}
+
+	switch resp.Status {
+	case ports.GatewayRefundStatusCompleted, ports.GatewayRefundStatusFailed:
+		if resp.GatewayRefundID != "" {
+			rf.GatewayRefundID = resp.GatewayRefundID
+		}
+		rf.ActualGateway = rf.AttemptedGateway
+		return s.finalize(ctx, rf, resolveRefundOutcome(resp, nil))
+	case ports.GatewayRefundStatusNotFound:
+		s.flagForReview(ctx, rf, "not_found_at_gateway", nil)
+		return rf, nil
+	case ports.GatewayRefundStatusUnknown:
+		s.flagForReview(ctx, rf, "status_unknown", nil)
+		return rf, nil
+	}
+
+	if resp.GatewayRefundID != "" && resp.GatewayRefundID != rf.GatewayRefundID {
+		rf.GatewayRefundID = resp.GatewayRefundID
+		if err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
+			return s.refunds.UpdateStatus(ctx, rf)
+		}); err != nil {
+			return nil, fmt.Errorf("refund: persist gateway refund id %s: %w", refundID, err)
+		}
+	}
+	return rf, nil
+}
+
+func (s *Service) finalize(ctx context.Context, rf *refund.Refund, outcome refundOutcome) (*refund.Refund, error) {
 	if err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := rf.Transition(outcome.newStatus); err != nil {
 			return err
@@ -92,7 +158,7 @@ func (s *Service) ProcessRefund(ctx context.Context, refundID uuid.UUID) (*refun
 		}
 		return s.outbox.Write(ctx, event)
 	}); err != nil {
-		return nil, fmt.Errorf("refund: finalize %s: %w", refundID, err)
+		return nil, fmt.Errorf("refund: finalize %s: %w", rf.ID, err)
 	}
 
 	if outcome.newStatus == refund.StatusRefunded {
@@ -105,18 +171,34 @@ func (s *Service) ProcessRefund(ctx context.Context, refundID uuid.UUID) (*refun
 	return rf, nil
 }
 
-func (s *Service) flagForReview(rf *refund.Refund, gwErr *ports.GatewayError) {
+func (s *Service) flagForReview(ctx context.Context, rf *refund.Refund, code string, cause error) {
+	marked, err := s.refunds.MarkReviewRequired(ctx, rf.ID, code)
+	if err != nil {
+		s.log.Error(ports.LogEventRefundReviewRequired, map[string]any{
+			ports.FieldErrorCode:     "mark_review_failed",
+			ports.FieldTraceID:       "",
+			ports.FieldTransactionID: rf.TransactionID.String(),
+			ports.FieldRefundID:      rf.ID.String(),
+		}, err)
+		return
+	}
+	if !marked {
+		return
+	}
+	if cause == nil {
+		cause = errors.New("refund outcome cannot be determined automatically")
+	}
 	s.metrics.Increment(ports.MetricRefundReviewRequired, map[string]string{
 		"gateway_id": rf.AttemptedGateway,
-		"code":       gwErr.Code,
+		"code":       code,
 	})
 	s.log.Error(ports.LogEventRefundReviewRequired, map[string]any{
-		ports.FieldErrorCode:     gwErr.Code,
+		ports.FieldErrorCode:     code,
 		ports.FieldTraceID:       "",
 		ports.FieldTransactionID: rf.TransactionID.String(),
 		ports.FieldRefundID:      rf.ID.String(),
 		ports.FieldGatewayID:     rf.AttemptedGateway,
-	}, gwErr)
+	}, cause)
 }
 
 func (s *Service) ResolveCancelRefund(ctx context.Context, transactionID uuid.UUID, amount int64) error {

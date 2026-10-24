@@ -30,6 +30,7 @@ type fakeRefunds struct {
 	byID     map[uuid.UUID]*domainrefund.Refund
 	updates  int
 	exists   bool
+	reviews  map[uuid.UUID]string
 }
 
 func (f *fakeRefunds) LockParentTransaction(context.Context, uuid.UUID) error { return nil }
@@ -57,6 +58,16 @@ func (f *fakeRefunds) UpdateStatus(_ context.Context, rf *domainrefund.Refund) e
 }
 func (f *fakeRefunds) ExistsByReason(_ context.Context, _ uuid.UUID, _ string) (bool, error) {
 	return f.exists, nil
+}
+func (f *fakeRefunds) MarkReviewRequired(_ context.Context, id uuid.UUID, reason string) (bool, error) {
+	if f.reviews == nil {
+		f.reviews = map[uuid.UUID]string{}
+	}
+	if _, done := f.reviews[id]; done {
+		return false, nil
+	}
+	f.reviews[id] = reason
+	return true, nil
 }
 
 type fakeRegistry struct {
@@ -122,6 +133,147 @@ func (a *fakeAdapter) Cancel(context.Context, ports.GatewayCancelRequest) (*port
 	return nil, nil
 }
 func (a *fakeAdapter) Capabilities() ports.GatewayCapabilities { return ports.GatewayCapabilities{} }
+
+type checkingAdapter struct {
+	fakeAdapter
+	status    *ports.GatewayRefundResponse
+	statusErr error
+	refunds   int
+	asked     []ports.GatewayRefundStatusRequest
+}
+
+func (a *checkingAdapter) Refund(context.Context, ports.GatewayRefundRequest) (*ports.GatewayRefundResponse, error) {
+	a.refunds++
+	return a.resp, a.err
+}
+
+func (a *checkingAdapter) RefundStatus(_ context.Context, req ports.GatewayRefundStatusRequest) (*ports.GatewayRefundResponse, error) {
+	a.asked = append(a.asked, req)
+	return a.status, a.statusErr
+}
+
+func processingRefund(t *testing.T, adapter ports.GatewayAdapter) (*Service, *fakeRefunds, *fakeOutbox, *domainrefund.Refund) {
+	t.Helper()
+	parent := succeededTxn(100000)
+	parent.GatewayReferenceID = "order_1"
+	rf, _ := domainrefund.New(parent.ID, 40000, 100000, 0, "r", "merchant")
+	rf.AttemptedGateway = "razorpay"
+	rf.Status = domainrefund.StatusProcessing
+	refunds := &fakeRefunds{byID: map[uuid.UUID]*domainrefund.Refund{rf.ID: rf}}
+	outbox := &fakeOutbox{}
+	s := NewService(&fakeTxns{txn: parent}, refunds, outbox, fakeTransactor{}, &fakeRegistry{adapter: adapter}, noopLogger{}, noopMetrics{})
+	return s, refunds, outbox, rf
+}
+
+func TestRecoverRefund_CompletedAtTheGatewayIsFinalized(t *testing.T) {
+	adapter := &checkingAdapter{status: &ports.GatewayRefundResponse{GatewayRefundID: "rfnd_9", Status: ports.GatewayRefundStatusCompleted}}
+	s, _, outbox, rf := processingRefund(t, adapter)
+
+	got, err := s.RecoverRefund(context.Background(), rf.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domainrefund.StatusRefunded || got.GatewayRefundID != "rfnd_9" {
+		t.Fatalf("expected REFUNDED with the gateway refund id, got %s %q", got.Status, got.GatewayRefundID)
+	}
+	if len(outbox.events) != 1 || outbox.events[0].EventType != ports.EventTypeRefundSucceeded {
+		t.Fatalf("expected a REFUND_SUCCEEDED event, got %+v", outbox.events)
+	}
+	if adapter.refunds != 0 {
+		t.Fatal("recovery must check the status, never re-post the refund")
+	}
+	if adapter.asked[0].RefundID != rf.ID || adapter.asked[0].GatewayReferenceID != "order_1" {
+		t.Fatalf("the status check must carry our refund id and the payment reference, got %+v", adapter.asked[0])
+	}
+}
+
+func TestRecoverRefund_FailedAtTheGatewayIsFinalized(t *testing.T) {
+	adapter := &checkingAdapter{status: &ports.GatewayRefundResponse{Status: ports.GatewayRefundStatusFailed}}
+	s, _, outbox, rf := processingRefund(t, adapter)
+
+	got, err := s.RecoverRefund(context.Background(), rf.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domainrefund.StatusFailed || len(outbox.events) != 1 || outbox.events[0].EventType != ports.EventTypeRefundFailed {
+		t.Fatalf("expected REFUND_FAILED with an event, got %s %+v", got.Status, outbox.events)
+	}
+}
+
+func TestRecoverRefund_StillProcessingIsLeftAlone(t *testing.T) {
+	adapter := &checkingAdapter{status: &ports.GatewayRefundResponse{GatewayRefundID: "rfnd_learned", Status: ports.GatewayRefundStatusProcessing}}
+	s, refunds, outbox, rf := processingRefund(t, adapter)
+
+	got, err := s.RecoverRefund(context.Background(), rf.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domainrefund.StatusProcessing || len(outbox.events) != 0 || len(refunds.reviews) != 0 {
+		t.Fatalf("a pending refund must stay as it is, got %s events=%d reviews=%v", got.Status, len(outbox.events), refunds.reviews)
+	}
+	if got.GatewayRefundID != "rfnd_learned" {
+		t.Fatalf("a gateway refund id learned from the lookup must be kept for the next check, got %q", got.GatewayRefundID)
+	}
+}
+
+func TestRecoverRefund_UndeterminableRefundsGoToReviewOnce(t *testing.T) {
+	for name, adapter := range map[string]ports.GatewayAdapter{
+		"not_found_at_gateway":     &checkingAdapter{status: &ports.GatewayRefundResponse{Status: ports.GatewayRefundStatusNotFound}},
+		"status_unknown":           &checkingAdapter{status: &ports.GatewayRefundResponse{Status: ports.GatewayRefundStatusUnknown}},
+		"status_check_unsupported": &fakeAdapter{},
+	} {
+		s, refunds, outbox, rf := processingRefund(t, adapter)
+		got, err := s.RecoverRefund(context.Background(), rf.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != domainrefund.StatusProcessing || len(outbox.events) != 0 {
+			t.Errorf("%s: must not be guessed at, got %s", name, got.Status)
+		}
+		if refunds.reviews[rf.ID] != name {
+			t.Errorf("%s: expected a review mark with that reason, got %v", name, refunds.reviews)
+		}
+	}
+}
+
+func TestRecoverRefund_StatusCheckErrorChangesNothing(t *testing.T) {
+	adapter := &checkingAdapter{statusErr: &ports.GatewayError{Category: ports.ErrorCategoryNetworkTimeout, Code: "network_error"}}
+	s, refunds, outbox, rf := processingRefund(t, adapter)
+
+	if _, err := s.RecoverRefund(context.Background(), rf.ID); err == nil {
+		t.Fatal("the caller must see the error so it is logged and retried next run")
+	}
+	if rf.Status != domainrefund.StatusProcessing || len(outbox.events) != 0 || len(refunds.reviews) != 0 || refunds.updates != 0 {
+		t.Fatal("a failed status check must leave the refund untouched")
+	}
+}
+
+func TestRecoverRefund_StaleInitiatedRefundIsSent(t *testing.T) {
+	adapter := &checkingAdapter{fakeAdapter: fakeAdapter{resp: &ports.GatewayRefundResponse{GatewayRefundID: "rfnd_1", Status: ports.GatewayRefundStatusCompleted}}}
+	s, _, _, rf := processingRefund(t, adapter)
+	rf.Status = domainrefund.StatusInitiated
+
+	got, err := s.RecoverRefund(context.Background(), rf.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if adapter.refunds != 1 || got.Status != domainrefund.StatusRefunded {
+		t.Fatalf("an INITIATED refund was never sent, so recovery sends it once; got %d posts, %s", adapter.refunds, got.Status)
+	}
+}
+
+func TestRecoverRefund_TerminalRefundIsANoOp(t *testing.T) {
+	adapter := &checkingAdapter{}
+	s, _, _, rf := processingRefund(t, adapter)
+	rf.Status = domainrefund.StatusRefunded
+
+	if _, err := s.RecoverRefund(context.Background(), rf.ID); err != nil {
+		t.Fatal(err)
+	}
+	if adapter.refunds != 0 || len(adapter.asked) != 0 {
+		t.Fatal("a finished refund must not touch the gateway")
+	}
+}
 
 func TestProcessRefund_GatewayCompleted(t *testing.T) {
 	parent := succeededTxn(100000)
