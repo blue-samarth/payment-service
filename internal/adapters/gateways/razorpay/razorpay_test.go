@@ -217,6 +217,19 @@ func TestRefundStatus(t *testing.T) {
 			map[string]string{"/v1/payments/pay_1/refunds": `{"items":[]}`},
 			ports.GatewayRefundStatusNotFound, "",
 		},
+		"full refund: the only payment is now refunded": {
+			ports.GatewayRefundStatusRequest{RefundID: ours, GatewayReferenceID: "order_2"},
+			map[string]string{
+				"/v1/orders/order_2/payments": `{"items":[{"id":"pay_declined","status":"failed"},{"id":"pay_2","status":"refunded","amount":1000,"amount_refunded":1000}]}`,
+				"/v1/payments/pay_2/refunds":  `{"items":[{"id":"rfnd_full","status":"processed","notes":{"refund_id":"` + ours.String() + `"}}]}`,
+			},
+			ports.GatewayRefundStatusCompleted, "rfnd_full",
+		},
+		"no single payment to look under": {
+			ports.GatewayRefundStatusRequest{RefundID: ours, GatewayReferenceID: "order_3"},
+			map[string]string{"/v1/orders/order_3/payments": `{"items":[{"id":"pay_x","status":"failed"}]}`},
+			ports.GatewayRefundStatusUnknown, "",
+		},
 	} {
 		a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
 			body, ok := tc.routes[r.URL.Path]

@@ -131,9 +131,12 @@ func (a *Adapter) RefundStatus(ctx context.Context, req ports.GatewayRefundStatu
 		return toRefundResponse(&refund), nil
 	}
 
-	paymentID, err := a.capturedPaymentID(ctx, req.GatewayReferenceID, 0)
+	paymentID, ok, err := a.refundedPaymentID(ctx, req.GatewayReferenceID)
 	if err != nil {
 		return nil, err
+	}
+	if !ok {
+		return &ports.GatewayRefundResponse{Status: ports.GatewayRefundStatusUnknown}, nil
 	}
 	var list rzpRefundList
 	if err := a.do(ctx, http.MethodGet, "/v1/payments/"+url.PathEscape(paymentID)+"/refunds", nil, &list); err != nil {
@@ -154,6 +157,27 @@ func toRefundResponse(refund *rzpRefund) *ports.GatewayRefundResponse {
 		Amount:          refund.Amount,
 		Currency:        strings.ToUpper(refund.Currency),
 	}
+}
+
+func (a *Adapter) refundedPaymentID(ctx context.Context, reference string) (string, bool, error) {
+	if strings.HasPrefix(reference, "pay_") {
+		return reference, true, nil
+	}
+
+	var payments rzpPaymentList
+	if err := a.do(ctx, http.MethodGet, "/v1/orders/"+url.PathEscape(reference)+"/payments", nil, &payments); err != nil {
+		return "", false, err
+	}
+	var candidates []string
+	for _, p := range payments.Items {
+		if p.Status == "captured" || p.Status == "refunded" || p.AmountRefunded > 0 {
+			candidates = append(candidates, p.ID)
+		}
+	}
+	if len(candidates) != 1 {
+		return "", false, nil
+	}
+	return candidates[0], true, nil
 }
 
 func (a *Adapter) capturedPaymentID(ctx context.Context, reference string, amount int64) (string, error) {

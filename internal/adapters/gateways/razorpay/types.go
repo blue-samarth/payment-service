@@ -14,9 +14,10 @@ type rzpPaymentList struct {
 }
 
 type rzpPayment struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
-	Amount int64  `json:"amount"`
+	ID             string `json:"id"`
+	Status         string `json:"status"`
+	Amount         int64  `json:"amount"`
+	AmountRefunded int64  `json:"amount_refunded"`
 }
 
 type rzpRefund struct {
