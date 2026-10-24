@@ -20,6 +20,7 @@ const (
 	MetricGatewayDiscrepancyRate    = "gateway.discrepancy_rate"
 	MetricGatewayCircuitBreakerOpen = "gateway.circuit_breaker_open"
 	MetricGatewayFallbackTriggered  = "gateway.fallback_triggered"
+	MetricGatewayProbeGateError     = "gateway.probe_gate_error"
 	MetricGatewayFeeCalculated      = "gateway.fee_calculated_paise"
 	MetricGatewayInconsistencyRate  = "gateway.inconsistency_rate"
 

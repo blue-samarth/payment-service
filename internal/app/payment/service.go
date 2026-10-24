@@ -51,6 +51,9 @@ type CircuitBreaker interface {
 	RecordFailure(ctx context.Context, gatewayID string) error
 	RecordSuccess(ctx context.Context, gatewayID string) error
 }
+type CallGate interface {
+	AdmitCall(ctx context.Context, gatewayID string, probeTTL time.Duration) (bool, error)
+}
 type IntentTracker interface {
 	EnterProcessing(ctx context.Context, gatewayID string, txnID uuid.UUID, ttl time.Duration) error
 	ExitProcessing(ctx context.Context, gatewayID string, txnID uuid.UUID) error
@@ -89,6 +92,7 @@ type Service struct {
 	gateways       GatewayRegistry
 	cancelResolver CancelResolver
 	breaker        CircuitBreaker
+	gate           CallGate
 	intents        IntentTracker
 	idem           *idempotency.Guard
 	maxAttempts    int
@@ -99,6 +103,7 @@ type Service struct {
 
 func (s *Service) SetCancelResolver(r CancelResolver)    { s.cancelResolver = r }
 func (s *Service) SetCircuitBreaker(b CircuitBreaker)    { s.breaker = b }
+func (s *Service) SetCallGate(g CallGate)                { s.gate = g }
 func (s *Service) SetIntentTracker(t IntentTracker)      { s.intents = t }
 func (s *Service) SetMaxGatewayAttempts(n int)           { s.maxAttempts = n }
 func (s *Service) SetGatewayHTTPTimeout(d time.Duration) { s.httpTimeout = d }

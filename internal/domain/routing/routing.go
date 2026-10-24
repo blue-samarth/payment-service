@@ -36,6 +36,7 @@ type Candidate struct {
 	SupportedCurrencies       []string
 	CooldownUntil             time.Time
 	CircuitBreakerState       string
+	ProbeInFlight             bool
 	LastKnownReliabilityScore int
 	DiscrepancyRate24h        float64
 	P99LatencyMs              int
@@ -216,6 +217,9 @@ func UnavailableReason(c Candidate) string {
 	}
 	if c.CircuitBreakerState == "OPEN" {
 		return "circuit_breaker_open"
+	}
+	if c.CircuitBreakerState == "HALF_OPEN" && c.ProbeInFlight {
+		return "circuit_breaker_probe_in_flight"
 	}
 	if c.DiscrepancyRate24h > 0.20 {
 		return fmt.Sprintf("discrepancy_rate_exceeded_%.2f", c.DiscrepancyRate24h)
