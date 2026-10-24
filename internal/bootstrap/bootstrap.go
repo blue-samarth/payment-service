@@ -14,9 +14,10 @@ import (
 func GatewayRegistry(cfg *config.Config) *gateways.Registry {
 	registry := gateways.NewRegistry()
 	registry.Register("stripe", stripe.New(stripe.Config{
-		APIKey:  os.Getenv("STRIPE_API_KEY"),
-		BaseURL: os.Getenv("STRIPE_BASE_URL"),
-		Timeout: cfg.Gateway.HTTPTimeout,
+		APIKey:         os.Getenv("STRIPE_API_KEY"),
+		PublishableKey: os.Getenv("STRIPE_PUBLISHABLE_KEY"),
+		BaseURL:        os.Getenv("STRIPE_BASE_URL"),
+		Timeout:        cfg.Gateway.HTTPTimeout,
 	}))
 	registry.Register("razorpay", razorpay.New(razorpay.Config{
 		KeyID:     os.Getenv("RAZORPAY_KEY_ID"),
@@ -28,6 +29,8 @@ func GatewayRegistry(cfg *config.Config) *gateways.Registry {
 		MerchantKey:  os.Getenv("PAYU_MERCHANT_KEY"),
 		MerchantSalt: os.Getenv("PAYU_MERCHANT_SALT"),
 		BaseURL:      os.Getenv("PAYU_BASE_URL"),
+		PaymentURL:   os.Getenv("PAYU_PAYMENT_URL"),
+		ReturnURL:    os.Getenv("PAYU_RETURN_URL"),
 		Timeout:      cfg.Gateway.HTTPTimeout,
 	}))
 	return registry

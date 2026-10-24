@@ -3,6 +3,8 @@ package transaction_test
 import . "samarth/payment-service/internal/domain/transaction"
 
 import (
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,30 @@ import (
 
 func validNewArgs() (uuid.UUID, int64, string, PaymentMethod, string, uuid.UUID, string, string, map[string]any, int) {
 	return uuid.New(), 150000, "INR", PaymentMethodCard, "razorpay", uuid.New(), "buyer@example.com", "order #42", nil, 30
+}
+
+func TestValidateMetadata_Boundary(t *testing.T) {
+	pad := func(n int) map[string]any {
+		overhead := len(`{"k":""}`)
+		return map[string]any{"k": strings.Repeat("x", n-overhead)}
+	}
+	if err := ValidateMetadata(pad(MaxMetadataBytes)); err != nil {
+		t.Fatalf("exactly %d bytes of JSON must be accepted, got %v", MaxMetadataBytes, err)
+	}
+	if err := ValidateMetadata(pad(MaxMetadataBytes + 1)); !errors.Is(err, ErrMetadataTooLarge) {
+		t.Fatalf("one byte over must be ErrMetadataTooLarge, got %v", err)
+	}
+	if err := ValidateMetadata(nil); err != nil {
+		t.Fatalf("no metadata is fine, got %v", err)
+	}
+}
+
+func TestNew_RejectsOversizedMetadata(t *testing.T) {
+	merchant, amount, currency, method, gw, customer, email, desc, _, timeout := validNewArgs()
+	big := map[string]any{"k": strings.Repeat("x", MaxMetadataBytes)}
+	if _, err := New(merchant, amount, currency, method, gw, customer, email, desc, big, timeout); !errors.Is(err, ErrMetadataTooLarge) {
+		t.Fatalf("expected ErrMetadataTooLarge, got %v", err)
+	}
 }
 
 func TestNew_Valid(t *testing.T) {

@@ -31,6 +31,18 @@ func TestParseWebhook_Valid(t *testing.T) {
 	}
 }
 
+func TestParseWebhook_CarriesTheCapturedAmount(t *testing.T) {
+	a := New(Config{})
+	body := []byte(`{"event":"payment.captured","payload":{"payment":{"entity":{"id":"pay_1","order_id":"order_1","status":"captured","amount":150000,"currency":"inr"}}}}`)
+	ev, err := a.ParseWebhook(body, map[string]string{"X-Razorpay-Signature": rzpSig("whsec", body)}, "whsec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Amount != 150000 || ev.Currency != "INR" {
+		t.Fatalf("the webhook's captured amount and currency must reach the service, got %d %q", ev.Amount, ev.Currency)
+	}
+}
+
 func TestParseWebhook_CarriesTransactionIDFromNotes(t *testing.T) {
 	const id = "0b7c3a52-6a3e-4c1f-9d2e-6f1a2b3c4d5e"
 	cases := map[string]string{

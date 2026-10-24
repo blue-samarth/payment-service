@@ -161,9 +161,11 @@ func (o *fakeOutbox) Write(ctx context.Context, event ports.OutboxEvent) error {
 type fakeRouter struct {
 	decision *routing.Decision
 	err      error
+	inputs   []RouteInput
 }
 
 func (r *fakeRouter) Route(ctx context.Context, in RouteInput) (*routing.Decision, error) {
+	r.inputs = append(r.inputs, in)
 	return r.decision, r.err
 }
 
@@ -223,8 +225,6 @@ func validInput() CreatePaymentInput {
 		CustomerID:    uuid.New(),
 		CustomerEmail: "buyer@example.com",
 		Description:   "order #42",
-		MerchantTier:  "standard",
-		IsDomestic:    true,
 	}
 }
 
@@ -285,6 +285,38 @@ func TestCreatePayment_RoutingAndConfigReadsRunOutsideTheReservation(t *testing.
 	}
 	if router.insideTx || config.insideTx {
 		t.Fatal("routing and config reads take their own pool connections; inside the reservation transaction, concurrent creates each hold one connection while waiting for a second, and the pool deadlocks")
+	}
+}
+
+func TestCreatePayment_RoutingTierAndDomesticComeFromTheServer(t *testing.T) {
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "stripe"}}
+	svc := newTestService(&fakeRepo{}, &fakeOutbox{}, router, &fakeConfig{timeout: 30 * time.Second}, &fakeTransactor{})
+	in := validInput()
+	in.Currency = "USD"
+	svc.SetMerchantTiers(StaticMerchantTiers{in.MerchantID.String(): "enterprise"})
+
+	if _, err := svc.CreatePayment(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	got := router.inputs[0]
+	if got.MerchantTier != "enterprise" {
+		t.Errorf("the tier must be the merchant's configured tier, got %q", got.MerchantTier)
+	}
+	if got.IsDomestic {
+		t.Error("a USD payment is not domestic; the flag must be derived from the currency, not the client")
+	}
+}
+
+func TestCreatePayment_UnconfiguredMerchantGetsTheDefaultTier(t *testing.T) {
+	router := &fakeRouter{decision: &routing.Decision{SelectedGateway: "stripe"}}
+	svc := newTestService(&fakeRepo{}, &fakeOutbox{}, router, &fakeConfig{timeout: 30 * time.Second}, &fakeTransactor{})
+	svc.SetMerchantTiers(StaticMerchantTiers{})
+
+	if _, err := svc.CreatePayment(context.Background(), validInput()); err != nil {
+		t.Fatal(err)
+	}
+	if router.inputs[0].MerchantTier != "" || !router.inputs[0].IsDomestic {
+		t.Fatalf("an unlisted merchant routes with the default weights, and INR is domestic; got %+v", router.inputs[0])
 	}
 }
 

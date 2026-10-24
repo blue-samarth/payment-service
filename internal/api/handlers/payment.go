@@ -33,20 +33,19 @@ type createPaymentRequest struct {
 	CustomerEmail string         `json:"customer_email"`
 	Description   string         `json:"description"`
 	Metadata      map[string]any `json:"metadata"`
-	MerchantTier  string         `json:"merchant_tier"`
-	IsDomestic    bool           `json:"is_domestic"`
 }
 
 type paymentResponse struct {
-	ID                 string `json:"id"`
-	Status             string `json:"status"`
-	Amount             int64  `json:"amount"`
-	Currency           string `json:"currency"`
-	PaymentMethod      string `json:"payment_method"`
-	Gateway            string `json:"gateway"`
-	GatewayReferenceID string `json:"gateway_reference_id,omitempty"`
-	ReviewRequired     bool   `json:"review_required,omitempty"`
-	CreatedAt          string `json:"created_at"`
+	ID                 string                  `json:"id"`
+	Status             string                  `json:"status"`
+	Amount             int64                   `json:"amount"`
+	Currency           string                  `json:"currency"`
+	PaymentMethod      string                  `json:"payment_method"`
+	Gateway            string                  `json:"gateway"`
+	GatewayReferenceID string                  `json:"gateway_reference_id,omitempty"`
+	ReviewRequired     bool                    `json:"review_required,omitempty"`
+	NextAction         *transaction.NextAction `json:"next_action,omitempty"`
+	CreatedAt          string                  `json:"created_at"`
 }
 
 func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
@@ -71,6 +70,10 @@ func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Currency == "" || req.PaymentMethod == "" {
 		writeError(w, http.StatusBadRequest, "missing_fields", "currency and payment_method are required")
+		return
+	}
+	if err := transaction.ValidateMetadata(req.Metadata); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
 		return
 	}
 
@@ -98,12 +101,12 @@ func (h *PaymentHandler) Create(w http.ResponseWriter, r *http.Request) {
 		CustomerEmail:  req.CustomerEmail,
 		Description:    req.Description,
 		Metadata:       req.Metadata,
-		MerchantTier:   req.MerchantTier,
-		IsDomestic:     req.IsDomestic,
 		IdempotencyKey: idemKey,
 	})
 	if err != nil {
 		switch {
+		case errors.Is(err, transaction.ErrMetadataTooLarge):
+			writeError(w, http.StatusBadRequest, "invalid_metadata", err.Error())
 		case errors.Is(err, authz.ErrDenied):
 			writeError(w, http.StatusForbidden, "merchant_mismatch", "merchant_id does not match the authenticated merchant")
 		case errors.Is(err, payment.ErrNoGateway):
@@ -160,6 +163,13 @@ func (h *PaymentHandler) Get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toPaymentResponse(txn))
 }
 
+func nextActionWhileAwaiting(t *transaction.Transaction) *transaction.NextAction {
+	if !t.AwaitingCustomer() {
+		return nil
+	}
+	return t.NextAction
+}
+
 func toPaymentResponse(t *transaction.Transaction) paymentResponse {
 	return paymentResponse{
 		ID:                 t.ID.String(),
@@ -170,6 +180,7 @@ func toPaymentResponse(t *transaction.Transaction) paymentResponse {
 		Gateway:            t.ProcessingGateway(),
 		GatewayReferenceID: t.GatewayReferenceID,
 		ReviewRequired:     t.Status == transaction.StatusProcessing && t.ReviewRequiredAt != nil,
+		NextAction:         nextActionWhileAwaiting(t),
 		CreatedAt:          t.CreatedAt.Format("2006-01-02T15:04:05.999999999Z07:00"),
 	}
 }

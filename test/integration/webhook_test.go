@@ -49,7 +49,7 @@ func TestWebhook_ResolvesProcessingTransaction(t *testing.T) {
 	)
 
 	out, err := svc.Process(ctx, "razorpay", appwebhook.Event{
-		EventID: "evt_int_1", GatewayReferenceID: "order_int", Status: "success",
+		EventID: "evt_int_1", GatewayReferenceID: "order_int", Status: "success", Amount: 150000, Currency: "INR",
 	}, []byte(`{"raw":"payload"}`))
 	if err != nil {
 		t.Fatalf("process: %v", err)
@@ -75,7 +75,7 @@ func TestWebhook_ResolvesProcessingTransaction(t *testing.T) {
 
 	// Replaying the same event must be an idempotent no-op.
 	again, err := svc.Process(ctx, "razorpay", appwebhook.Event{
-		EventID: "evt_int_1", GatewayReferenceID: "order_int", Status: "success",
+		EventID: "evt_int_1", GatewayReferenceID: "order_int", Status: "success", Amount: 150000, Currency: "INR",
 	}, []byte(`{"raw":"payload"}`))
 	if err != nil {
 		t.Fatal(err)

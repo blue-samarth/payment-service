@@ -21,6 +21,8 @@ type GatewayWebhookEvent struct {
 	GatewayReferenceID string
 	TransactionID      string
 	Status             GatewayPaymentStatus
+	Amount             int64
+	Currency           string
 }
 
 type GatewayWebhookParser interface {
@@ -148,6 +150,7 @@ type GatewayPaymentResponse struct {
 	MethodResponse     GatewayMethodResponse
 	RawMetadata        map[string]any
 	GatewayFees        int64
+	NextAction         *transaction.NextAction
 }
 type GatewayRefundResponse struct {
 	GatewayRefundID string

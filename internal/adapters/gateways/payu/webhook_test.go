@@ -36,6 +36,9 @@ func TestParseWebhook_Valid(t *testing.T) {
 	if ev.GatewayReferenceID != "TXN-1" || ev.EventID != "403993" || ev.Status != ports.GatewayPaymentStatusSucceeded {
 		t.Errorf("unexpected event: %+v", ev)
 	}
+	if ev.Amount != 150000 || ev.Currency != "INR" {
+		t.Errorf("PayU's amount is in rupees and must reach the service as paise in INR, got %d %q", ev.Amount, ev.Currency)
+	}
 }
 
 func TestParseWebhook_BadHash(t *testing.T) {

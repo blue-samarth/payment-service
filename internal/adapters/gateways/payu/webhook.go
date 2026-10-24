@@ -42,7 +42,10 @@ func (a *Adapter) ParseWebhook(body []byte, headers map[string]string, secret st
 	return &ports.GatewayWebhookEvent{
 		EventID:            eventID,
 		GatewayReferenceID: txnid,
+		TransactionID:      form.Get("udf1"),
 		Status:             mapStatus(form.Get("status")),
+		Amount:             rupeesToPaise(form.Get("amount")),
+		Currency:           "INR",
 	}, nil
 }
 

@@ -17,6 +17,7 @@ type fakeTxns struct {
 	byID    *transaction.Transaction
 	updates int
 	saved   []transaction.Transaction
+	reviews []string
 }
 
 func (f *fakeTxns) GetByGatewayReference(context.Context, string, string) (*transaction.Transaction, error) {
@@ -32,6 +33,10 @@ func (f *fakeTxns) UpdateStatus(_ context.Context, t *transaction.Transaction) e
 	f.updates++
 	f.saved = append(f.saved, *t)
 	return nil
+}
+func (f *fakeTxns) MarkReviewRequired(_ context.Context, _ uuid.UUID, reason string) (bool, error) {
+	f.reviews = append(f.reviews, reason)
+	return true, nil
 }
 
 type fakeWebhooks struct {
@@ -75,6 +80,112 @@ func (noopMetrics) Increment(string, map[string]string)          {}
 func (noopMetrics) Histogram(string, float64, map[string]string) {}
 func (noopMetrics) Gauge(string, float64, map[string]string)     {}
 
+type countingMetrics struct{ counts map[string]int }
+
+func (m *countingMetrics) Increment(name string, tags map[string]string) {
+	m.counts[name+"/"+tags["reason"]]++
+}
+func (m *countingMetrics) Histogram(string, float64, map[string]string) {}
+func (m *countingMetrics) Gauge(string, float64, map[string]string)     {}
+
+func TestProcess_CaptureThatDoesNotMatchThePaymentGoesToReview(t *testing.T) {
+	for name, tc := range map[string]struct {
+		amount   int64
+		currency string
+		reason   string
+	}{
+		"amount differs":   {149999, "INR", "webhook_amount_mismatch"},
+		"currency differs": {150000, "USD", "webhook_currency_mismatch"},
+		"amount missing":   {0, "INR", "webhook_amount_missing"},
+		"currency missing": {150000, "", "webhook_currency_missing"},
+	} {
+		txn := processingTxn()
+		txns := &fakeTxns{txn: txn}
+		outbox := &fakeOutbox{}
+		metrics := &countingMetrics{counts: map[string]int{}}
+		s := NewService(txns, &fakeWebhooks{recorded: true}, outbox, fakeTransactor{}, noopLogger{}, metrics)
+
+		out, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_1", Status: "success", Amount: tc.amount, Currency: tc.currency}, []byte(`{}`))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !out.Mismatch || out.Resolved || txn.Status != transaction.StatusProcessing || len(outbox.events) != 0 {
+			t.Errorf("%s: a signed capture that doesn't match must never mark the payment SUCCEEDED, got %+v status=%s events=%d", name, out, txn.Status, len(outbox.events))
+		}
+		if len(txns.reviews) != 1 || txns.reviews[0] != tc.reason {
+			t.Errorf("%s: expected a review mark %q, got %v", name, tc.reason, txns.reviews)
+		}
+		if metrics.counts[ports.MetricWebhookCaptureMismatch+"/"+tc.reason] != 1 {
+			t.Errorf("%s: expected the mismatch to be counted, got %v", name, metrics.counts)
+		}
+	}
+}
+
+func failedTxn() *transaction.Transaction {
+	t := processingTxn()
+	t.Status = transaction.StatusFailed
+	t.FailureReason = &transaction.FailureReason{Category: "gateway_declined", Source: transaction.FailureReasonSourceGateway}
+	return t
+}
+
+func TestProcess_LateCaptureAfterFailedSettlesTheCharge(t *testing.T) {
+	txn := failedTxn()
+	txns := &fakeTxns{txn: txn}
+	outbox := &fakeOutbox{}
+	metrics := &countingMetrics{counts: map[string]int{}}
+	s := NewService(txns, &fakeWebhooks{recorded: true}, outbox, fakeTransactor{}, noopLogger{}, metrics)
+
+	out, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_1", Status: "success", Amount: 150000, Currency: "INR"}, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Resolved || txn.Status != transaction.StatusSucceeded || txn.FailureReason != nil {
+		t.Fatalf("the customer was charged, so the payment must become SUCCEEDED, got %+v status=%s reason=%+v", out, txn.Status, txn.FailureReason)
+	}
+	if len(outbox.events) != 1 || outbox.events[0].EventType != ports.EventTypePaymentSucceeded {
+		t.Fatalf("expected a PAYMENT_SUCCEEDED event, got %+v", outbox.events)
+	}
+	if metrics.counts[ports.MetricTransactionLateCapture+"/"] != 1 {
+		t.Fatalf("a late capture must raise an alert, got %v", metrics.counts)
+	}
+}
+
+func TestProcess_LateCaptureThatDoesNotMatchStaysFailed(t *testing.T) {
+	txn := failedTxn()
+	txns := &fakeTxns{txn: txn}
+	outbox := &fakeOutbox{}
+	metrics := &countingMetrics{counts: map[string]int{}}
+	s := NewService(txns, &fakeWebhooks{recorded: true}, outbox, fakeTransactor{}, noopLogger{}, metrics)
+
+	out, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_1", Status: "success", Amount: 1, Currency: "INR"}, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Mismatch || txn.Status != transaction.StatusFailed || len(outbox.events) != 0 {
+		t.Fatalf("a mismatched late capture must stay FAILED for a person, got %+v status=%s", out, txn.Status)
+	}
+	if len(txns.reviews) != 0 {
+		t.Fatal("the review mark is only for PROCESSING payments, which the resolve endpoint can settle")
+	}
+	if metrics.counts[ports.MetricWebhookCaptureMismatch+"/webhook_amount_mismatch"] != 1 {
+		t.Fatalf("it must still raise the mismatch alert, got %v", metrics.counts)
+	}
+}
+
+func TestProcess_LateFailureAfterFailedIsANoOp(t *testing.T) {
+	txn := failedTxn()
+	txns := &fakeTxns{txn: txn}
+	outbox := &fakeOutbox{}
+	s := NewService(txns, &fakeWebhooks{recorded: true}, outbox, fakeTransactor{}, noopLogger{}, noopMetrics{})
+
+	if _, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_1", Status: "failed"}, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	if txns.updates != 0 || len(outbox.events) != 0 {
+		t.Fatal("only a capture reopens a FAILED payment")
+	}
+}
+
 func processingTxn() *transaction.Transaction {
 	t, _ := transaction.New(uuid.New(), 150000, "INR", transaction.PaymentMethodCard, "razorpay", uuid.New(), "b@e.com", "o", nil, 30)
 	t.Status = transaction.StatusProcessing
@@ -89,7 +200,7 @@ func TestProcess_ResolvesProcessingToSucceeded(t *testing.T) {
 	outbox := &fakeOutbox{}
 	s := NewService(txns, webhooks, outbox, fakeTransactor{}, noopLogger{}, noopMetrics{})
 
-	out, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_1", Status: "success"}, []byte(`{}`))
+	out, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_1", Status: "success", Amount: 150000, Currency: "INR"}, []byte(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +221,7 @@ func TestProcess_DuplicateIsNoop(t *testing.T) {
 	outbox := &fakeOutbox{}
 	s := NewService(txns, webhooks, outbox, fakeTransactor{}, noopLogger{}, noopMetrics{})
 
-	out, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_1", Status: "success"}, []byte(`{}`))
+	out, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_1", Status: "success", Amount: 150000, Currency: "INR"}, []byte(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +256,7 @@ func TestProcess_MatchesByTransactionIDWhenTheReferenceWasNeverSaved(t *testing.
 	outbox := &fakeOutbox{}
 	s := NewService(txns, &fakeWebhooks{recorded: true}, outbox, fakeTransactor{}, noopLogger{}, noopMetrics{})
 
-	out, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_9", TransactionID: txn.ID.String(), Status: "success"}, []byte(`{}`))
+	out, err := s.Process(context.Background(), "razorpay", Event{EventID: "evt", GatewayReferenceID: "order_9", TransactionID: txn.ID.String(), Status: "success", Amount: 150000, Currency: "INR"}, []byte(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +301,7 @@ func TestProcess_TransactionIDFallbackRefusesMismatches(t *testing.T) {
 			txns := &fakeTxns{byID: tc.txn}
 			s := NewService(txns, &fakeWebhooks{recorded: true}, &fakeOutbox{}, fakeTransactor{}, noopLogger{}, noopMetrics{})
 
-			out, err := s.Process(context.Background(), tc.gateway, Event{EventID: "evt", GatewayReferenceID: "order_9", TransactionID: tc.txID(tc.txn), Status: "success"}, []byte(`{}`))
+			out, err := s.Process(context.Background(), tc.gateway, Event{EventID: "evt", GatewayReferenceID: "order_9", TransactionID: tc.txID(tc.txn), Status: "success", Amount: 150000, Currency: "INR"}, []byte(`{}`))
 			if err != nil {
 				t.Fatal(err)
 			}

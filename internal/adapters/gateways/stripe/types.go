@@ -7,6 +7,7 @@ type stripePaymentIntent struct {
 	Status           string            `json:"status"`
 	Amount           int64             `json:"amount"`
 	Currency         string            `json:"currency"`
+	ClientSecret     string            `json:"client_secret"`
 	Metadata         map[string]string `json:"metadata"`
 	LastPaymentError *stripeError      `json:"last_payment_error"`
 	LatestCharge     json.RawMessage   `json:"latest_charge"`

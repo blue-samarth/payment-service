@@ -28,6 +28,7 @@ func validatableConfig() *Config {
 	c.RateLimit.WebhookRefillPerSec = 100
 	c.Routing.FXReconciliationTolerancePct = 1.0
 	c.Gateway.HTTPTimeout = 30 * time.Second
+	c.Gateway.CustomerActionTimeout = 30 * time.Minute
 	c.Gateway.MaxAttempts = 3
 	c.Gateway.CircuitBreakerFailureThreshold = 5
 	c.App.ShutdownDrainDelay = 5 * time.Second
@@ -76,7 +77,7 @@ func setRequiredEnv(t *testing.T) {
 	for _, k := range []string{
 		"REDIS_TLS_ENABLED", "REDIS_USERNAME", "REDIS_PASSWORD", "REDIS_RATE_LIMIT_DB", "REDIS_STATE_DB", "REDIS_CACHE_DB",
 		"PORT", "WEBHOOK_PORT", "HEALTH_PORT", "WEBHOOK_TLS_MODE",
-		"SERVICE_TOKENS", "OPS_TOKENS", "WEBHOOK_SECRETS", "TRUSTED_PROXY_CIDRS",
+		"SERVICE_TOKENS", "OPS_TOKENS", "WEBHOOK_SECRETS", "TRUSTED_PROXY_CIDRS", "MERCHANT_TIERS",
 		"RATE_LIMIT_CAPACITY", "RATE_LIMIT_REFILL_PER_SEC", "CIRCUIT_BREAKER_FAILURE_THRESHOLD",
 		"AUTH_FAILURE_LIMIT_CAPACITY", "AUTH_FAILURE_REFILL_PER_SEC",
 		"RATE_LIMIT_USER_CAPACITY", "RATE_LIMIT_USER_REFILL_PER_SEC",
@@ -163,6 +164,14 @@ func TestValidate_RefundRecoveryMinAgeCoversTwoGatewayCalls(t *testing.T) {
 	c.Jobs.RefundRecoveryMinAgeSec = 91
 	if err := Validate(c); err != nil {
 		t.Fatalf("91s should validate, got %v", err)
+	}
+}
+
+func TestValidate_CustomerActionWindowMustExceedTheGatewayBudget(t *testing.T) {
+	c := validatableConfig()
+	c.Gateway.CustomerActionTimeout = c.Gateway.Budget()
+	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "CUSTOMER_ACTION_TIMEOUT_SEC") {
+		t.Fatalf("expected the customer window to be checked against the gateway budget, got %v", err)
 	}
 }
 
@@ -272,6 +281,29 @@ func TestLoadConfig_InvalidLegacyRedisCacheDBFails(t *testing.T) {
 	t.Setenv("REDIS_CACHE_DB", "two")
 	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "REDIS_CACHE_DB") {
 		t.Fatalf("a malformed legacy value must still fail instead of defaulting, got: %v", err)
+	}
+}
+
+func TestLoadConfig_MerchantTiers(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("MERCHANT_TIERS", "0B7C3A52-6A3E-4C1F-9D2E-6F1A2B3C4D5E=enterprise, 5f0d9e7a-1b2c-4d3e-8f4a-9b0c1d2e3f4a=standard")
+	c, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Gateway.MerchantTiers["0b7c3a52-6a3e-4c1f-9d2e-6f1a2b3c4d5e"] != "enterprise" || c.Gateway.MerchantTiers["5f0d9e7a-1b2c-4d3e-8f4a-9b0c1d2e3f4a"] != "standard" {
+		t.Fatalf("merchants must be stored in canonical UUID form, got %v", c.Gateway.MerchantTiers)
+	}
+
+	for name, raw := range map[string]string{
+		"not a uuid": "merchant-a=enterprise",
+		"no tier":    "0b7c3a52-6a3e-4c1f-9d2e-6f1a2b3c4d5e=",
+		"repeated":   "0b7c3a52-6a3e-4c1f-9d2e-6f1a2b3c4d5e=a,0B7C3A52-6A3E-4C1F-9D2E-6F1A2B3C4D5E=b",
+	} {
+		t.Setenv("MERCHANT_TIERS", raw)
+		if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "MERCHANT_TIERS entry") {
+			t.Errorf("%s: expected a MERCHANT_TIERS error, got %v", name, err)
+		}
 	}
 }
 

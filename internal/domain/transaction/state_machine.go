@@ -19,7 +19,7 @@ var transitionTable = map[Status][]Status{
 	StatusPending:      {StatusProcessing, StatusCancelled, StatusFailed},
 	StatusProcessing:   {StatusSucceeded, StatusFailed},
 	StatusSucceeded:    {StatusRefunded, StatusRefundFailed},
-	StatusFailed:       {StatusCancelled},
+	StatusFailed:       {StatusCancelled, StatusSucceeded},
 	StatusRefundFailed: {StatusRefunded},
 	StatusCancelled:    {},
 	StatusRefunded:     {},

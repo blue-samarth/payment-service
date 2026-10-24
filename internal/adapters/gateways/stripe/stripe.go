@@ -19,19 +19,21 @@ import (
 )
 
 type Config struct {
-	APIKey     string
-	BaseURL    string
-	Timeout    time.Duration
-	HTTPClient *http.Client
+	APIKey         string
+	PublishableKey string
+	BaseURL        string
+	Timeout        time.Duration
+	HTTPClient     *http.Client
 }
 
 const maxResponseBytes = 2 << 20
 const defaultHTTPTimeout = 30 * time.Second
 
 type Adapter struct {
-	apiKey  string
-	baseURL string
-	client  *http.Client
+	apiKey         string
+	publishableKey string
+	baseURL        string
+	client         *http.Client
 }
 
 func New(cfg Config) *Adapter {
@@ -48,9 +50,10 @@ func New(cfg Config) *Adapter {
 		client = &http.Client{Timeout: timeout}
 	}
 	return &Adapter{
-		apiKey:  cfg.APIKey,
-		baseURL: strings.TrimRight(base, "/"),
-		client:  client,
+		apiKey:         cfg.APIKey,
+		publishableKey: cfg.PublishableKey,
+		baseURL:        strings.TrimRight(base, "/"),
+		client:         client,
 	}
 }
 
@@ -80,6 +83,7 @@ func (a *Adapter) InitiatePayment(ctx context.Context, req ports.GatewayPaymentR
 		form.Set("receipt_email", req.CustomerEmail)
 	}
 	form.Set("metadata[transaction_id]", req.TransactionID.String())
+	form.Set("automatic_payment_methods[enabled]", "true")
 	form.Add("expand[]", "latest_charge")
 	form.Add("expand[]", "latest_charge.balance_transaction")
 
@@ -87,7 +91,15 @@ func (a *Adapter) InitiatePayment(ctx context.Context, req ports.GatewayPaymentR
 	if err := a.do(ctx, http.MethodPost, "/v1/payment_intents", form, idem, &pi); err != nil {
 		return nil, err
 	}
-	return toPaymentResponse(&pi), nil
+	resp := toPaymentResponse(&pi)
+	if resp.Status == ports.GatewayPaymentStatusPending && pi.ClientSecret != "" {
+		params := map[string]string{"client_secret": pi.ClientSecret, "payment_intent_id": pi.ID}
+		if a.publishableKey != "" {
+			params["publishable_key"] = a.publishableKey
+		}
+		resp.NextAction = &transaction.NextAction{Type: transaction.NextActionStripePaymentElement, Params: params}
+	}
+	return resp, nil
 }
 
 func (a *Adapter) CheckStatus(ctx context.Context, req ports.GatewayStatusRequest) (*ports.GatewayPaymentResponse, error) {

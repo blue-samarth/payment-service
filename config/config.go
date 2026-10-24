@@ -218,6 +218,8 @@ type GatewayConfig struct {
 	HTTPTimeout                    time.Duration
 	MaxAttempts                    int
 	CircuitBreakerFailureThreshold int
+	MerchantTiers                  map[string]string
+	CustomerActionTimeout          time.Duration
 }
 
 func (g GatewayConfig) Budget() time.Duration {
@@ -389,6 +391,8 @@ func LoadConfig() (*Config, error) {
 
 	c.Gateway.HTTPTimeout = getEnvDuration("GATEWAY_HTTP_TIMEOUT", 30*time.Second, &errs)
 	c.Gateway.MaxAttempts = getEnvInt("GATEWAY_MAX_ATTEMPTS", 3, &errs)
+	c.Gateway.MerchantTiers = parseMerchantTiers(os.Getenv("MERCHANT_TIERS"), &errs)
+	c.Gateway.CustomerActionTimeout = time.Duration(getEnvInt("CUSTOMER_ACTION_TIMEOUT_SEC", 1800, &errs)) * time.Second
 	c.Gateway.CircuitBreakerFailureThreshold = getEnvInt("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 5, &errs)
 	c.App.ShutdownTimeout = getEnvDuration("SHUTDOWN_TIMEOUT", c.Gateway.Budget()+ShutdownTimeoutMargin, &errs)
 
@@ -582,6 +586,9 @@ func Validate(c *Config) error {
 	if c.Gateway.HTTPTimeout <= 0 {
 		errs = append(errs, "GATEWAY_HTTP_TIMEOUT must be greater than 0")
 	}
+	if c.Gateway.CustomerActionTimeout <= c.Gateway.Budget() {
+		errs = append(errs, fmt.Sprintf("CUSTOMER_ACTION_TIMEOUT_SEC (%s) must exceed the gateway budget GATEWAY_HTTP_TIMEOUT*GATEWAY_MAX_ATTEMPTS (%s): it is how long a customer has to complete the payment", c.Gateway.CustomerActionTimeout, c.Gateway.Budget()))
+	}
 	minAge := time.Duration(c.Jobs.RefundRecoveryMinAgeSec) * time.Second
 	if inFlight := 2*c.Gateway.HTTPTimeout + 30*time.Second; minAge <= inFlight {
 		errs = append(errs, fmt.Sprintf("REFUND_RECOVERY_MIN_AGE_SEC (%s) must exceed 2 x GATEWAY_HTTP_TIMEOUT + 30s (%s): an API refund on Razorpay or PayU makes two gateway calls, and recovery must not check a refund whose refund call may still be in flight", minAge, inFlight))
@@ -661,6 +668,28 @@ func parseServiceTokens(raw string, errs *[]string) map[string]string {
 			continue
 		}
 		out[token] = merchant.String()
+	}
+	return out
+}
+
+func parseMerchantTiers(raw string, errs *[]string) map[string]string {
+	out := map[string]string{}
+	for i, entry := range splitList(raw) {
+		sep := strings.Index(entry, "=")
+		if sep <= 0 || sep == len(entry)-1 {
+			*errs = append(*errs, fmt.Sprintf("MERCHANT_TIERS entry %d must be merchantID=tier", i+1))
+			continue
+		}
+		merchant, err := uuid.Parse(entry[:sep])
+		if err != nil {
+			*errs = append(*errs, fmt.Sprintf("MERCHANT_TIERS entry %d: merchant ID must be a UUID", i+1))
+			continue
+		}
+		if _, dup := out[merchant.String()]; dup {
+			*errs = append(*errs, fmt.Sprintf("MERCHANT_TIERS entry %d repeats an earlier merchant", i+1))
+			continue
+		}
+		out[merchant.String()] = entry[sep+1:]
 	}
 	return out
 }

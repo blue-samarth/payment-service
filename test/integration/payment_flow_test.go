@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -19,6 +20,7 @@ import (
 	"samarth/payment-service/internal/app/authz"
 	"samarth/payment-service/internal/app/payment"
 	approuting "samarth/payment-service/internal/app/routing"
+	appwebhook "samarth/payment-service/internal/app/webhook"
 	"samarth/payment-service/internal/domain/transaction"
 	"samarth/payment-service/internal/ports"
 	"samarth/payment-service/internal/testsupport"
@@ -52,8 +54,6 @@ func cardInput() payment.CreatePaymentInput {
 		PaymentMethod: transaction.PaymentMethodCard,
 		CustomerEmail: "buyer@example.com",
 		Description:   "integration order",
-		MerchantTier:  "standard",
-		IsDomestic:    true,
 	}
 }
 
@@ -130,6 +130,55 @@ func TestPaymentFlow_SuccessEndToEnd(t *testing.T) {
 	types := outboxEventTypes(t, pg)
 	if len(types) != 2 || !contains(types, ports.EventTypePaymentCreated) || !contains(types, ports.EventTypePaymentSucceeded) {
 		t.Errorf("expected PAYMENT_CREATED + PAYMENT_SUCCEEDED in outbox, got %v", types)
+	}
+}
+
+func TestPaymentFlow_ClientConfirmationEndToEnd(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "transactions", "processing_lease", "outbox_events", "webhook_events", "transaction_raw_metadata")
+	testsupport.SeedStripeCardGateway(t, pg)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"id":"pi_client","status":"requires_payment_method","amount":150000,"currency":"inr","client_secret":"pi_client_secret_x"}`))
+	}))
+	defer srv.Close()
+
+	svc := buildService(pg, srv.URL)
+	svc.SetCustomerActionWindow(30 * time.Minute)
+	ctx := context.Background()
+
+	created, err := svc.CreatePayment(ctx, cardInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	processed, err := svc.ProcessPayment(ctx, created.Transaction.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !processed.AwaitingCustomer() || processed.NextAction.Params["client_secret"] != "pi_client_secret_x" {
+		t.Fatalf("the merchant needs the client secret to show the payment form, got %s %+v", processed.Status, processed.NextAction)
+	}
+
+	repo := postgres.NewTransactionRepository(pg.DB, pg.Q)
+	reloaded, err := repo.GetByID(ctx, created.Transaction.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reloaded.AwaitingCustomer() || *reloaded.ProcessingTimeout != 30*time.Minute {
+		t.Fatalf("a replay or GET must be able to return the action, and the reaper must wait out the window; got %+v timeout=%v", reloaded.NextAction, reloaded.ProcessingTimeout)
+	}
+
+	webhooks := appwebhook.NewService(repo, postgres.NewWebhookRepository(pg.DB, pg.Q), postgres.NewOutboxWriter(pg.DB, pg.Q), postgres.NewTransactor(pg.DB), discardLogger(), observability.NewNoopMetrics())
+	out, err := webhooks.Process(ctx, "stripe", appwebhook.Event{EventID: "evt_client", GatewayReferenceID: "pi_client", Status: "succeeded", Amount: 150000, Currency: "INR"}, []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.Resolved || out.Status != transaction.StatusSucceeded {
+		t.Fatalf("the customer's payment must settle through the webhook, got %+v", out)
+	}
+	settled, _ := repo.GetByID(ctx, created.Transaction.ID)
+	if settled.AwaitingCustomer() {
+		t.Fatal("a settled payment no longer waits on the customer")
 	}
 }
 

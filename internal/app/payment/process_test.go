@@ -331,6 +331,7 @@ func TestProcessPayment_FallsBackToSecondGatewayOnSoftDecline(t *testing.T) {
 
 	svc := NewService(repo, &fakeOutbox{}, router, &fakeConfig{}, &fakeTransactor{}, &fakeLease{acquired: true}, reg, noopLogger{}, noopMetrics{})
 	svc.SetMaxGatewayAttempts(2)
+	svc.SetMerchantTiers(StaticMerchantTiers{txn.MerchantID.String(): "enterprise"})
 
 	got, err := svc.ProcessPayment(context.Background(), txn.ID)
 	if err != nil {
@@ -341,6 +342,9 @@ func TestProcessPayment_FallsBackToSecondGatewayOnSoftDecline(t *testing.T) {
 	}
 	if got.ActualGateway != "razorpay" || got.GatewayReferenceID != "pi_fb" {
 		t.Errorf("expected the second gateway to settle the payment, got gateway=%q ref=%q", got.ActualGateway, got.GatewayReferenceID)
+	}
+	if len(router.inputs) != 1 || router.inputs[0].MerchantTier != "enterprise" {
+		t.Errorf("the fallback must route with the merchant's tier too, got %+v", router.inputs)
 	}
 }
 
@@ -412,6 +416,23 @@ func TestProcessPayment_NoFallbackOnGatewayError(t *testing.T) {
 	}
 	if got.GatewayReferenceID == "pi_fb" {
 		t.Error("the second gateway must not have been called after a GatewayError")
+	}
+	if got.Status != transaction.StatusProcessing {
+		t.Errorf("a 5xx may have charged the customer, so it must stay PROCESSING for the reaper rather than end FAILED, got %s", got.Status)
+	}
+}
+
+func TestRecoverExpiredLease_StatusCheck5xxStaysProcessing(t *testing.T) {
+	txn := processingExpiredTxn()
+	repo := seedRepo(txn)
+	svc := recoverService(repo, &fakeRegistry{adapter: &fakeAdapter{err: &ports.GatewayError{Category: ports.ErrorCategoryGatewayError, Code: "api_error"}}}, &fakeOutbox{})
+
+	got, err := svc.RecoverExpiredLease(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != transaction.StatusProcessing {
+		t.Fatalf("a 5xx on a status check says nothing about the payment; it used to finalize FAILED, got %s", got.Status)
 	}
 }
 
@@ -530,6 +551,102 @@ func TestProcessPayment_FallbackRecordsNextGatewayBeforeCallingIt(t *testing.T) 
 	}
 	if updatesBeforeSecondCall != 2 || repo.snapshots[1].ActualGateway != "razorpay" {
 		t.Fatalf("the switch to razorpay must be persisted before razorpay is called, updates=%d snapshots=%+v", updatesBeforeSecondCall, repo.snapshots)
+	}
+}
+
+func TestProcessPayment_CustomerActionIsSavedAndGetsItsOwnWindow(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	action := &transaction.NextAction{Type: transaction.NextActionStripePaymentElement, Params: map[string]string{"client_secret": "pi_1_secret"}}
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusPending, NextAction: action}}
+	svc := processService(repo, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter})
+	svc.SetCustomerActionWindow(30 * time.Minute)
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != transaction.StatusProcessing || !got.AwaitingCustomer() || got.NextAction.Params["client_secret"] != "pi_1_secret" {
+		t.Fatalf("the payment must wait on the customer with the action saved, got %s %+v", got.Status, got.NextAction)
+	}
+	if got.ProcessingTimeout == nil || *got.ProcessingTimeout != 30*time.Minute {
+		t.Fatalf("the reaper must leave it alone for the customer window, got %v", got.ProcessingTimeout)
+	}
+	if got.GatewayReferenceID != "pi_1" {
+		t.Fatalf("the reference must be saved for status checks and webhooks, got %q", got.GatewayReferenceID)
+	}
+}
+
+func TestProcessPayment_WindowNeverShortensTheLease(t *testing.T) {
+	txn := pendingTxn()
+	repo := seedRepo(txn)
+	adapter := &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_1", Status: ports.GatewayPaymentStatusPending, NextAction: &transaction.NextAction{Type: "x"}}}
+	svc := processService(repo, &fakeLease{acquired: true}, &fakeRegistry{adapter: adapter})
+
+	got, err := svc.ProcessPayment(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProcessingTimeout == nil || *got.ProcessingTimeout <= 0 {
+		t.Fatalf("with no window configured the original lease must stand, got %v", got.ProcessingTimeout)
+	}
+}
+
+func awaitingExpiredTxn() *transaction.Transaction {
+	t := processingExpiredTxn()
+	t.NextAction = &transaction.NextAction{Type: transaction.NextActionRazorpayCheckout, Params: map[string]string{"order_id": "order_1"}}
+	return t
+}
+
+func TestRecoverExpiredLease_AbandonedCustomerActionFails(t *testing.T) {
+	txn := awaitingExpiredTxn()
+	repo := seedRepo(txn)
+	outbox := &fakeOutbox{}
+	svc := recoverService(repo, &fakeRegistry{adapter: &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_stuck", Status: ports.GatewayPaymentStatusPending}}}, outbox)
+
+	got, err := svc.RecoverExpiredLease(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != transaction.StatusFailed || got.FailureReason == nil || got.FailureReason.Category != "customer_action_expired" {
+		t.Fatalf("a customer who never paid within the window ends the payment, instead of a status check every sweep forever; got %s %+v", got.Status, got.FailureReason)
+	}
+	if len(outbox.events) != 1 || outbox.events[0].EventType != ports.EventTypePaymentFailed {
+		t.Fatalf("expected PAYMENT_FAILED, got %+v", outbox.events)
+	}
+}
+
+func TestRecoverExpiredLease_CustomerActionInProgressKeepsWaiting(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status ports.GatewayPaymentStatus
+		want   transaction.Status
+	}{
+		"bank still processing": {ports.GatewayPaymentStatusProcessing, transaction.StatusProcessing},
+		"paid in the meantime":  {ports.GatewayPaymentStatusSucceeded, transaction.StatusSucceeded},
+	} {
+		txn := awaitingExpiredTxn()
+		repo := seedRepo(txn)
+		svc := recoverService(repo, &fakeRegistry{adapter: &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_stuck", Status: tc.status}}}, &fakeOutbox{})
+		got, err := svc.RecoverExpiredLease(context.Background(), txn.ID)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got.Status != tc.want {
+			t.Errorf("%s: got %s, want %s", name, got.Status, tc.want)
+		}
+	}
+}
+
+func TestRecoverExpiredLease_PendingWithoutACustomerActionIsNotAbandoned(t *testing.T) {
+	txn := processingExpiredTxn()
+	repo := seedRepo(txn)
+	svc := recoverService(repo, &fakeRegistry{adapter: &fakeAdapter{resp: &ports.GatewayPaymentResponse{GatewayReferenceID: "pi_stuck", Status: ports.GatewayPaymentStatusPending}}}, &fakeOutbox{})
+	got, err := svc.RecoverExpiredLease(context.Background(), txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != transaction.StatusProcessing {
+		t.Fatalf("only a payment that handed the customer an action can be abandoned, got %s", got.Status)
 	}
 }
 

@@ -201,6 +201,34 @@ func TestGet_NamesTheGatewayThatProcessedThePayment(t *testing.T) {
 	}
 }
 
+func TestGet_NextActionOnlyWhileAwaitingTheCustomer(t *testing.T) {
+	action := &transaction.NextAction{Type: transaction.NextActionRazorpayCheckout, Params: map[string]string{"order_id": "order_1"}}
+	for status, want := range map[transaction.Status]bool{
+		transaction.StatusProcessing: true,
+		transaction.StatusSucceeded:  false,
+		transaction.StatusFailed:     false,
+	} {
+		txn := sampleTxn(status)
+		txn.NextAction = action
+		h := NewPaymentHandler(&fakeService{fetched: txn})
+		req := anonymous(httptest.NewRequest(http.MethodGet, "/payments/"+txn.ID.String(), nil))
+		req.SetPathValue("id", txn.ID.String())
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+
+		var resp paymentResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if got := resp.NextAction != nil; got != want {
+			t.Errorf("%s: next_action present=%v, want %v", status, got, want)
+		}
+		if want && resp.NextAction.Params["order_id"] != "order_1" {
+			t.Errorf("%s: the client needs the action's parameters to continue, got %+v", status, resp.NextAction)
+		}
+	}
+}
+
 func TestGet_InvalidID(t *testing.T) {
 	h := NewPaymentHandler(&fakeService{})
 	req := anonymous(httptest.NewRequest(http.MethodGet, "/payments/bad", nil))
@@ -230,6 +258,52 @@ func TestGet_ErrorMapping(t *testing.T) {
 		if rec.Code != tc.want {
 			t.Errorf("%s: expected %d, got %d", name, tc.want, rec.Code)
 		}
+	}
+}
+
+type recordingCreate struct {
+	fakeService
+	calls int
+	got   payment.CreatePaymentInput
+}
+
+func (f *recordingCreate) CreatePayment(ctx context.Context, in payment.CreatePaymentInput) (payment.CreateResult, error) {
+	f.calls++
+	f.got = in
+	return f.fakeService.CreatePayment(ctx, in)
+}
+
+func TestCreate_OversizedMetadataIs400BeforeTheService(t *testing.T) {
+	svc := &recordingCreate{}
+	h := NewPaymentHandler(svc)
+	body := `{"merchant_id":"` + uuid.NewString() + `","amount":100,"currency":"INR","payment_method":"card","metadata":{"note":"` + strings.Repeat("x", transaction.MaxMetadataBytes) + `"}}`
+	rec := doRequest(h, http.MethodPost, "/payments", body)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_metadata") {
+		t.Fatalf("expected 400 invalid_metadata, got %d %s", rec.Code, rec.Body.String())
+	}
+	if svc.calls != 0 {
+		t.Fatal("oversized metadata must be refused before routing or the database")
+	}
+}
+
+func TestCreate_MetadataTooLargeFromTheStoreIs400(t *testing.T) {
+	h := NewPaymentHandler(&fakeService{createErr: fmt.Errorf("insert: %w", transaction.ErrMetadataTooLarge)})
+	rec := doRequest(h, http.MethodPost, "/payments", validBody())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("a metadata size violation must never surface as a 500, got %d", rec.Code)
+	}
+}
+
+func TestCreate_TierAndDomesticFromTheBodyAreIgnored(t *testing.T) {
+	svc := &recordingCreate{fakeService: fakeService{created: sampleTxn(transaction.StatusPending)}}
+	svc.fakeService.verdict = idempotency.Replayed
+	h := NewPaymentHandler(svc)
+	body := `{"merchant_id":"` + uuid.NewString() + `","amount":100,"currency":"USD","payment_method":"card","merchant_tier":"enterprise","is_domestic":true}`
+	if rec := doRequest(h, http.MethodPost, "/payments", body); rec.Code >= 400 {
+		t.Fatalf("old clients still sending these fields must keep working, got %d", rec.Code)
+	}
+	if svc.calls != 1 {
+		t.Fatal("expected the create to reach the service")
 	}
 }
 

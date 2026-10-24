@@ -139,7 +139,9 @@ func run() error {
 	router.SetProbeReader(cbStore)
 	paymentSvc.SetCallGate(cbStore)
 	paymentSvc.SetMaxGatewayAttempts(cfg.Gateway.MaxAttempts)
+	paymentSvc.SetMerchantTiers(payment.StaticMerchantTiers(cfg.Gateway.MerchantTiers))
 	paymentSvc.SetGatewayHTTPTimeout(cfg.Gateway.HTTPTimeout)
+	paymentSvc.SetCustomerActionWindow(cfg.Gateway.CustomerActionTimeout)
 
 	intentStore := redis.NewIntentStore(redisClient)
 	router.SetActiveIntents(intentStore)

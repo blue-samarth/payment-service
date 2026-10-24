@@ -1,6 +1,7 @@
 package transaction
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -84,6 +85,7 @@ type Transaction struct {
 	UpdatedAt               time.Time
 	ReviewRequiredAt        *time.Time
 	ReviewReason            string
+	NextAction              *NextAction
 }
 
 const (
@@ -175,6 +177,9 @@ func New(
 	if estimatedTimeoutSec <= 0 {
 		return nil, fmt.Errorf("estimatedTimeoutSec must be positive, got %d", estimatedTimeoutSec)
 	}
+	if err := ValidateMetadata(metadata); err != nil {
+		return nil, err
+	}
 
 	now := time.Now().UTC()
 	return &Transaction{
@@ -194,6 +199,40 @@ func New(
 		CreatedAt:               now,
 		UpdatedAt:               now,
 	}, nil
+}
+
+const (
+	NextActionStripePaymentElement = "stripe_payment_element"
+	NextActionRazorpayCheckout     = "razorpay_checkout"
+	NextActionPayUForm             = "payu_form"
+)
+
+type NextAction struct {
+	Type   string            `json:"type"`
+	URL    string            `json:"url,omitempty"`
+	Params map[string]string `json:"params"`
+}
+
+func (t *Transaction) AwaitingCustomer() bool {
+	return t.Status == StatusProcessing && t.NextAction != nil
+}
+
+const MaxMetadataBytes = 4096
+
+var ErrMetadataTooLarge = fmt.Errorf("metadata must be at most %d bytes of JSON", MaxMetadataBytes)
+
+func ValidateMetadata(metadata map[string]any) error {
+	if len(metadata) == 0 {
+		return nil
+	}
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("metadata is not valid JSON: %w", err)
+	}
+	if len(encoded) > MaxMetadataBytes {
+		return ErrMetadataTooLarge
+	}
+	return nil
 }
 
 func (t *Transaction) SetCancelIntent(by Actor, via CancelVia) {
