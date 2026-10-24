@@ -14,6 +14,8 @@ const (
 	MetricTransactionLatencyMs = "transaction.latency_ms"
 
 	MetricTransactionReviewRequired = "transaction.review_required"
+	MetricTransactionLateCapture    = "transaction.late_capture"
+	MetricWebhookCaptureMismatch    = "webhook.capture_mismatch"
 	MetricTransactionReviewPending  = "transaction.review_pending"
 
 	MetricGatewayRequestLatencyMs   = "gateway.request_latency_ms"

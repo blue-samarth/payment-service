@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -16,12 +17,15 @@ type Event struct {
 	GatewayReferenceID string
 	TransactionID      string
 	Status             string
+	Amount             int64
+	Currency           string
 }
 
 type Outcome struct {
 	Duplicate  bool
 	UnknownTxn bool
 	Resolved   bool
+	Mismatch   bool
 	Status     transaction.Status
 }
 
@@ -29,6 +33,7 @@ type TransactionRepo interface {
 	GetByGatewayReference(ctx context.Context, gatewayID, reference string) (*transaction.Transaction, error)
 	FindByID(ctx context.Context, id uuid.UUID) (*transaction.Transaction, error)
 	UpdateStatus(ctx context.Context, t *transaction.Transaction) error
+	MarkReviewRequired(ctx context.Context, id uuid.UUID, reason string) (bool, error)
 }
 
 type WebhookRepo interface {
@@ -55,6 +60,41 @@ type Service struct {
 
 func NewService(txns TransactionRepo, webhooks WebhookRepo, outbox EventWriter, tx Transactor, log ports.Logger, metrics ports.MetricRecorder) *Service {
 	return &Service{txns: txns, webhooks: webhooks, outbox: outbox, tx: tx, log: log, metrics: metrics}
+}
+
+func capturedMismatch(ev Event, txn *transaction.Transaction) string {
+	switch {
+	case ev.Amount <= 0:
+		return "webhook_amount_missing"
+	case ev.Amount != txn.Amount:
+		return "webhook_amount_mismatch"
+	case ev.Currency == "":
+		return "webhook_currency_missing"
+	case !strings.EqualFold(ev.Currency, txn.Currency):
+		return "webhook_currency_mismatch"
+	}
+	return ""
+}
+
+func (s *Service) flagMismatch(ctx context.Context, txn *transaction.Transaction, gatewayID, reason string, ev Event) error {
+	if txn.Status == transaction.StatusProcessing {
+		if _, err := s.txns.MarkReviewRequired(ctx, txn.ID, reason); err != nil {
+			return err
+		}
+	}
+	s.metrics.Increment(ports.MetricWebhookCaptureMismatch, map[string]string{ports.FieldGatewayID: gatewayID, "reason": reason})
+	s.log.Error(ports.LogEventWebhookCaptureMismatch, map[string]any{
+		ports.FieldErrorCode:     reason,
+		ports.FieldTraceID:       "",
+		ports.FieldTransactionID: txn.ID.String(),
+		ports.FieldGatewayID:     gatewayID,
+		"expected_amount":        txn.Amount,
+		"expected_currency":      txn.Currency,
+		"captured_amount":        ev.Amount,
+		"captured_currency":      ev.Currency,
+		"status":                 string(txn.Status),
+	}, fmt.Errorf("signed webhook reports a capture that does not match the payment"))
+	return nil
 }
 
 type webhookEventPayload struct {
@@ -91,7 +131,8 @@ func (s *Service) Process(ctx context.Context, gatewayID string, ev Event, rawPa
 		}
 
 		newStatus, terminal := mapWebhookStatus(ev.Status)
-		if !terminal || txn.Status != transaction.StatusProcessing {
+		lateCapture := terminal && newStatus == transaction.StatusSucceeded && txn.Status == transaction.StatusFailed
+		if !terminal || (txn.Status != transaction.StatusProcessing && !lateCapture) {
 			if referenceRecovered && txn.Status == transaction.StatusProcessing {
 				if err := s.txns.UpdateStatus(ctx, txn); err != nil {
 					return err
@@ -101,14 +142,35 @@ func (s *Service) Process(ctx context.Context, gatewayID string, ev Event, rawPa
 			return nil
 		}
 
+		if newStatus == transaction.StatusSucceeded {
+			if reason := capturedMismatch(ev, txn); reason != "" {
+				if err := s.flagMismatch(ctx, txn, gatewayID, reason, ev); err != nil {
+					return err
+				}
+				outcome.Mismatch = true
+				outcome.Status = txn.Status
+				return nil
+			}
+		}
+
 		if err := transaction.TransitionState(txn, newStatus, transaction.ActorGateway); err != nil {
 			return err
 		}
-		if newStatus == transaction.StatusFailed {
+		switch {
+		case newStatus == transaction.StatusFailed:
 			txn.FailureReason = &transaction.FailureReason{
 				Category: "gateway_webhook_failed",
 				Source:   transaction.FailureReasonSourceGateway,
 			}
+		case lateCapture:
+			txn.FailureReason = nil
+			s.metrics.Increment(ports.MetricTransactionLateCapture, map[string]string{ports.FieldGatewayID: gatewayID})
+			s.log.Error(ports.LogEventTransactionLateCapture, map[string]any{
+				ports.FieldErrorCode:     "late_capture_after_failed",
+				ports.FieldTraceID:       "",
+				ports.FieldTransactionID: txn.ID.String(),
+				ports.FieldGatewayID:     gatewayID,
+			}, fmt.Errorf("gateway captured a payment already recorded as FAILED"))
 		}
 		if err := s.txns.UpdateStatus(ctx, txn); err != nil {
 			return err

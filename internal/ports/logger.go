@@ -13,6 +13,8 @@ const (
 	LogEventTransactionCreated        = "transaction.created"
 	LogEventTransactionTransition     = "transaction.state_transition"
 	LogEventTransactionLeaseExpired   = "transaction.lease_expired"
+	LogEventTransactionLateCapture    = "transaction.late_capture"
+	LogEventWebhookCaptureMismatch    = "webhook.capture_mismatch"
 	LogEventTransactionReviewResolved = "transaction.review_resolved"
 
 	LogEventGatewayRequest       = "gateway.request"

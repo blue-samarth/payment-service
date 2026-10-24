@@ -21,6 +21,7 @@ func TestTransitionState_ValidTransitions(t *testing.T) {
 		{StatusSucceeded, StatusRefunded},
 		{StatusSucceeded, StatusRefundFailed},
 		{StatusRefundFailed, StatusRefunded},
+		{StatusFailed, StatusSucceeded},
 	}
 	for _, c := range cases {
 		tx := &Transaction{Status: c.from}

@@ -91,6 +91,8 @@ func (h *WebhookHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		GatewayReferenceID: ev.GatewayReferenceID,
 		TransactionID:      ev.TransactionID,
 		Status:             normalizeStatus(ev.Status),
+		Amount:             ev.Amount,
+		Currency:           ev.Currency,
 	}, rawBody)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "webhook_processing_failed", "could not process webhook")
