@@ -175,7 +175,7 @@ func (s *Service) insertRefund(ctx context.Context, in InitiateInput, parent *tr
 	if err != nil {
 		return nil, err
 	}
-	r.AttemptedGateway = parent.GatewayID
+	r.AttemptedGateway = parent.ProcessingGateway()
 
 	if err := s.refunds.Insert(ctx, r); err != nil {
 		return nil, fmt.Errorf("insert refund: %w", err)

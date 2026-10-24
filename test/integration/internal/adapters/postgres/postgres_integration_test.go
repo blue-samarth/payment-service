@@ -462,6 +462,38 @@ func TestTransaction_ProcessingTimeoutRoundTrips(t *testing.T) {
 	}
 }
 
+func TestUpdateStatus_PersistsTheCurrentGateway(t *testing.T) {
+	pg := testsupport.RequirePostgres(t)
+	pg.Truncate(t, "transactions")
+	ctx := context.Background()
+
+	repo := postgres.NewTransactionRepository(pg.DB, pg.Q)
+	tr := postgres.NewTransactor(pg.DB)
+
+	txn := newTxn(t)
+	if err := tr.WithinTx(ctx, func(ctx context.Context) error { return repo.Insert(ctx, txn) }); err != nil {
+		t.Fatal(err)
+	}
+
+	txn.GatewayID = "razorpay"
+	txn.ActualGateway = "razorpay"
+	txn.GatewayReferenceID = "pay_fallback"
+	if err := tr.WithinTx(ctx, func(ctx context.Context) error { return repo.UpdateStatus(ctx, txn) }); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := repo.GetByID(ctx, txn.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GatewayID != "razorpay" || got.ActualGateway != "razorpay" || got.GatewayReferenceID != "pay_fallback" {
+		t.Fatalf("after a fallback the row must name the gateway that holds the reference, got gateway_id=%q actual=%q ref=%q", got.GatewayID, got.ActualGateway, got.GatewayReferenceID)
+	}
+	if got.AttemptedGateway != "stripe" {
+		t.Errorf("attempted_gateway records the first choice and must not move, got %q", got.AttemptedGateway)
+	}
+}
+
 func TestUpdateStatus_NotFoundIsDistinctFromVersionConflict(t *testing.T) {
 	pg := testsupport.RequirePostgres(t)
 	pg.Truncate(t, "transactions")

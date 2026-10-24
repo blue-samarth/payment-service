@@ -196,6 +196,22 @@ func TestInitiateRefund_Success(t *testing.T) {
 	}
 }
 
+func TestInitiateRefund_TargetsTheGatewayThatProcessedThePayment(t *testing.T) {
+	parent := succeededTxn(100000)
+	parent.GatewayID = "stripe"
+	parent.ActualGateway = "razorpay"
+	refunds := &fakeRefunds{}
+	s := svc(&fakeTxns{txn: parent}, refunds, &fakeOutbox{})
+
+	res, err := s.InitiateRefund(context.Background(), InitiateInput{TransactionID: parent.ID, Scope: authz.AllMerchants(), Amount: 100, Reason: "r", InitiatedBy: "merchant"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Refund.AttemptedGateway != "razorpay" {
+		t.Fatalf("the refund must go to the gateway that holds the reference, got %q", res.Refund.AttemptedGateway)
+	}
+}
+
 func TestInitiateRefund_AnotherMerchantsTransactionIsNotFound(t *testing.T) {
 	parent := succeededTxn(100000)
 	refunds := &fakeRefunds{}

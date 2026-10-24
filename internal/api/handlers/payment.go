@@ -167,7 +167,7 @@ func toPaymentResponse(t *transaction.Transaction) paymentResponse {
 		Amount:             t.Amount,
 		Currency:           t.Currency,
 		PaymentMethod:      string(t.PaymentMethod),
-		Gateway:            t.GatewayID,
+		Gateway:            t.ProcessingGateway(),
 		GatewayReferenceID: t.GatewayReferenceID,
 		ReviewRequired:     t.Status == transaction.StatusProcessing && t.ReviewRequiredAt != nil,
 		CreatedAt:          t.CreatedAt.Format("2006-01-02T15:04:05.999999999Z07:00"),

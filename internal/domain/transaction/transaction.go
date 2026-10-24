@@ -215,6 +215,13 @@ func (t *Transaction) IsLeaseExpired() bool {
 	return time.Now().UTC().After(t.ProcessingStartedAt.Add(*t.ProcessingTimeout))
 }
 
+func (t *Transaction) ProcessingGateway() string {
+	if t.ActualGateway != "" {
+		return t.ActualGateway
+	}
+	return t.GatewayID
+}
+
 func (t *Transaction) HasGatewayDiscrepancy() bool {
 	return t.ActualGateway != "" && t.AttemptedGateway != t.ActualGateway
 }

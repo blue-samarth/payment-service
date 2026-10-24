@@ -182,6 +182,25 @@ func TestGet_Success(t *testing.T) {
 	}
 }
 
+func TestGet_NamesTheGatewayThatProcessedThePayment(t *testing.T) {
+	txn := sampleTxn(transaction.StatusSucceeded)
+	txn.GatewayID = "stripe"
+	txn.ActualGateway = "razorpay"
+	h := NewPaymentHandler(&fakeService{fetched: txn})
+	req := anonymous(httptest.NewRequest(http.MethodGet, "/payments/"+txn.ID.String(), nil))
+	req.SetPathValue("id", txn.ID.String())
+	rec := httptest.NewRecorder()
+	h.Get(rec, req)
+
+	var resp paymentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Gateway != "razorpay" {
+		t.Fatalf("a row that fell back before gateway_id was saved must still report the processing gateway, got %q", resp.Gateway)
+	}
+}
+
 func TestGet_InvalidID(t *testing.T) {
 	h := NewPaymentHandler(&fakeService{})
 	req := anonymous(httptest.NewRequest(http.MethodGet, "/payments/bad", nil))
