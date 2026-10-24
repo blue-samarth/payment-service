@@ -77,6 +77,17 @@ const (
 	CooldownMax  = 240 * time.Second
 )
 
+const (
+	RefusalOpen          = "circuit_breaker_open"
+	RefusalProbeInFlight = "circuit_breaker_probe_in_flight"
+)
+
+type Admission struct {
+	Admitted   bool
+	HoldsProbe bool
+	Refusal    string
+}
+
 func CooldownDuration(trips int) time.Duration {
 	if trips <= 0 {
 		trips = 1

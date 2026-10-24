@@ -122,7 +122,7 @@ func (s *CircuitBreakerStore) AcquireProbe(ctx context.Context, gatewayID string
 
 const minProbeTTL = 5 * time.Second
 
-func (s *CircuitBreakerStore) AdmitCall(ctx context.Context, gatewayID string, probeTTL time.Duration) (bool, error) {
+func (s *CircuitBreakerStore) AdmitCall(ctx context.Context, gatewayID string, probeTTL time.Duration) (gateway.Admission, error) {
 	if probeTTL < minProbeTTL {
 		probeTTL = minProbeTTL
 	}
@@ -130,9 +130,25 @@ func (s *CircuitBreakerStore) AdmitCall(ctx context.Context, gatewayID string, p
 		s.now().UTC().Unix(), probeTTL.Milliseconds(),
 	).Int()
 	if err != nil {
-		return false, fmt.Errorf("circuit_breaker: admit call %s: %w", gatewayID, err)
+		return gateway.Admission{}, fmt.Errorf("circuit_breaker: admit call %s: %w", gatewayID, err)
 	}
-	return n == 1, nil
+	switch n {
+	case 1:
+		return gateway.Admission{Admitted: true}, nil
+	case 2:
+		return gateway.Admission{Admitted: true, HoldsProbe: true}, nil
+	case 3:
+		return gateway.Admission{Refusal: gateway.RefusalProbeInFlight}, nil
+	default:
+		return gateway.Admission{Refusal: gateway.RefusalOpen}, nil
+	}
+}
+
+func (s *CircuitBreakerStore) ReleaseProbe(ctx context.Context, gatewayID string) error {
+	if err := s.client.Del(ctx, probeKey(gatewayID)).Err(); err != nil {
+		return fmt.Errorf("circuit_breaker: release probe %s: %w", gatewayID, err)
+	}
+	return nil
 }
 
 func (s *CircuitBreakerStore) ProbeHeld(ctx context.Context, gatewayID string) (bool, error) {
