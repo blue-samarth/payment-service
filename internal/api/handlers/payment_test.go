@@ -201,6 +201,34 @@ func TestGet_NamesTheGatewayThatProcessedThePayment(t *testing.T) {
 	}
 }
 
+func TestGet_NextActionOnlyWhileAwaitingTheCustomer(t *testing.T) {
+	action := &transaction.NextAction{Type: transaction.NextActionRazorpayCheckout, Params: map[string]string{"order_id": "order_1"}}
+	for status, want := range map[transaction.Status]bool{
+		transaction.StatusProcessing: true,
+		transaction.StatusSucceeded:  false,
+		transaction.StatusFailed:     false,
+	} {
+		txn := sampleTxn(status)
+		txn.NextAction = action
+		h := NewPaymentHandler(&fakeService{fetched: txn})
+		req := anonymous(httptest.NewRequest(http.MethodGet, "/payments/"+txn.ID.String(), nil))
+		req.SetPathValue("id", txn.ID.String())
+		rec := httptest.NewRecorder()
+		h.Get(rec, req)
+
+		var resp paymentResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		if got := resp.NextAction != nil; got != want {
+			t.Errorf("%s: next_action present=%v, want %v", status, got, want)
+		}
+		if want && resp.NextAction.Params["order_id"] != "order_1" {
+			t.Errorf("%s: the client needs the action's parameters to continue, got %+v", status, resp.NextAction)
+		}
+	}
+}
+
 func TestGet_InvalidID(t *testing.T) {
 	h := NewPaymentHandler(&fakeService{})
 	req := anonymous(httptest.NewRequest(http.MethodGet, "/payments/bad", nil))

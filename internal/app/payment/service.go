@@ -102,12 +102,14 @@ type Service struct {
 	breaker        CircuitBreaker
 	gate           CallGate
 	tiers          MerchantTiers
-	intents        IntentTracker
-	idem           *idempotency.Guard
-	maxAttempts    int
-	httpTimeout    time.Duration
-	log            ports.Logger
-	metrics        ports.MetricRecorder
+
+	customerActionWindow time.Duration
+	intents              IntentTracker
+	idem                 *idempotency.Guard
+	maxAttempts          int
+	httpTimeout          time.Duration
+	log                  ports.Logger
+	metrics              ports.MetricRecorder
 }
 
 func (s *Service) SetCancelResolver(r CancelResolver) { s.cancelResolver = r }
@@ -125,6 +127,9 @@ func (s *Service) SetIntentTracker(t IntentTracker)      { s.intents = t }
 func (s *Service) SetMaxGatewayAttempts(n int)           { s.maxAttempts = n }
 func (s *Service) SetGatewayHTTPTimeout(d time.Duration) { s.httpTimeout = d }
 func (s *Service) SetIdempotency(g *idempotency.Guard)   { s.idem = g }
+func (s *Service) SetCustomerActionWindow(d time.Duration) {
+	s.customerActionWindow = d
+}
 
 func (s *Service) gatewayBudget() time.Duration {
 	attempts := s.maxAttempts

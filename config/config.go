@@ -219,6 +219,7 @@ type GatewayConfig struct {
 	MaxAttempts                    int
 	CircuitBreakerFailureThreshold int
 	MerchantTiers                  map[string]string
+	CustomerActionTimeout          time.Duration
 }
 
 func (g GatewayConfig) Budget() time.Duration {
@@ -391,6 +392,7 @@ func LoadConfig() (*Config, error) {
 	c.Gateway.HTTPTimeout = getEnvDuration("GATEWAY_HTTP_TIMEOUT", 30*time.Second, &errs)
 	c.Gateway.MaxAttempts = getEnvInt("GATEWAY_MAX_ATTEMPTS", 3, &errs)
 	c.Gateway.MerchantTiers = parseMerchantTiers(os.Getenv("MERCHANT_TIERS"), &errs)
+	c.Gateway.CustomerActionTimeout = time.Duration(getEnvInt("CUSTOMER_ACTION_TIMEOUT_SEC", 1800, &errs)) * time.Second
 	c.Gateway.CircuitBreakerFailureThreshold = getEnvInt("CIRCUIT_BREAKER_FAILURE_THRESHOLD", 5, &errs)
 	c.App.ShutdownTimeout = getEnvDuration("SHUTDOWN_TIMEOUT", c.Gateway.Budget()+ShutdownTimeoutMargin, &errs)
 
@@ -583,6 +585,9 @@ func Validate(c *Config) error {
 	}
 	if c.Gateway.HTTPTimeout <= 0 {
 		errs = append(errs, "GATEWAY_HTTP_TIMEOUT must be greater than 0")
+	}
+	if c.Gateway.CustomerActionTimeout <= c.Gateway.Budget() {
+		errs = append(errs, fmt.Sprintf("CUSTOMER_ACTION_TIMEOUT_SEC (%s) must exceed the gateway budget GATEWAY_HTTP_TIMEOUT*GATEWAY_MAX_ATTEMPTS (%s): it is how long a customer has to complete the payment", c.Gateway.CustomerActionTimeout, c.Gateway.Budget()))
 	}
 	minAge := time.Duration(c.Jobs.RefundRecoveryMinAgeSec) * time.Second
 	if inFlight := 2*c.Gateway.HTTPTimeout + 30*time.Second; minAge <= inFlight {

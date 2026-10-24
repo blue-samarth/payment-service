@@ -159,6 +159,7 @@ func buildReaper(cfg *config.Config, db *postgres.DB, queries *postgres.Queries,
 	paymentSvc.SetMaxGatewayAttempts(cfg.Gateway.MaxAttempts)
 	paymentSvc.SetMerchantTiers(payment.StaticMerchantTiers(cfg.Gateway.MerchantTiers))
 	paymentSvc.SetGatewayHTTPTimeout(cfg.Gateway.HTTPTimeout)
+	paymentSvc.SetCustomerActionWindow(cfg.Gateway.CustomerActionTimeout)
 	refundSvc := refund.NewService(txnRepo, refundRepo, outboxWriter, transactor, registry, logger, metrics)
 	paymentSvc.SetCancelResolver(refundSvc)
 

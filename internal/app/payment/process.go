@@ -102,6 +102,7 @@ func (s *Service) ProcessPayment(ctx context.Context, transactionID uuid.UUID) (
 	s.enterIntent(work, txn.GatewayID, txn.ID, timeout)
 
 	resp, result := s.attemptGateways(work, adapter, txn)
+	s.awaitCustomer(txn, resp, result)
 	final, err := s.finalize(work, txn, resp, result)
 	if err == nil {
 		return final, nil
@@ -145,6 +146,17 @@ func (s *Service) RecoverExpiredLease(ctx context.Context, transactionID uuid.UU
 	result := resolveOutcome(resp, gwErr)
 	if txn.GatewayReferenceID == "" && gwErr != nil && !isDecline(gwErr) {
 		result = outcome{terminal: false}
+	}
+	if !result.terminal && txn.NextAction != nil && gwErr == nil && resp != nil && resp.Status == ports.GatewayPaymentStatusPending {
+		result = outcome{
+			terminal:  true,
+			newStatus: transaction.StatusFailed,
+			failureReason: &transaction.FailureReason{
+				Category: "customer_action_expired",
+				Code:     "abandoned",
+				Source:   transaction.FailureReasonSourceTimeout,
+			},
+		}
 	}
 	s.recordBreaker(ctx, gateway, gwErr)
 
@@ -346,6 +358,17 @@ func (s *Service) moveToNextAdmitted(ctx context.Context, txn *transaction.Trans
 			return nil, false
 		}
 		return adapter, true
+	}
+}
+
+func (s *Service) awaitCustomer(txn *transaction.Transaction, resp *ports.GatewayPaymentResponse, result outcome) {
+	if result.terminal || resp == nil || resp.NextAction == nil {
+		return
+	}
+	txn.NextAction = resp.NextAction
+	if s.customerActionWindow > 0 && (txn.ProcessingTimeout == nil || s.customerActionWindow > *txn.ProcessingTimeout) {
+		window := s.customerActionWindow
+		txn.ProcessingTimeout = &window
 	}
 }
 

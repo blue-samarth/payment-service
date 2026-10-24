@@ -28,6 +28,7 @@ func validatableConfig() *Config {
 	c.RateLimit.WebhookRefillPerSec = 100
 	c.Routing.FXReconciliationTolerancePct = 1.0
 	c.Gateway.HTTPTimeout = 30 * time.Second
+	c.Gateway.CustomerActionTimeout = 30 * time.Minute
 	c.Gateway.MaxAttempts = 3
 	c.Gateway.CircuitBreakerFailureThreshold = 5
 	c.App.ShutdownDrainDelay = 5 * time.Second
@@ -163,6 +164,14 @@ func TestValidate_RefundRecoveryMinAgeCoversTwoGatewayCalls(t *testing.T) {
 	c.Jobs.RefundRecoveryMinAgeSec = 91
 	if err := Validate(c); err != nil {
 		t.Fatalf("91s should validate, got %v", err)
+	}
+}
+
+func TestValidate_CustomerActionWindowMustExceedTheGatewayBudget(t *testing.T) {
+	c := validatableConfig()
+	c.Gateway.CustomerActionTimeout = c.Gateway.Budget()
+	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "CUSTOMER_ACTION_TIMEOUT_SEC") {
+		t.Fatalf("expected the customer window to be checked against the gateway budget, got %v", err)
 	}
 }
 
