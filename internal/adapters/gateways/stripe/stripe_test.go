@@ -168,6 +168,68 @@ func TestCheckStatus(t *testing.T) {
 	}
 }
 
+func TestRefund_CarriesOurRefundID(t *testing.T) {
+	id := uuid.New()
+	var got string
+	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		got = r.PostFormValue("metadata[refund_id]")
+		_, _ = w.Write([]byte(`{"id":"re_1","status":"pending"}`))
+	})
+	defer srv.Close()
+
+	if _, err := a.Refund(context.Background(), ports.GatewayRefundRequest{RefundID: id, GatewayReferenceID: "pi_1", Amount: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if got != id.String() {
+		t.Fatalf("recovery matches refunds by metadata[refund_id], got %q", got)
+	}
+}
+
+func TestRefundStatus(t *testing.T) {
+	ours := uuid.New()
+	for name, tc := range map[string]struct {
+		req      ports.GatewayRefundStatusRequest
+		wantPath string
+		body     string
+		want     ports.GatewayRefundStatus
+		wantID   string
+	}{
+		"by gateway refund id": {
+			ports.GatewayRefundStatusRequest{RefundID: ours, GatewayRefundID: "re_1"},
+			"/v1/refunds/re_1", `{"id":"re_1","status":"succeeded"}`, ports.GatewayRefundStatusCompleted, "re_1",
+		},
+		"matched by metadata": {
+			ports.GatewayRefundStatusRequest{RefundID: ours, GatewayReferenceID: "pi_1"},
+			"/v1/refunds", `{"data":[{"id":"re_other","status":"succeeded","metadata":{"refund_id":"x"}},{"id":"re_ours","status":"failed","metadata":{"refund_id":"` + ours.String() + `"}}]}`,
+			ports.GatewayRefundStatusFailed, "re_ours",
+		},
+		"not there": {
+			ports.GatewayRefundStatusRequest{RefundID: ours, GatewayReferenceID: "pi_1"},
+			"/v1/refunds", `{"data":[{"id":"re_other","status":"succeeded","metadata":{"refund_id":"x"}}]}`,
+			ports.GatewayRefundStatusNotFound, "",
+		},
+	} {
+		a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || r.URL.Path != tc.wantPath {
+				t.Errorf("%s: a status check must only read, got %s %s", name, r.Method, r.URL.Path)
+			}
+			if tc.req.GatewayRefundID == "" && r.URL.Query().Get("payment_intent") != "pi_1" {
+				t.Errorf("%s: the listing must be scoped to the payment intent", name)
+			}
+			_, _ = w.Write([]byte(tc.body))
+		})
+		resp, err := a.RefundStatus(context.Background(), tc.req)
+		srv.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if resp.Status != tc.want || resp.GatewayRefundID != tc.wantID {
+			t.Errorf("%s: got %s %q, want %s %q", name, resp.Status, resp.GatewayRefundID, tc.want, tc.wantID)
+		}
+	}
+}
+
 func TestRefund(t *testing.T) {
 	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/refunds" {

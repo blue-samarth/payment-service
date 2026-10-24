@@ -117,17 +117,44 @@ func (a *Adapter) Refund(ctx context.Context, req ports.GatewayRefundRequest) (*
 	if req.Reason != "" {
 		form.Set("metadata[reason]", req.Reason)
 	}
+	form.Set("metadata[refund_id]", req.RefundID.String())
 
 	var rf stripeRefund
 	if err := a.do(ctx, http.MethodPost, "/v1/refunds", form, idem, &rf); err != nil {
 		return nil, err
 	}
+	return toRefundResponse(&rf), nil
+}
+
+func (a *Adapter) RefundStatus(ctx context.Context, req ports.GatewayRefundStatusRequest) (*ports.GatewayRefundResponse, error) {
+	if req.GatewayRefundID != "" {
+		var rf stripeRefund
+		if err := a.do(ctx, http.MethodGet, "/v1/refunds/"+url.PathEscape(req.GatewayRefundID), nil, "", &rf); err != nil {
+			return nil, err
+		}
+		return toRefundResponse(&rf), nil
+	}
+
+	var list stripeRefundList
+	query := url.Values{"payment_intent": {req.GatewayReferenceID}, "limit": {"100"}}
+	if err := a.do(ctx, http.MethodGet, "/v1/refunds?"+query.Encode(), nil, "", &list); err != nil {
+		return nil, err
+	}
+	for i := range list.Data {
+		if list.Data[i].Metadata["refund_id"] == req.RefundID.String() {
+			return toRefundResponse(&list.Data[i]), nil
+		}
+	}
+	return &ports.GatewayRefundResponse{Status: ports.GatewayRefundStatusNotFound}, nil
+}
+
+func toRefundResponse(rf *stripeRefund) *ports.GatewayRefundResponse {
 	return &ports.GatewayRefundResponse{
 		GatewayRefundID: rf.ID,
 		Status:          mapRefundStatus(rf.Status),
 		Amount:          rf.Amount,
 		Currency:        strings.ToUpper(rf.Currency),
-	}, nil
+	}
 }
 
 func (a *Adapter) Cancel(ctx context.Context, req ports.GatewayCancelRequest) (*ports.GatewayCancelResponse, error) {

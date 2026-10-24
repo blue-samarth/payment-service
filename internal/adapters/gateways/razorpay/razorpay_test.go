@@ -2,6 +2,7 @@ package razorpay
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -169,6 +170,69 @@ func TestRefund_AmountAboveCapturedIsRefused(t *testing.T) {
 	var gwErr *ports.GatewayError
 	if !errors.As(err, &gwErr) || gwErr.Code != "refund_exceeds_captured" || posted {
 		t.Fatalf("expected refund_exceeds_captured with nothing posted, got %v posted=%v", err, posted)
+	}
+}
+
+func TestRefund_CarriesOurRefundIDInNotes(t *testing.T) {
+	id := uuid.New()
+	var body map[string]any
+	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte(`{"id":"rfnd_1","status":"pending"}`))
+	})
+	defer srv.Close()
+
+	if _, err := a.Refund(context.Background(), ports.GatewayRefundRequest{RefundID: id, GatewayReferenceID: "pay_1", Amount: 100, Reason: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	notes, _ := body["notes"].(map[string]any)
+	if notes["refund_id"] != id.String() || notes["reason"] != "r" {
+		t.Fatalf("recovery matches refunds by notes.refund_id, got notes %v", notes)
+	}
+}
+
+func TestRefundStatus(t *testing.T) {
+	ours := uuid.New()
+	for name, tc := range map[string]struct {
+		req    ports.GatewayRefundStatusRequest
+		routes map[string]string
+		want   ports.GatewayRefundStatus
+		wantID string
+	}{
+		"by gateway refund id": {
+			ports.GatewayRefundStatusRequest{RefundID: ours, GatewayRefundID: "rfnd_1"},
+			map[string]string{"/v1/refunds/rfnd_1": `{"id":"rfnd_1","status":"processed"}`},
+			ports.GatewayRefundStatusCompleted, "rfnd_1",
+		},
+		"matched by notes on the captured payment": {
+			ports.GatewayRefundStatusRequest{RefundID: ours, GatewayReferenceID: "order_1"},
+			map[string]string{
+				"/v1/orders/order_1/payments": `{"items":[{"id":"pay_1","status":"captured","amount":1000}]}`,
+				"/v1/payments/pay_1/refunds":  `{"items":[{"id":"rfnd_x","status":"processed","notes":{"refund_id":"x"}},{"id":"rfnd_ours","status":"pending","notes":{"refund_id":"` + ours.String() + `"}}]}`,
+			},
+			ports.GatewayRefundStatusProcessing, "rfnd_ours",
+		},
+		"not there": {
+			ports.GatewayRefundStatusRequest{RefundID: ours, GatewayReferenceID: "pay_1"},
+			map[string]string{"/v1/payments/pay_1/refunds": `{"items":[]}`},
+			ports.GatewayRefundStatusNotFound, "",
+		},
+	} {
+		a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+			body, ok := tc.routes[r.URL.Path]
+			if r.Method != http.MethodGet || !ok {
+				t.Errorf("%s: a status check must only read known paths, got %s %s", name, r.Method, r.URL.Path)
+			}
+			_, _ = w.Write([]byte(body))
+		})
+		resp, err := a.RefundStatus(context.Background(), tc.req)
+		srv.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if resp.Status != tc.want || resp.GatewayRefundID != tc.wantID {
+			t.Errorf("%s: got %s %q, want %s %q", name, resp.Status, resp.GatewayRefundID, tc.want, tc.wantID)
+		}
 	}
 }
 

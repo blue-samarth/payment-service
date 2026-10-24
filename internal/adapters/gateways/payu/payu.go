@@ -140,6 +140,49 @@ func (a *Adapter) Refund(ctx context.Context, req ports.GatewayRefundRequest) (*
 	}, nil
 }
 
+func (a *Adapter) RefundStatus(ctx context.Context, req ports.GatewayRefundStatusRequest) (*ports.GatewayRefundResponse, error) {
+	if req.GatewayRefundID == "" {
+		return &ports.GatewayRefundResponse{Status: ports.GatewayRefundStatusUnknown}, nil
+	}
+
+	var out payuActionStatusResponse
+	if err := a.postService(ctx, "check_action_status", req.GatewayRefundID, nil, &out); err != nil {
+		return nil, err
+	}
+	var byRequest map[string]map[string]payuActionDetail
+	unknown := &ports.GatewayRefundResponse{GatewayRefundID: req.GatewayRefundID, Status: ports.GatewayRefundStatusUnknown}
+	if err := decodeJSON(out.TransactionDetails, &byRequest); err != nil {
+		return unknown, nil
+	}
+	actions, ok := byRequest[req.GatewayRefundID]
+	if !ok || len(actions) != 1 {
+		return unknown, nil
+	}
+	var detail payuActionDetail
+	for _, d := range actions {
+		detail = d
+	}
+	return &ports.GatewayRefundResponse{
+		GatewayRefundID: req.GatewayRefundID,
+		Status:          mapActionStatus(detail.Status),
+		Amount:          rupeesToPaise(detail.Amount),
+		Currency:        "INR",
+	}, nil
+}
+
+func mapActionStatus(s string) ports.GatewayRefundStatus {
+	switch strings.ToLower(s) {
+	case "success":
+		return ports.GatewayRefundStatusCompleted
+	case "failure", "failed":
+		return ports.GatewayRefundStatusFailed
+	case "queued", "pending", "in progress", "requested":
+		return ports.GatewayRefundStatusProcessing
+	default:
+		return ports.GatewayRefundStatusUnknown
+	}
+}
+
 func (a *Adapter) mihpayID(ctx context.Context, reference string, amount int64) (string, error) {
 	if isDigits(reference) {
 		return reference, nil

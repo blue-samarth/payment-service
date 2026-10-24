@@ -21,6 +21,18 @@ type payuRefundResponse struct {
 	RequestID string `json:"request_id"`
 }
 
+type payuActionStatusResponse struct {
+	Status             int             `json:"status"`
+	Msg                string          `json:"msg"`
+	TransactionDetails json.RawMessage `json:"transaction_details"`
+}
+
+type payuActionDetail struct {
+	Status string `json:"status"`
+	Amount string `json:"amount"`
+	Action string `json:"action"`
+}
+
 func decodeJSON(data []byte, out any) error {
 	return json.Unmarshal(data, out)
 }

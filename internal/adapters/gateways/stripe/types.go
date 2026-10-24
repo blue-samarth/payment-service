@@ -59,10 +59,15 @@ type stripeCardDetails struct {
 }
 
 type stripeRefund struct {
-	ID       string `json:"id"`
-	Status   string `json:"status"`
-	Amount   int64  `json:"amount"`
-	Currency string `json:"currency"`
+	ID       string            `json:"id"`
+	Status   string            `json:"status"`
+	Amount   int64             `json:"amount"`
+	Currency string            `json:"currency"`
+	Metadata map[string]string `json:"metadata"`
+}
+
+type stripeRefundList struct {
+	Data []stripeRefund `json:"data"`
 }
 
 type stripeError struct {

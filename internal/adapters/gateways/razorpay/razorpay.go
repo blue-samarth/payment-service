@@ -104,9 +104,11 @@ func (a *Adapter) Refund(ctx context.Context, req ports.GatewayRefundRequest) (*
 	if req.Amount > 0 {
 		body["amount"] = req.Amount
 	}
+	notes := map[string]string{"refund_id": req.RefundID.String()}
 	if req.Reason != "" {
-		body["notes"] = map[string]string{"reason": req.Reason}
+		notes["reason"] = req.Reason
 	}
+	body["notes"] = notes
 
 	paymentID, err := a.capturedPaymentID(ctx, req.GatewayReferenceID, req.Amount)
 	if err != nil {
@@ -117,12 +119,41 @@ func (a *Adapter) Refund(ctx context.Context, req ports.GatewayRefundRequest) (*
 	if err := a.do(ctx, http.MethodPost, "/v1/payments/"+url.PathEscape(paymentID)+"/refund", body, &refund); err != nil {
 		return nil, err
 	}
+	return toRefundResponse(&refund), nil
+}
+
+func (a *Adapter) RefundStatus(ctx context.Context, req ports.GatewayRefundStatusRequest) (*ports.GatewayRefundResponse, error) {
+	if req.GatewayRefundID != "" {
+		var refund rzpRefund
+		if err := a.do(ctx, http.MethodGet, "/v1/refunds/"+url.PathEscape(req.GatewayRefundID), nil, &refund); err != nil {
+			return nil, err
+		}
+		return toRefundResponse(&refund), nil
+	}
+
+	paymentID, err := a.capturedPaymentID(ctx, req.GatewayReferenceID, 0)
+	if err != nil {
+		return nil, err
+	}
+	var list rzpRefundList
+	if err := a.do(ctx, http.MethodGet, "/v1/payments/"+url.PathEscape(paymentID)+"/refunds", nil, &list); err != nil {
+		return nil, err
+	}
+	for i := range list.Items {
+		if list.Items[i].Notes["refund_id"] == req.RefundID.String() {
+			return toRefundResponse(&list.Items[i]), nil
+		}
+	}
+	return &ports.GatewayRefundResponse{Status: ports.GatewayRefundStatusNotFound}, nil
+}
+
+func toRefundResponse(refund *rzpRefund) *ports.GatewayRefundResponse {
 	return &ports.GatewayRefundResponse{
 		GatewayRefundID: refund.ID,
 		Status:          mapRefundStatus(refund.Status),
 		Amount:          refund.Amount,
 		Currency:        strings.ToUpper(refund.Currency),
-	}, nil
+	}
 }
 
 func (a *Adapter) capturedPaymentID(ctx context.Context, reference string, amount int64) (string, error) {
