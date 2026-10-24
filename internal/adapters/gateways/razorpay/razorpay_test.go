@@ -73,6 +73,105 @@ func TestRefund_Processed(t *testing.T) {
 	}
 }
 
+func TestRefund_OrderReferenceRefundsItsCapturedPayment(t *testing.T) {
+	var refundPath string
+	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/orders/order_7/payments":
+			_, _ = w.Write([]byte(`{"items":[{"id":"pay_declined","status":"failed"},{"id":"pay_ok","status":"captured","amount":150000}]}`))
+		case r.Method == http.MethodPost:
+			refundPath = r.URL.Path
+			_, _ = w.Write([]byte(`{"id":"rfnd_7","status":"processed","amount":150000,"currency":"INR"}`))
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	})
+	defer srv.Close()
+
+	resp, err := a.Refund(context.Background(), ports.GatewayRefundRequest{GatewayReferenceID: "order_7", Amount: 150000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refundPath != "/v1/payments/pay_ok/refund" {
+		t.Fatalf("the refund must go to the captured pay_ ID, not the order, got %s", refundPath)
+	}
+	if resp.GatewayRefundID != "rfnd_7" {
+		t.Errorf("got %+v", resp)
+	}
+}
+
+func TestRefund_OrderWithoutExactlyOneCapturedPaymentIsNotRefunded(t *testing.T) {
+	for name, tc := range map[string]struct {
+		items string
+		cat   ports.ErrorCategory
+		code  string
+	}{
+		"none captured":    {`[{"id":"pay_1","status":"failed"}]`, ports.ErrorCategoryHardDecline, "no_captured_payment"},
+		"several captured": {`[{"id":"pay_1","status":"captured"},{"id":"pay_2","status":"captured"}]`, ports.ErrorCategoryAmbiguous, "multiple_captured_payments"},
+	} {
+		refunded := false
+		a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				refunded = true
+			}
+			_, _ = w.Write([]byte(`{"items":` + tc.items + `}`))
+		})
+
+		_, err := a.Refund(context.Background(), ports.GatewayRefundRequest{GatewayReferenceID: "order_8", Amount: 100})
+		srv.Close()
+		var gwErr *ports.GatewayError
+		if !errors.As(err, &gwErr) || gwErr.Category != tc.cat || gwErr.Code != tc.code {
+			t.Errorf("%s: expected %s/%s, got %v", name, tc.cat, tc.code, err)
+		}
+		if refunded {
+			t.Errorf("%s: no refund may be sent when the payment to refund is not unambiguous", name)
+		}
+	}
+}
+
+func TestRefund_LookupFailureIsTerminalAndPostsNothing(t *testing.T) {
+	for name, status := range map[string]int{"4xx": http.StatusBadRequest, "5xx": http.StatusInternalServerError, "no connection": 0} {
+		posted := false
+		a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				posted = true
+			}
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":{"code":"BAD_REQUEST_ERROR","description":"The id provided does not exist"}}`))
+		})
+		if status == 0 {
+			srv.Close()
+		}
+
+		_, err := a.Refund(context.Background(), ports.GatewayRefundRequest{GatewayReferenceID: "order_9", Amount: 100})
+		srv.Close()
+		var gwErr *ports.GatewayError
+		if !errors.As(err, &gwErr) || gwErr.Category != ports.ErrorCategoryHardDecline || gwErr.Code != "refund_lookup_failed" {
+			t.Errorf("%s: nothing was sent, so the refund must end terminally, got %v", name, err)
+		}
+		if posted {
+			t.Errorf("%s: no refund may be posted when the lookup fails", name)
+		}
+	}
+}
+
+func TestRefund_AmountAboveCapturedIsRefused(t *testing.T) {
+	posted := false
+	a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posted = true
+		}
+		_, _ = w.Write([]byte(`{"items":[{"id":"pay_1","status":"captured","amount":1000}]}`))
+	})
+	defer srv.Close()
+
+	_, err := a.Refund(context.Background(), ports.GatewayRefundRequest{GatewayReferenceID: "order_10", Amount: 1001})
+	var gwErr *ports.GatewayError
+	if !errors.As(err, &gwErr) || gwErr.Code != "refund_exceeds_captured" || posted {
+		t.Fatalf("expected refund_exceeds_captured with nothing posted, got %v posted=%v", err, posted)
+	}
+}
+
 func TestCancel_NotSupported(t *testing.T) {
 	a := New(Config{})
 	resp, _ := a.Cancel(context.Background(), ports.GatewayCancelRequest{})

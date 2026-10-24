@@ -172,6 +172,66 @@ func TestProcessRefund_GatewayErrorStaysNonTerminal(t *testing.T) {
 	}
 }
 
+type countingMetrics struct{ counts map[string]int }
+
+func (m *countingMetrics) Increment(name string, tags map[string]string) {
+	m.counts[name+"/"+tags["code"]]++
+}
+func (m *countingMetrics) Histogram(string, float64, map[string]string) {}
+func (m *countingMetrics) Gauge(string, float64, map[string]string)     {}
+
+type errorLog struct {
+	noopLogger
+	events []string
+}
+
+func (l *errorLog) Error(event string, _ map[string]any, _ error) { l.events = append(l.events, event) }
+
+func processWith(t *testing.T, gwErr *ports.GatewayError) (*domainrefund.Refund, *countingMetrics, *errorLog) {
+	t.Helper()
+	parent := succeededTxn(100000)
+	parent.GatewayReferenceID = "order_1"
+	rf, _ := domainrefund.New(parent.ID, 40000, 100000, 0, "r", "merchant")
+	rf.AttemptedGateway = "razorpay"
+	refunds := &fakeRefunds{byID: map[uuid.UUID]*domainrefund.Refund{rf.ID: rf}}
+	metrics := &countingMetrics{counts: map[string]int{}}
+	log := &errorLog{}
+	s := NewService(&fakeTxns{txn: parent}, refunds, &fakeOutbox{}, fakeTransactor{}, &fakeRegistry{adapter: &fakeAdapter{err: gwErr}}, log, metrics)
+
+	got, err := s.ProcessRefund(context.Background(), rf.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got, metrics, log
+}
+
+func TestProcessRefund_AmbiguousRefundIsFlaggedForReview(t *testing.T) {
+	got, metrics, log := processWith(t, &ports.GatewayError{Category: ports.ErrorCategoryAmbiguous, Code: "multiple_captured_payments"})
+	if got.Status != domainrefund.StatusProcessing {
+		t.Fatalf("an ambiguous refund must not be guessed at, got %s", got.Status)
+	}
+	if metrics.counts[ports.MetricRefundReviewRequired+"/multiple_captured_payments"] != 1 {
+		t.Fatalf("a refund parked for a person must raise a metric with a stable code, got %v", metrics.counts)
+	}
+	if len(log.events) != 1 || log.events[0] != ports.LogEventRefundReviewRequired {
+		t.Fatalf("and an error log, got %v", log.events)
+	}
+}
+
+func TestProcessRefund_PlainNonTerminalErrorIsNotFlagged(t *testing.T) {
+	_, metrics, log := processWith(t, &ports.GatewayError{Category: ports.ErrorCategoryNetworkTimeout, Code: "network_error"})
+	if len(log.events) != 0 || metrics.counts[ports.MetricRefundReviewRequired+"/network_error"] != 0 {
+		t.Fatalf("only ambiguity needs a person, got logs=%v metrics=%v", log.events, metrics.counts)
+	}
+}
+
+func TestProcessRefund_LookupFailureEndsTheRefund(t *testing.T) {
+	got, _, _ := processWith(t, ports.RefundLookupFailed(&ports.GatewayError{Category: ports.ErrorCategoryNetworkTimeout, Code: "network_error"}))
+	if got.Status != domainrefund.StatusFailed {
+		t.Fatalf("a failed lookup means nothing was sent, so the refund must end REFUND_FAILED rather than stick, got %s", got.Status)
+	}
+}
+
 func TestInitiateRefund_Success(t *testing.T) {
 	parent := succeededTxn(100000)
 	outbox := &fakeOutbox{}
