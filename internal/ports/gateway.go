@@ -45,6 +45,8 @@ const (
 	GatewayRefundStatusProcessing GatewayRefundStatus = "PROCESSING"
 	GatewayRefundStatusCompleted  GatewayRefundStatus = "COMPLETED"
 	GatewayRefundStatusFailed     GatewayRefundStatus = "FAILED"
+	GatewayRefundStatusNotFound   GatewayRefundStatus = "NOT_FOUND"
+	GatewayRefundStatusUnknown    GatewayRefundStatus = "UNKNOWN"
 )
 const (
 	GatewayCancelStatusCancelled    GatewayCancelStatus = "CANCELLED"
@@ -93,6 +95,16 @@ type GatewayRefundRequest struct {
 	Reason             string
 	IdempotencyKey     string
 }
+type GatewayRefundStatusRequest struct {
+	RefundID           uuid.UUID
+	GatewayRefundID    string
+	GatewayReferenceID string
+}
+
+type RefundStatusChecker interface {
+	RefundStatus(ctx context.Context, req GatewayRefundStatusRequest) (*GatewayRefundResponse, error)
+}
+
 type GatewayCancelRequest struct {
 	TransactionID      uuid.UUID
 	GatewayReferenceID string

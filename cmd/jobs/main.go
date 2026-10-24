@@ -16,6 +16,7 @@ import (
 	"samarth/payment-service/internal/bootstrap"
 	leaseexpiry "samarth/payment-service/internal/jobs/lease_expiry"
 	partitionmanager "samarth/payment-service/internal/jobs/partition_manager"
+	refundrecovery "samarth/payment-service/internal/jobs/refund_recovery"
 	"samarth/payment-service/internal/ports"
 )
 
@@ -102,9 +103,35 @@ func run() error {
 		}
 		logger.Info("job.completed", map[string]any{"job": job})
 		return nil
+	case "refund_recovery":
+		recovery := buildRefundRecovery(cfg, db, queries, logger, metrics)
+		logger.Info("job.starting", map[string]any{"job": job})
+		if err := recovery.RunOnce(ctx); err != nil {
+			return fmt.Errorf("refund_recovery: %w", err)
+		}
+		logger.Info("job.completed", map[string]any{"job": job})
+		return nil
 	default:
 		return fmt.Errorf("unknown JOB %q", job)
 	}
+}
+
+func buildRefundRecovery(cfg *config.Config, db *postgres.DB, queries *postgres.Queries, logger *observability.SlogLogger, metrics ports.MetricRecorder) *refundrecovery.Job {
+	refundRepo := postgres.NewRefundRepository(db, queries)
+	refundSvc := refund.NewService(
+		postgres.NewTransactionRepository(db, queries),
+		refundRepo,
+		postgres.NewOutboxWriter(db, queries),
+		postgres.NewTransactor(db),
+		bootstrap.GatewayRegistry(cfg),
+		logger,
+		metrics,
+	)
+	refundSvc.SetRecoveryMaxAge(time.Duration(cfg.Jobs.RefundRecoveryMaxAgeSec) * time.Second)
+	return refundrecovery.New(refundRepo, refundSvc, logger, metrics, refundrecovery.Config{
+		MinAge:    time.Duration(cfg.Jobs.RefundRecoveryMinAgeSec) * time.Second,
+		BatchSize: cfg.Jobs.RefundRecoveryBatchSize,
+	})
 }
 
 func buildReaper(cfg *config.Config, db *postgres.DB, queries *postgres.Queries, logger *observability.SlogLogger, metrics ports.MetricRecorder) *leaseexpiry.Reaper {

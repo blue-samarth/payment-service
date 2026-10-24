@@ -33,6 +33,8 @@ const (
 	MetricRefundFailed             = "refund.failed"
 	MetricRefundDuplicationBlocked = "refund.duplication_blocked"
 	MetricRefundReviewRequired     = "refund.review_required"
+	MetricRefundReviewPending      = "refund.review_pending"
+	MetricRefundRecoveryFailed     = "refund.recovery_failed"
 
 	MetricOutboxEventWritten     = "outbox.event_written"
 	MetricOutboxPublishLatencyMs = "outbox.publish_latency_ms"

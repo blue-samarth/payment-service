@@ -234,6 +234,9 @@ type JobsConfig struct {
 	PartitionWeeksAhead             int
 	PartitionRetentionWeeks         int
 	PartitionDropAfterDays          int
+	RefundRecoveryMinAgeSec         int
+	RefundRecoveryMaxAgeSec         int
+	RefundRecoveryBatchSize         int
 }
 type DataRetentionConfig struct {
 	BatchSize      int
@@ -419,6 +422,9 @@ func LoadConfig() (*Config, error) {
 	c.Jobs.PartitionWeeksAhead = getEnvInt("PARTITION_WEEKS_AHEAD", 2, &errs)
 	c.Jobs.PartitionRetentionWeeks = getEnvInt("PARTITION_RETENTION_WEEKS", 2, &errs)
 	c.Jobs.PartitionDropAfterDays = getEnvInt("PARTITION_DROP_AFTER_DAYS", 14, &errs)
+	c.Jobs.RefundRecoveryMinAgeSec = getEnvInt("REFUND_RECOVERY_MIN_AGE_SEC", 300, &errs)
+	c.Jobs.RefundRecoveryMaxAgeSec = getEnvInt("REFUND_RECOVERY_MAX_AGE_SEC", 14*24*3600, &errs)
+	c.Jobs.RefundRecoveryBatchSize = getEnvInt("REFUND_RECOVERY_BATCH_SIZE", 100, &errs)
 
 	c.DataRetention.BatchSize = getEnvInt("DATA_RETENTION_BATCH_SIZE", 1000, &errs)
 	c.DataRetention.BatchSleepMs = getEnvInt("DATA_RETENTION_BATCH_SLEEP_MS", 100, &errs)
@@ -575,6 +581,16 @@ func Validate(c *Config) error {
 	}
 	if c.Gateway.HTTPTimeout <= 0 {
 		errs = append(errs, "GATEWAY_HTTP_TIMEOUT must be greater than 0")
+	}
+	minAge := time.Duration(c.Jobs.RefundRecoveryMinAgeSec) * time.Second
+	if inFlight := 2*c.Gateway.HTTPTimeout + 30*time.Second; minAge <= inFlight {
+		errs = append(errs, fmt.Sprintf("REFUND_RECOVERY_MIN_AGE_SEC (%s) must exceed 2 x GATEWAY_HTTP_TIMEOUT + 30s (%s): an API refund on Razorpay or PayU makes two gateway calls, and recovery must not check a refund whose refund call may still be in flight", minAge, inFlight))
+	}
+	if maxAge := time.Duration(c.Jobs.RefundRecoveryMaxAgeSec) * time.Second; maxAge <= minAge {
+		errs = append(errs, fmt.Sprintf("REFUND_RECOVERY_MAX_AGE_SEC (%s) must exceed REFUND_RECOVERY_MIN_AGE_SEC (%s)", maxAge, minAge))
+	}
+	if c.Jobs.RefundRecoveryBatchSize < 1 {
+		errs = append(errs, "REFUND_RECOVERY_BATCH_SIZE must be at least 1")
 	}
 	if c.App.ShutdownDrainDelay < 0 {
 		errs = append(errs, "SHUTDOWN_DRAIN_DELAY must not be negative")

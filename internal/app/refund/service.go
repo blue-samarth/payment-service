@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -29,6 +30,7 @@ type RefundRepo interface {
 	GetByID(ctx context.Context, id uuid.UUID) (*refund.Refund, error)
 	UpdateStatus(ctx context.Context, rf *refund.Refund) error
 	ExistsByReason(ctx context.Context, transactionID uuid.UUID, reason string) (bool, error)
+	MarkReviewRequired(ctx context.Context, id uuid.UUID, reason string) (bool, error)
 }
 
 const ReasonCancelResolution = "cancel_resolution"
@@ -54,6 +56,8 @@ type Service struct {
 	idem     *idempotency.Guard
 	log      ports.Logger
 	metrics  ports.MetricRecorder
+
+	recoveryMaxAge time.Duration
 }
 
 func NewService(txns TransactionReader, refunds RefundRepo, outbox EventWriter, tx Transactor, gateways GatewayRegistry, log ports.Logger, metrics ports.MetricRecorder) *Service {
@@ -61,6 +65,8 @@ func NewService(txns TransactionReader, refunds RefundRepo, outbox EventWriter, 
 }
 
 func (s *Service) SetIdempotency(g *idempotency.Guard) { s.idem = g }
+
+func (s *Service) SetRecoveryMaxAge(d time.Duration) { s.recoveryMaxAge = d }
 
 type InitiateInput struct {
 	TransactionID  uuid.UUID

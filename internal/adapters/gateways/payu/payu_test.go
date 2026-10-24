@@ -191,6 +191,44 @@ func TestRefund_AmountAboveCapturedIsRefused(t *testing.T) {
 	}
 }
 
+func TestRefundStatus(t *testing.T) {
+	for name, tc := range map[string]struct {
+		details string
+		want    ports.GatewayRefundStatus
+	}{
+		"success":    {`{"req_1":{"403993":{"action":"refund","status":"success","amount":"15.00"}}}`, ports.GatewayRefundStatusCompleted},
+		"queued":     {`{"req_1":{"403993":{"action":"refund","status":"queued"}}}`, ports.GatewayRefundStatusProcessing},
+		"failure":    {`{"req_1":{"403993":{"action":"refund","status":"failure"}}}`, ports.GatewayRefundStatusFailed},
+		"odd status": {`{"req_1":{"403993":{"action":"refund","status":"something_new"}}}`, ports.GatewayRefundStatusUnknown},
+		"missing":    {`{}`, ports.GatewayRefundStatusUnknown},
+		"not a map":  {`"no records found"`, ports.GatewayRefundStatusUnknown},
+	} {
+		a, srv := newTestAdapter(func(w http.ResponseWriter, r *http.Request) {
+			_ = r.ParseForm()
+			if r.FormValue("command") != "check_action_status" || r.FormValue("var1") != "req_1" {
+				t.Errorf("%s: a status check must only call check_action_status on the request id, got %q %q", name, r.FormValue("command"), r.FormValue("var1"))
+			}
+			_, _ = w.Write([]byte(`{"status":1,"transaction_details":` + tc.details + `}`))
+		})
+		resp, err := a.RefundStatus(context.Background(), ports.GatewayRefundStatusRequest{RefundID: uuid.New(), GatewayRefundID: "req_1"})
+		srv.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if resp.Status != tc.want {
+			t.Errorf("%s: got %s, want %s", name, resp.Status, tc.want)
+		}
+	}
+}
+
+func TestRefundStatus_WithoutARequestIDIsUnknown(t *testing.T) {
+	a := New(Config{})
+	resp, err := a.RefundStatus(context.Background(), ports.GatewayRefundStatusRequest{RefundID: uuid.New()})
+	if err != nil || resp.Status != ports.GatewayRefundStatusUnknown {
+		t.Fatalf("PayU can't look a refund up without its request_id, so it must go to review, got %v %v", resp, err)
+	}
+}
+
 func TestHash_IsDeterministicSHA512(t *testing.T) {
 	a := New(Config{MerchantKey: "key", MerchantSalt: "salt"})
 	h1 := a.hash("verify_payment", "TXN-1")

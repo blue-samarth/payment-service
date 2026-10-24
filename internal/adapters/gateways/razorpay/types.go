@@ -14,16 +14,22 @@ type rzpPaymentList struct {
 }
 
 type rzpPayment struct {
-	ID     string `json:"id"`
-	Status string `json:"status"`
-	Amount int64  `json:"amount"`
+	ID             string `json:"id"`
+	Status         string `json:"status"`
+	Amount         int64  `json:"amount"`
+	AmountRefunded int64  `json:"amount_refunded"`
 }
 
 type rzpRefund struct {
-	ID       string `json:"id"`
-	Status   string `json:"status"`
-	Amount   int64  `json:"amount"`
-	Currency string `json:"currency"`
+	ID       string            `json:"id"`
+	Status   string            `json:"status"`
+	Amount   int64             `json:"amount"`
+	Currency string            `json:"currency"`
+	Notes    map[string]string `json:"notes"`
+}
+
+type rzpRefundList struct {
+	Items []rzpRefund `json:"items"`
 }
 
 type rzpError struct {
