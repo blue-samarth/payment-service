@@ -13,21 +13,25 @@ import (
 
 type CircuitBreakerStore struct {
 	client goredis.UniversalClient
+	now    func() time.Time
 }
 
 func NewCircuitBreakerStore(c *Client) *CircuitBreakerStore {
-	return &CircuitBreakerStore{client: c.State}
+	return &CircuitBreakerStore{client: c.State, now: time.Now}
 }
+
+func (s *CircuitBreakerStore) SetClock(now func() time.Time) { s.now = now }
 
 type cbRecord struct {
 	State               string `json:"state"`
 	CooldownUntil       int64  `json:"cooldown_until"`
 	ConsecutiveFailures int    `json:"consecutive_failures"`
+	Trips               int    `json:"trips"`
 	LastKnownScore      int    `json:"last_known_score"`
 }
 
-func cbKey(gatewayID string) string    { return "gateway:cb:" + gatewayID }
-func probeKey(gatewayID string) string { return "gateway:probe:" + gatewayID }
+func cbKey(gatewayID string) string    { return "gateway:{" + gatewayID + "}:cb" }
+func probeKey(gatewayID string) string { return "gateway:{" + gatewayID + "}:probe" }
 func critKey(gatewayID string) string  { return "gateway:critical:" + gatewayID }
 
 func (s *CircuitBreakerStore) Get(ctx context.Context, gatewayID string) (*gateway.CircuitBreaker, error) {
@@ -46,6 +50,7 @@ func (s *CircuitBreakerStore) Get(ctx context.Context, gatewayID string) (*gatew
 		GatewayID:                 gatewayID,
 		State:                     gateway.CircuitState(r.State),
 		ConsecutiveFailures:       r.ConsecutiveFailures,
+		Trips:                     r.Trips,
 		LastKnownReliabilityScore: r.LastKnownScore,
 	}
 	if r.CooldownUntil > 0 {
@@ -88,8 +93,9 @@ func (s *CircuitBreakerStore) Transition(ctx context.Context, cb *gateway.Circui
 }
 
 func (s *CircuitBreakerStore) RecordFailure(ctx context.Context, gatewayID string, threshold int) (opened bool, failures int, err error) {
-	now := time.Now().UTC().Unix()
-	res, err := cbRecordFailureScript.Run(ctx, s.client, []string{cbKey(gatewayID)}, threshold, now).Int64Slice()
+	res, err := cbRecordFailureScript.Run(ctx, s.client, []string{cbKey(gatewayID), probeKey(gatewayID)},
+		threshold, s.now().UTC().Unix(), int64(gateway.CooldownBase/time.Second), int64(gateway.CooldownMax/time.Second),
+	).Int64Slice()
 	if err != nil {
 		return false, 0, fmt.Errorf("circuit_breaker: record failure %s: %w", gatewayID, err)
 	}
@@ -100,7 +106,7 @@ func (s *CircuitBreakerStore) RecordFailure(ctx context.Context, gatewayID strin
 }
 
 func (s *CircuitBreakerStore) RecordSuccess(ctx context.Context, gatewayID string) error {
-	if err := cbRecordSuccessScript.Run(ctx, s.client, []string{cbKey(gatewayID)}).Err(); err != nil {
+	if err := cbRecordSuccessScript.Run(ctx, s.client, []string{cbKey(gatewayID), probeKey(gatewayID)}, s.now().UTC().Unix()).Err(); err != nil {
 		return fmt.Errorf("circuit_breaker: record success %s: %w", gatewayID, err)
 	}
 	return nil

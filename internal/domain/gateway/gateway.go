@@ -19,6 +19,7 @@ type CircuitBreaker struct {
 	State                     CircuitState
 	CooldownUntil             time.Time
 	ConsecutiveFailures       int
+	Trips                     int
 	LastKnownReliabilityScore int
 }
 
@@ -71,18 +72,21 @@ func (d *DiscrepancyMetrics) IsResolved() bool {
 	return d.DaysSinceDiscrepancy >= 1 && d.EffectiveRate() < 0.001
 }
 
-func CooldownDuration(consecutiveFailures int) time.Duration {
-	if consecutiveFailures <= 0 {
-		consecutiveFailures = 1
+const (
+	CooldownBase = 60 * time.Second
+	CooldownMax  = 240 * time.Second
+)
+
+func CooldownDuration(trips int) time.Duration {
+	if trips <= 0 {
+		trips = 1
 	}
-	if consecutiveFailures > 4 {
-		consecutiveFailures = 4
+	if trips > 4 {
+		trips = 4
 	}
-	base := 60 * time.Second
-	d := base * time.Duration(1<<(consecutiveFailures-1))
-	max := 240 * time.Second
-	if d > max {
-		return max
+	d := CooldownBase * time.Duration(1<<(trips-1))
+	if d > CooldownMax {
+		return CooldownMax
 	}
 	return d
 }
