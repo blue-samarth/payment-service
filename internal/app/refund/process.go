@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -86,6 +87,23 @@ func (s *Service) RecoverRefund(ctx context.Context, refundID uuid.UUID) (*refun
 	if err != nil {
 		return nil, fmt.Errorf("refund: load refund %s: %w", refundID, err)
 	}
+
+	got, err := s.recoverRefund(ctx, rf)
+	if s.recoveryMaxAge <= 0 || time.Since(rf.InitiatedAt) <= s.recoveryMaxAge {
+		return got, err
+	}
+	if err != nil {
+		s.flagForReview(ctx, rf, "recovery_stalled", err)
+		return rf, nil
+	}
+	if !got.Status.IsTerminal() {
+		s.flagForReview(ctx, got, "pending_too_long", nil)
+	}
+	return got, nil
+}
+
+func (s *Service) recoverRefund(ctx context.Context, rf *refund.Refund) (*refund.Refund, error) {
+	refundID := rf.ID
 	switch rf.Status {
 	case refund.StatusInitiated:
 		return s.ProcessRefund(ctx, refundID)

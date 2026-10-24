@@ -127,6 +127,7 @@ func buildRefundRecovery(cfg *config.Config, db *postgres.DB, queries *postgres.
 		logger,
 		metrics,
 	)
+	refundSvc.SetRecoveryMaxAge(time.Duration(cfg.Jobs.RefundRecoveryMaxAgeSec) * time.Second)
 	return refundrecovery.New(refundRepo, refundSvc, logger, metrics, refundrecovery.Config{
 		MinAge:    time.Duration(cfg.Jobs.RefundRecoveryMinAgeSec) * time.Second,
 		BatchSize: cfg.Jobs.RefundRecoveryBatchSize,

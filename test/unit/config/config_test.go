@@ -34,6 +34,7 @@ func validatableConfig() *Config {
 	c.App.ShutdownTimeout = 105 * time.Second
 	c.Jobs.IdempotencyProcessingTimeoutSec = 300
 	c.Jobs.RefundRecoveryMinAgeSec = 300
+	c.Jobs.RefundRecoveryMaxAgeSec = 7 * 24 * 3600
 	c.Jobs.RefundRecoveryBatchSize = 100
 	c.Redis.Addrs = []string{"localhost:6379"}
 	c.Redis.RateLimitDB = 0
@@ -153,15 +154,23 @@ func TestValidate_GatewayAttemptsAndTimeoutArePositive(t *testing.T) {
 	}
 }
 
-func TestValidate_RefundRecoveryMinAgeMustExceedTheHTTPTimeout(t *testing.T) {
+func TestValidate_RefundRecoveryMinAgeCoversTwoGatewayCalls(t *testing.T) {
 	c := validatableConfig()
-	c.Jobs.RefundRecoveryMinAgeSec = 30
+	c.Jobs.RefundRecoveryMinAgeSec = 90
 	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "REFUND_RECOVERY_MIN_AGE_SEC") {
-		t.Fatalf("recovery must not act on a refund whose first call may still be in flight, got %v", err)
+		t.Fatalf("with a 30s timeout a refund can be in flight for 2 x 30s + margin, so 90s must be rejected, got %v", err)
 	}
-	c.Jobs.RefundRecoveryMinAgeSec = 31
+	c.Jobs.RefundRecoveryMinAgeSec = 91
 	if err := Validate(c); err != nil {
-		t.Fatalf("31s > 30s timeout should validate, got %v", err)
+		t.Fatalf("91s should validate, got %v", err)
+	}
+}
+
+func TestValidate_RefundRecoveryMaxAgeMustExceedMinAge(t *testing.T) {
+	c := validatableConfig()
+	c.Jobs.RefundRecoveryMaxAgeSec = c.Jobs.RefundRecoveryMinAgeSec
+	if err := Validate(c); err == nil || !strings.Contains(err.Error(), "REFUND_RECOVERY_MAX_AGE_SEC") {
+		t.Fatalf("expected the max age to be checked against the min age, got %v", err)
 	}
 }
 

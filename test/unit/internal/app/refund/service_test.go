@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -259,6 +260,48 @@ func TestRecoverRefund_StaleInitiatedRefundIsSent(t *testing.T) {
 	}
 	if adapter.refunds != 1 || got.Status != domainrefund.StatusRefunded {
 		t.Fatalf("an INITIATED refund was never sent, so recovery sends it once; got %d posts, %s", adapter.refunds, got.Status)
+	}
+}
+
+func TestRecoverRefund_PastTheCutOffItGoesToReview(t *testing.T) {
+	for name, tc := range map[string]struct {
+		adapter   *checkingAdapter
+		age       time.Duration
+		reason    string
+		wantErr   bool
+		wantFinal domainrefund.Status
+	}{
+		"still pending after the cut-off": {
+			&checkingAdapter{status: &ports.GatewayRefundResponse{Status: ports.GatewayRefundStatusProcessing}},
+			8 * 24 * time.Hour, "pending_too_long", false, domainrefund.StatusProcessing,
+		},
+		"still failing after the cut-off": {
+			&checkingAdapter{statusErr: &ports.GatewayError{Category: ports.ErrorCategoryGatewayError, Code: "gateway_error"}},
+			8 * 24 * time.Hour, "recovery_stalled", false, domainrefund.StatusProcessing,
+		},
+		"failing but young": {
+			&checkingAdapter{statusErr: &ports.GatewayError{Category: ports.ErrorCategoryGatewayError, Code: "gateway_error"}},
+			time.Hour, "", true, domainrefund.StatusProcessing,
+		},
+		"old but completed": {
+			&checkingAdapter{status: &ports.GatewayRefundResponse{Status: ports.GatewayRefundStatusCompleted}},
+			30 * 24 * time.Hour, "", false, domainrefund.StatusRefunded,
+		},
+	} {
+		s, refunds, _, rf := processingRefund(t, tc.adapter)
+		s.SetRecoveryMaxAge(7 * 24 * time.Hour)
+		rf.InitiatedAt = time.Now().UTC().Add(-tc.age)
+
+		got, err := s.RecoverRefund(context.Background(), rf.ID)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: err=%v, wantErr=%v", name, err, tc.wantErr)
+		}
+		if refunds.reviews[rf.ID] != tc.reason {
+			t.Errorf("%s: review reason %q, want %q", name, refunds.reviews[rf.ID], tc.reason)
+		}
+		if got != nil && got.Status != tc.wantFinal {
+			t.Errorf("%s: status %s, want %s", name, got.Status, tc.wantFinal)
+		}
 	}
 }
 

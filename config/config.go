@@ -235,6 +235,7 @@ type JobsConfig struct {
 	PartitionRetentionWeeks         int
 	PartitionDropAfterDays          int
 	RefundRecoveryMinAgeSec         int
+	RefundRecoveryMaxAgeSec         int
 	RefundRecoveryBatchSize         int
 }
 type DataRetentionConfig struct {
@@ -422,6 +423,7 @@ func LoadConfig() (*Config, error) {
 	c.Jobs.PartitionRetentionWeeks = getEnvInt("PARTITION_RETENTION_WEEKS", 2, &errs)
 	c.Jobs.PartitionDropAfterDays = getEnvInt("PARTITION_DROP_AFTER_DAYS", 14, &errs)
 	c.Jobs.RefundRecoveryMinAgeSec = getEnvInt("REFUND_RECOVERY_MIN_AGE_SEC", 300, &errs)
+	c.Jobs.RefundRecoveryMaxAgeSec = getEnvInt("REFUND_RECOVERY_MAX_AGE_SEC", 7*24*3600, &errs)
 	c.Jobs.RefundRecoveryBatchSize = getEnvInt("REFUND_RECOVERY_BATCH_SIZE", 100, &errs)
 
 	c.DataRetention.BatchSize = getEnvInt("DATA_RETENTION_BATCH_SIZE", 1000, &errs)
@@ -580,8 +582,12 @@ func Validate(c *Config) error {
 	if c.Gateway.HTTPTimeout <= 0 {
 		errs = append(errs, "GATEWAY_HTTP_TIMEOUT must be greater than 0")
 	}
-	if minAge := time.Duration(c.Jobs.RefundRecoveryMinAgeSec) * time.Second; minAge <= c.Gateway.HTTPTimeout {
-		errs = append(errs, fmt.Sprintf("REFUND_RECOVERY_MIN_AGE_SEC (%s) must exceed GATEWAY_HTTP_TIMEOUT (%s), or recovery can act on a refund whose first call is still in flight", minAge, c.Gateway.HTTPTimeout))
+	minAge := time.Duration(c.Jobs.RefundRecoveryMinAgeSec) * time.Second
+	if inFlight := 2*c.Gateway.HTTPTimeout + 30*time.Second; minAge <= inFlight {
+		errs = append(errs, fmt.Sprintf("REFUND_RECOVERY_MIN_AGE_SEC (%s) must exceed 2 x GATEWAY_HTTP_TIMEOUT + 30s (%s): an API refund on Razorpay or PayU makes two gateway calls, and recovery must not check a refund whose refund call may still be in flight", minAge, inFlight))
+	}
+	if maxAge := time.Duration(c.Jobs.RefundRecoveryMaxAgeSec) * time.Second; maxAge <= minAge {
+		errs = append(errs, fmt.Sprintf("REFUND_RECOVERY_MAX_AGE_SEC (%s) must exceed REFUND_RECOVERY_MIN_AGE_SEC (%s)", maxAge, minAge))
 	}
 	if c.Jobs.RefundRecoveryBatchSize < 1 {
 		errs = append(errs, "REFUND_RECOVERY_BATCH_SIZE must be at least 1")
