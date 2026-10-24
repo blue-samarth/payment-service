@@ -258,11 +258,14 @@ func TestCircuitBreaker_ProbeIsReleasedByTheProbeOutcome(t *testing.T) {
 	tripAt(t, store, gw, 1)
 
 	clk.Advance(gateway.CooldownBase + time.Second)
-	if ok, _ := store.AcquireProbe(ctx, gw, time.Hour); !ok {
-		t.Fatal("expected to take the probe")
+	if ok, _ := store.AdmitCall(ctx, gw, time.Hour); !ok {
+		t.Fatal("expected the first call after the cooldown to be admitted as the probe")
 	}
-	if ok, _ := store.AcquireProbe(ctx, gw, time.Hour); ok {
+	if ok, _ := store.AdmitCall(ctx, gw, time.Hour); ok {
 		t.Fatal("the probe must be single-flight")
+	}
+	if held, _ := store.ProbeHeld(ctx, gw); !held {
+		t.Fatal("routing must be able to see the probe is out")
 	}
 	if _, _, err := store.RecordFailure(ctx, gw, 1); err != nil {
 		t.Fatal(err)
@@ -270,16 +273,41 @@ func TestCircuitBreaker_ProbeIsReleasedByTheProbeOutcome(t *testing.T) {
 
 	cb, _ := store.Get(ctx, gw)
 	clk.now = cb.CooldownUntil.Add(time.Second)
-	if ok, _ := store.AcquireProbe(ctx, gw, time.Hour); !ok {
+	if ok, _ := store.AdmitCall(ctx, gw, time.Hour); !ok {
 		t.Fatal("a failed probe must release the lock so the next cooldown can be probed without waiting for its TTL")
 	}
 	if err := store.RecordSuccess(ctx, gw); err != nil {
 		t.Fatal(err)
 	}
-	tripAt(t, store, gw, 1)
-	clk.Advance(gateway.CooldownBase + time.Second)
-	if ok, _ := store.AcquireProbe(ctx, gw, time.Hour); !ok {
+	if held, _ := store.ProbeHeld(ctx, gw); held {
 		t.Fatal("a successful probe must release the lock")
+	}
+}
+
+func TestCircuitBreaker_AdmitCall(t *testing.T) {
+	store, clk := newClockedStore(t)
+	ctx := context.Background()
+
+	if ok, err := store.AdmitCall(ctx, "never-seen", time.Minute); err != nil || !ok {
+		t.Fatalf("a gateway with no breaker record must be admitted, got %v %v", ok, err)
+	}
+
+	const gw = "admit-gw"
+	tripAt(t, store, gw, 1)
+	if ok, _ := store.AdmitCall(ctx, gw, time.Minute); ok {
+		t.Fatal("a call routed before the trip must be refused while the cooldown is active")
+	}
+	if held, _ := store.ProbeHeld(ctx, gw); held {
+		t.Fatal("a refused call during the cooldown must not take the probe")
+	}
+
+	clk.Advance(gateway.CooldownBase + time.Second)
+	if ok, _ := store.AdmitCall(ctx, gw, 0); !ok {
+		t.Fatal("expected the probe")
+	}
+	ttl, err := testsupport.RequireRedis(t).State.PTTL(ctx, "gateway:probe:"+gw).Result()
+	if err != nil || ttl <= 0 {
+		t.Fatalf("a zero TTL must be floored, never stored as a lock without expiry; got ttl=%s err=%v", ttl, err)
 	}
 }
 

@@ -30,8 +30,8 @@ type cbRecord struct {
 	LastKnownScore      int    `json:"last_known_score"`
 }
 
-func cbKey(gatewayID string) string    { return "gateway:{" + gatewayID + "}:cb" }
-func probeKey(gatewayID string) string { return "gateway:{" + gatewayID + "}:probe" }
+func cbKey(gatewayID string) string    { return "gateway:cb:" + gatewayID }
+func probeKey(gatewayID string) string { return "gateway:probe:" + gatewayID }
 func critKey(gatewayID string) string  { return "gateway:critical:" + gatewayID }
 
 func (s *CircuitBreakerStore) Get(ctx context.Context, gatewayID string) (*gateway.CircuitBreaker, error) {
@@ -118,6 +118,29 @@ func (s *CircuitBreakerStore) AcquireProbe(ctx context.Context, gatewayID string
 		return false, fmt.Errorf("circuit_breaker: acquire probe %s: %w", gatewayID, err)
 	}
 	return ok, nil
+}
+
+const minProbeTTL = 5 * time.Second
+
+func (s *CircuitBreakerStore) AdmitCall(ctx context.Context, gatewayID string, probeTTL time.Duration) (bool, error) {
+	if probeTTL < minProbeTTL {
+		probeTTL = minProbeTTL
+	}
+	n, err := cbAdmitScript.Run(ctx, s.client, []string{cbKey(gatewayID), probeKey(gatewayID)},
+		s.now().UTC().Unix(), probeTTL.Milliseconds(),
+	).Int()
+	if err != nil {
+		return false, fmt.Errorf("circuit_breaker: admit call %s: %w", gatewayID, err)
+	}
+	return n == 1, nil
+}
+
+func (s *CircuitBreakerStore) ProbeHeld(ctx context.Context, gatewayID string) (bool, error) {
+	n, err := s.client.Exists(ctx, probeKey(gatewayID)).Result()
+	if err != nil {
+		return false, fmt.Errorf("circuit_breaker: probe held %s: %w", gatewayID, err)
+	}
+	return n == 1, nil
 }
 
 func (s *CircuitBreakerStore) SetLastKnownScore(ctx context.Context, gatewayID string, score int) error {

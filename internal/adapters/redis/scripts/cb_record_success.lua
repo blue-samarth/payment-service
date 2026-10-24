@@ -11,6 +11,10 @@ local cb       = cjson.decode(raw)
 local state    = cb.state or 'CLOSED'
 local cooldown = tonumber(cb.cooldown_until) or 0
 
+if state == 'CLOSED' and (tonumber(cb.consecutive_failures) or 0) == 0 then
+  return state
+end
+
 if state == 'OPEN' and (cooldown == 0 or now_epoch < cooldown) then
   return state
 end

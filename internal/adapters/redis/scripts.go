@@ -21,6 +21,11 @@ var cbRecordSuccessLua string
 //go:embed scripts/cb_set_score.lua
 var cbSetScoreLua string
 
+//go:embed scripts/cb_admit.lua
+var cbAdmitLua string
+
+var cbAdmitScript = goredis.NewScript(cbAdmitLua)
+
 var tokenBucketScript = goredis.NewScript(tokenBucketLua)
 
 var cbTransitionScript = goredis.NewScript(cbTransitionLua)
