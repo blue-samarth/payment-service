@@ -122,10 +122,7 @@ func (s *Service) RecoverExpiredLease(ctx context.Context, transactionID uuid.UU
 		return txn, nil
 	}
 
-	gateway := txn.ActualGateway
-	if gateway == "" {
-		gateway = txn.GatewayID
-	}
+	gateway := txn.ProcessingGateway()
 	adapter, err := s.gateways.Get(gateway)
 	if err != nil {
 		return nil, fmt.Errorf("payment: resolve adapter for %s: %w", gateway, err)
